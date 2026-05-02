@@ -4097,13 +4097,19 @@ def _wallet_hot_signal(wallet: str) -> Optional[dict]:
       {'new1d_pnl': USD, 'new7d_pnl': USD, 'wr_1d': %, 'wr_7d': %}
     Path within response: historic.summary.{1d|7d}.newTokens.total_pnl
     The newTokens.total_pnl is the right signal for memecoin sniping — PnL on tokens
-    BOUGHT in the window (vs total which mixes in older holdings)."""
+    BOUGHT in the window (vs total which mixes in older holdings).
+
+    V41.17s: timeout 60s → 8s. Massive-history wallets (e.g., suqh5sHtr8 with
+    100k+ trades) take 30-60s per call and stack up; with 100 wallets the filter
+    was taking 7+ minutes. 8s catches the fast 95% and skips the slow tail
+    (those wallets get marked as 'err' and dropped — acceptable trade-off for
+    reliable 2-3min boot)."""
     try:
         r = requests.get(
             f"{SOLANATRACKER_BASE}/pnl/{wallet}",
             headers={"x-api-key": SOLANATRACKER_API_KEY},
             params={"showHistoricPnL": "true", "hideDetails": "true"},
-            timeout=60,
+            timeout=8,
         )
         if r.status_code != 200:
             return None
