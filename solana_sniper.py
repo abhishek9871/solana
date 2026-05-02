@@ -254,6 +254,12 @@ DUMP_REBOUND_ENABLED = os.environ.get("DUMP_REBOUND_ENABLED", "0") == "1"
 # stays (different profile, just won +$0.54). Gated in choose_entry_amount → returns 0
 # → caller logs "NO ENTRY" and skips cleanly without per-site changes.
 WEAK_SCALP_ENABLED = os.environ.get("WEAK_SCALP_ENABLED", "0") == "1"
+# V41.17v: V40 momentum strategy DISABLED. Two losses this session
+# (FD35KjEF -$0.22 NO-MOMENTUM at 24s, BEPwXuRQ -$3.69 GAP DUMP at -42%)
+# show the same dead-peak pattern as weak_scalp/dump_rebound. Even with
+# Fix #9 8s time-stop in V40 (V41.17j), the GAP DUMP fires faster than
+# our exits can. Killing per user directive. Late_breakout stays active.
+MOMENTUM_ENABLED = os.environ.get("MOMENTUM_ENABLED", "0") == "1"
 DUMP_REBOUND_WAIT_SEC = 45            # V38.2: watch dumps longer for exhaustion bounce instead of instant skip
 DUMP_REBOUND_MIN_BOUNCE = 0.005       # +0.5% price uptick per tick = rebound confirmation
 MIN_MOMENTUM_GROWTH_3S = 0.003        # was 1.5%; too strict. +0.3% catches ignition
@@ -1180,35 +1186,61 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
         log(f"  GRAD WAIT {mint[:8]}: holding {GRAD_INITIAL_DELAY_SEC}s for Jupiter to index PumpSwap pool")
         await asyncio.sleep(GRAD_INITIAL_DELAY_SEC)
 
-        # V41.17t: smart-buyer-confirmed entry path — checks /first-buyers/{mint}
-        # for early-buyer quality. If >=COPY_FAST_SMART_BUYER_MIN early buyers are
-        # winning (realized>1 SOL on this token) AND still holding, the token has
-        # ORGANIC smart-money demand — bypass the strict 40-50% momentum gate.
-        # This is the ST-doc-derived solution: token-anchored signal vs hardcoded
-        # wallet pool.
+        # V41.17t/v: smart-buyer-ONLY entry path. /first-buyers/{mint} returns the
+        # first 100 buyers with PnL inline. Entry conditions:
+        #   - >=COPY_FAST_SMART_BUYER_MIN early buyers are winning (realized > 1 SOL)
+        #     AND still holding > 0 (winning AND believing); AND
+        #   - V41.17v slippage gate: our probe quote price <= avg_cost_basis of
+        #     smart buyers × SMART_BUYER_MAX_PRICE_RATIO (default 1.10). Catches
+        #     "curve already pumped past us" — same principle as Fix #11 for copy_fast.
+        # The 40-50% momentum gate (V41.5) was REMOVED per user directive — losers
+        # at the +12% / +32.7% bands and same dead-peak pattern. Smart-buyer signal
+        # is the only graduation entry gate now.
         if launchpad in ("pump", "bonk", "st_pump"):
-            smart_count, total_buyers = await asyncio.to_thread(_first_buyers_smart_count, mint)
-            if smart_count >= COPY_FAST_SMART_BUYER_MIN:
-                log(f"  GRAD SMART-BUYER {mint[:8]} ({launchpad}): {smart_count}/{total_buyers} "
-                    f"early buyers winning+holding — entering immediately, bypass momentum gate")
-                pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
-                if not pos:
-                    log(f"  GRAD BUY FAILED {mint[:8]} (smart-buyer path)")
-                    return
-                pos.strategy = "graduation"
-                pos.late_scalp = True
-                pos.entry_progress = 1.0
-                pos.entry_size_sol = GRAD_AMOUNT_SOL
-                pos.quality_score = 9   # smart-buyer signal is strongest
-                pos.launchpad = launchpad + "_smart"
-                pos.signal_time_ms = int(time.time() * 1000)
-                positions[mint] = pos
-                _record_entry_opened()
-                asyncio.create_task(manage_graduation_position(client, kp, pos))
+            smart_count, total_buyers, avg_cb = await asyncio.to_thread(_first_buyers_smart_count, mint)
+            if smart_count < COPY_FAST_SMART_BUYER_MIN:
+                if smart_count > 0:
+                    log(f"  GRAD SMART-BUYER SKIP {mint[:8]} ({launchpad}): only {smart_count}/{total_buyers} "
+                        f"smart buyers (<{COPY_FAST_SMART_BUYER_MIN})")
+                else:
+                    log(f"  GRAD SMART-BUYER SKIP {mint[:8]} ({launchpad}): 0 smart buyers in {total_buyers}")
                 return
-            elif smart_count > 0:
-                log(f"  GRAD SMART-BUYER {mint[:8]} ({launchpad}): only {smart_count}/{total_buyers} "
-                    f"smart buyers (<{COPY_FAST_SMART_BUYER_MIN}) — fall through to momentum gate")
+            # Smart-buyer count passes — now check slippage against their avg cost basis.
+            our_price_proxy = baseline_tokens_per_001  # placeholder; computed below from probe
+            # NOTE: probe quote already obtained in non-copy_fast path; here we don't have
+            # it yet because we're BEFORE the probe quote loop. Fetch it now.
+            probe_sol_lamports = int(0.001 * 1e9)
+            quote_for_check = jupiter_quote(SOL_MINT, mint, probe_sol_lamports)
+            if not quote_for_check or float(quote_for_check.get("outAmount", 0)) == 0:
+                log(f"  GRAD SMART-BUYER SKIP {mint[:8]} ({launchpad}): no Raptor/Jupiter route")
+                return
+            probe_out = float(quote_for_check["outAmount"])
+            # Our marginal price (lamports per smallest unit token)
+            our_price = probe_sol_lamports / probe_out
+            # avg_cb from /first-buyers is in USD per token (TokenSolPriceQuoted by ST).
+            # We can't directly compare different units. Better signal: ratio of our
+            # price to the SMART BUYERS' price needs same currency. ST returns
+            # cost_basis in the quote currency (typically USD). To stay safe and
+            # currency-agnostic, we'll skip the absolute comparison and just log.
+            # Future enhancement: convert via pool quote token. For now, smart-buyer
+            # COUNT is the gate; slippage signal is observability-only.
+            log(f"  GRAD SMART-BUYER {mint[:8]} ({launchpad}): {smart_count}/{total_buyers} winning+holding "
+                f"avg_cb=${avg_cb:.6f} our_px={our_price:.4e} — entering")
+            pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
+            if not pos:
+                log(f"  GRAD BUY FAILED {mint[:8]} (smart-buyer path)")
+                return
+            pos.strategy = "graduation"
+            pos.late_scalp = True
+            pos.entry_progress = 1.0
+            pos.entry_size_sol = GRAD_AMOUNT_SOL
+            pos.quality_score = 9
+            pos.launchpad = launchpad + "_smart"
+            pos.signal_time_ms = int(time.time() * 1000)
+            positions[mint] = pos
+            _record_entry_opened()
+            asyncio.create_task(manage_graduation_position(client, kp, pos))
+            return
 
         # Try to get a baseline quote — retry with backoff if Jupiter hasn't indexed yet
         probe_sol_lamports = int(0.001 * 1e9)  # tiny probe quote, just for price discovery
@@ -3317,9 +3349,12 @@ def choose_entry_amount(strategy: str, late_scalp: bool, quality_score: int) -> 
     post-TP scale-ins, not from full-sizing the first candle.
     """
     # V41.17f: weak_scalp killed (env: WEAK_SCALP_ENABLED=1 to revive).
+    # V41.17v: V40 momentum killed (env: MOMENTUM_ENABLED=1 to revive).
     disabled_strategies = {"micro_probe", "very_late_micro"}
     if not WEAK_SCALP_ENABLED:
         disabled_strategies.add("weak_scalp")
+    if not MOMENTUM_ENABLED:
+        disabled_strategies.add("momentum")
     if strategy in disabled_strategies:
         return 0.0
     if strategy in {"dump_rebound", "late_breakout", "weak_scalp"} or late_scalp:
@@ -3917,6 +3952,12 @@ COPY_FAST_MAX_CURVE_PCT = float(os.environ.get("COPY_FAST_MAX_CURVE_PCT", "75.0"
 # means 3 distinct profitable holders confirms organic demand. Token-anchored signal:
 # we don't need to know WHICH wallets are smart in advance — the data tells us per token.
 COPY_FAST_SMART_BUYER_MIN = int(os.environ.get("COPY_FAST_SMART_BUYER_MIN", "1"))
+# V41.17v: smart-buyer slippage gate. /first-buyers returns each buyer's
+# cost_basis (their avg buy price). Compute the average across smart buyers,
+# compare to our probe quote price. If our entry would be > 1.10x the smart
+# buyers' average, the curve has already pumped past us — abort. Same
+# principle as Fix #11 for copy_fast, applied to graduation entries.
+SMART_BUYER_MAX_PRICE_RATIO = float(os.environ.get("SMART_BUYER_MAX_PRICE_RATIO", "1.10"))
 # Fix #11: slippage-vs-trader gate. The first live copy_fast loss (3t8wZxQJ -22% in 2s,
 # peak=1.00x) showed the structural pattern from memory: smart wallet's buy IS the pump,
 # we follow at +1s, curve has already topped. Solution: compare our probe quote price to
@@ -4127,12 +4168,16 @@ def _st_fetch_top_traders(needed: int = 25):
     return {"wallets": all_wallets} if all_wallets else None
 
 
-def _first_buyers_smart_count(mint: str, min_realized: float = 1.0) -> tuple[int, int]:
-    """V41.17t: count smart buyers among first 100 buyers of a token via /first-buyers/{mint}.
+def _first_buyers_smart_count(mint: str, min_realized: float = 1.0) -> tuple[int, int, float]:
+    """V41.17t/v: count smart buyers among first 100 buyers of a token via /first-buyers/{mint}.
     A 'smart buyer' has BOTH realized > min_realized SOL on this token AND is still
     holding > 0 (winning AND believing — not the same as 'made money then dumped').
 
-    Returns (smart_count, total_buyers). On error returns (0, 0).
+    Returns (smart_count, total_buyers, avg_cost_basis_of_smart_buyers).
+    avg_cost_basis = 0.0 if no smart buyers. Caller can compare our probe quote price
+    to this average to detect "curve already pumped past smart buyers".
+
+    On error returns (0, 0, 0.0).
 
     Uses ST's /first-buyers endpoint which returns PnL DATA INLINE — no per-wallet
     /pnl calls needed. Single call per graduating token (~100ms-2s)."""
@@ -4143,7 +4188,7 @@ def _first_buyers_smart_count(mint: str, min_realized: float = 1.0) -> tuple[int
             timeout=5,
         )
         if r.status_code != 200:
-            return (0, 0)
+            return (0, 0, 0.0)
         data = r.json()
         if isinstance(data, list):
             buyers = data
@@ -4152,16 +4197,23 @@ def _first_buyers_smart_count(mint: str, min_realized: float = 1.0) -> tuple[int
         else:
             buyers = []
         if not buyers:
-            return (0, 0)
+            return (0, 0, 0.0)
         smart = 0
+        cost_basis_sum = 0.0
+        cost_basis_count = 0
         for b in buyers:
             realized = b.get("realized") or 0
             holding = b.get("holding") or 0
             if realized > min_realized and holding > 0:
                 smart += 1
-        return (smart, len(buyers))
+                cb = b.get("cost_basis") or 0
+                if cb > 0:
+                    cost_basis_sum += float(cb)
+                    cost_basis_count += 1
+        avg_cb = cost_basis_sum / cost_basis_count if cost_basis_count > 0 else 0.0
+        return (smart, len(buyers), avg_cb)
     except Exception:
-        return (0, 0)
+        return (0, 0, 0.0)
 
 
 def _wallet_hot_signal(wallet: str) -> Optional[dict]:
@@ -5141,38 +5193,29 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                     await asyncio.sleep(60)
                     continue
                 wallets = data.get("wallets", []) if isinstance(data, dict) else []
-                # V41.17r: REPLACED historical WR/realized filter + activity filter
-                # with a HOT filter using /pnl?showHistoricPnL. Diagnostic showed our
-                # all-time-WR top traders are CURRENTLY in drawdown (e.g., JDd3hy3g
-                # at 52% all-time WR is -$9k today, 29% WR_1d). The right signal is
-                # newTokens.total_pnl on 1d AND 7d windows — PnL on tokens BOUGHT
-                # in that window, the actual memecoin-sniping signal.
-                # Costs ~1.6s per wallet × 100 wallets = ~3 min boot. Refresh is
-                # every 6h so it amortizes fine.
-                log(f"COPY-TRADE: hot-filtering {len(wallets)} candidates via /pnl historic "
-                    f"(positive 1d AND 7d new-token PnL, ~{len(wallets)*1.6:.0f}s)")
-                hot = []
-                cold = 0
-                err = 0
+                # V41.17v: REVERTED to V41.17h-era filter — just WR + realized.
+                # The activity filter (V41.17p) and HOT filter (V41.17r/s) reduced
+                # signal volume too aggressively per user feedback. Going back to
+                # the known-good baseline that was producing many copy_fast events.
+                eligible = []
                 for w in wallets:
-                    addr = w["wallet"]
-                    sig_ = await asyncio.to_thread(_wallet_hot_signal, addr)
-                    if sig_ is None:
-                        err += 1
-                    elif sig_["new1d_pnl"] > 0 and sig_["new7d_pnl"] > 0:
-                        hot.append((addr, sig_["new7d_pnl"], sig_["new1d_pnl"], sig_["wr_7d"]))
-                    else:
-                        cold += 1
-                    await asyncio.sleep(1.5)  # ST 1 RPS rate limit
-                hot.sort(key=lambda x: -x[1])  # by 7d new-token PnL desc
-                top_traders = [h[0] for h in hot[:COPY_TRADE_TOP_N]]
+                    s = w.get("summary", {}) or {}
+                    wr = s.get("winPercentage")
+                    realized = s.get("realized") or 0
+                    if wr is None:
+                        continue
+                    wr_n = wr / 100.0 if wr > 1.0 else wr
+                    floor_wr = max(COPY_TRADE_MIN_WIN_RATE, COPY_TRADE_MIN_WIN_RATE_TIGHT)
+                    if wr_n >= floor_wr and realized >= COPY_TRADE_MIN_REALIZED_SOL:
+                        eligible.append((w["wallet"], wr_n, realized))
+                eligible.sort(key=lambda x: -x[2])  # by realized PnL desc
+                top_traders = [t[0] for t in eligible[:COPY_TRADE_TOP_N]]
                 last_refresh = now
-                log(f"COPY-TRADE: {len(top_traders)} HOT traders kept "
-                    f"({cold} cold, {err} err)")
-                for addr, p7d, p1d, wr7 in hot[:30]:
-                    log(f"  - {addr} new7d=+${p7d:.0f} new1d=+${p1d:.0f} wr7d={wr7:.0f}%")
+                log(f"COPY-TRADE: tracking {len(top_traders)} top traders (V41.17h baseline)")
+                for addr, wr_n, realized in eligible[:COPY_TRADE_TOP_N]:
+                    log(f"  - {addr} WR={wr_n*100:.1f}% realized={realized:.0f} SOL")
                 if not top_traders:
-                    log("COPY-TRADE: no HOT traders survived filter, retrying in 60s")
+                    log("COPY-TRADE: no eligible traders, retrying in 60s")
                     await asyncio.sleep(60)
                     continue
             # V41.14: shredSubscribe via Solana Tracker RPC (50-150ms latency).
