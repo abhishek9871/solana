@@ -3916,7 +3916,7 @@ COPY_FAST_MAX_CURVE_PCT = float(os.environ.get("COPY_FAST_MAX_CURVE_PCT", "75.0"
 # AND still holding > 0 — these are winners who are still believing. Threshold of 3
 # means 3 distinct profitable holders confirms organic demand. Token-anchored signal:
 # we don't need to know WHICH wallets are smart in advance — the data tells us per token.
-COPY_FAST_SMART_BUYER_MIN = int(os.environ.get("COPY_FAST_SMART_BUYER_MIN", "3"))
+COPY_FAST_SMART_BUYER_MIN = int(os.environ.get("COPY_FAST_SMART_BUYER_MIN", "1"))
 # Fix #11: slippage-vs-trader gate. The first live copy_fast loss (3t8wZxQJ -22% in 2s,
 # peak=1.00x) showed the structural pattern from memory: smart wallet's buy IS the pump,
 # we follow at +1s, curve has already topped. Solution: compare our probe quote price to
