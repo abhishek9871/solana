@@ -3900,6 +3900,13 @@ COPY_TRADE_MIN_REALIZED_SOL = float(os.environ.get("COPY_TRADE_MIN_REALIZED_SOL"
 # accountInclude > ~75 wallets. Reverting to 56 (V41.17h known-good level). If
 # volume returns at 56 wallets, hypothesis confirmed and we accept 56 as the cap.
 COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.50"))
+# V41.17p: activity filter. The leaderboard /top-traders/all is HISTORICAL — ranks
+# by all-time realized PnL, ignoring whether the wallet is currently active. Direct
+# /wallet/{addr}/trades check showed 8/10 of our top wallets last traded 24h-122d
+# ago. Effective live pool was ~10-15 of 56. Adding inactivity ceiling: drop any
+# wallet whose most recent trade was > MAX_INACTIVITY_HOURS ago. Pool drops to
+# 15-25 active wallets but shred density per wallet rises ~10×.
+COPY_TRADE_MAX_INACTIVITY_HOURS = int(os.environ.get("COPY_TRADE_MAX_INACTIVITY_HOURS", "24"))
 # Fix #6: bundle freshness — abort if any bundle in last N seconds.
 # V41.17g: 60s → 30s. The 60s threshold treated "bundle 4s ago" the same as
 # "bundle 34s ago", which is too coarse. After 30s the bundle's actual buy txs
@@ -4082,6 +4089,27 @@ def _st_fetch_top_traders(needed: int = 25):
             log(f"  COPY-TRADE fetch err page={page}: {type(e).__name__}: {e}")
             break
     return {"wallets": all_wallets} if all_wallets else None
+
+
+def _wallet_last_trade_ms(wallet: str) -> Optional[int]:
+    """V41.17p: most-recent trade timestamp for a wallet via /wallet/{addr}/trades.
+    Returns ms-epoch of trades[0].time, or None on error / no trades."""
+    try:
+        r = requests.get(
+            f"{SOLANATRACKER_BASE}/wallet/{wallet}/trades",
+            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        trades = d.get("trades", []) or []
+        if not trades:
+            return None
+        ts = trades[0].get("time")
+        return int(ts) if ts else None
+    except Exception:
+        return None
 
 
 _copy_trader_seen_sigs: set = set()
@@ -5016,13 +5044,32 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                     if wr_n >= floor_wr and realized >= COPY_TRADE_MIN_REALIZED_SOL:
                         eligible.append((w["wallet"], wr_n, realized))
                 eligible.sort(key=lambda x: -x[2])  # by realized PnL desc
-                top_traders = [t[0] for t in eligible[:COPY_TRADE_TOP_N]]
+                # V41.17p: activity filter. Drop wallets whose most-recent trade is
+                # older than COPY_TRADE_MAX_INACTIVITY_HOURS ago. Costs 1 API call per
+                # candidate (~2.5s/each due to ST 1 RPS); only top COPY_TRADE_TOP_N
+                # candidates are checked to bound boot time.
+                cutoff_ms = int(time.time() * 1000) - COPY_TRADE_MAX_INACTIVITY_HOURS * 3600 * 1000
+                candidates = eligible[:COPY_TRADE_TOP_N]
+                log(f"COPY-TRADE: activity-filtering {len(candidates)} candidates "
+                    f"(must have traded in last {COPY_TRADE_MAX_INACTIVITY_HOURS}h, ~{len(candidates)*1.5:.0f}s)")
+                active = []
+                drops = 0
+                for addr, wr_n, realized in candidates:
+                    last_ms = await asyncio.to_thread(_wallet_last_trade_ms, addr)
+                    if last_ms is not None and last_ms >= cutoff_ms:
+                        age_h = (time.time() * 1000 - last_ms) / 3600000
+                        active.append((addr, wr_n, realized, age_h))
+                    else:
+                        drops += 1
+                    await asyncio.sleep(1.3)  # ST 1 RPS rate limit
+                active.sort(key=lambda x: -x[2])  # by realized PnL desc
+                top_traders = [a[0] for a in active]
                 last_refresh = now
-                log(f"COPY-TRADE: tracking {len(top_traders)} top traders")
-                for addr, wr_n, realized in eligible[:COPY_TRADE_TOP_N]:
-                    log(f"  - {addr} WR={wr_n*100:.1f}% realized={realized:.0f} SOL")
+                log(f"COPY-TRADE: {len(top_traders)} ACTIVE traders kept, {drops} stale dropped")
+                for addr, wr_n, realized, age_h in active[:30]:
+                    log(f"  - {addr} WR={wr_n*100:.1f}% realized={realized:.0f} SOL active={age_h:.1f}h ago")
                 if not top_traders:
-                    log("COPY-TRADE: no eligible traders, retrying in 60s")
+                    log("COPY-TRADE: no active traders survived filter, retrying in 60s")
                     await asyncio.sleep(60)
                     continue
             # V41.14: shredSubscribe via Solana Tracker RPC (50-150ms latency).
