@@ -3895,12 +3895,11 @@ COPY_FAST_MAX_PRICE_RATIO = float(os.environ.get("COPY_FAST_MAX_PRICE_RATIO", "1
 COPY_FAST_MIN_PRICE_RATIO = float(os.environ.get("COPY_FAST_MIN_PRICE_RATIO", "0.85"))
 # Fix #5: tighter wallet allowlist filter (uses existing top-traders metrics)
 COPY_TRADE_MIN_REALIZED_SOL = float(os.environ.get("COPY_TRADE_MIN_REALIZED_SOL", "1.0"))
-# V41.17m: WR threshold 0.50 → 0.40. V41.17l's realized=1 had zero effect because
-# the leaderboard's top 100 all have realized > 5 SOL — WR was the actual binding
-# filter (still gave 56 traders). Lowering WR to 0.40 includes 40-49% WR traders
-# who DID make 1+ SOL realized. Expected pool 56 → ~70-85.
-# Risk: lower-WR wallets are noisier. Gates will catch the noise.
-COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.40"))
+# V41.17o: REVERTED WR 0.40 → 0.50. V41.17m bumped pool 56 → 90 but shred volume
+# unexpectedly dropped 5-10x. User-flagged hypothesis: ST shredSubscribe throttles
+# accountInclude > ~75 wallets. Reverting to 56 (V41.17h known-good level). If
+# volume returns at 56 wallets, hypothesis confirmed and we accept 56 as the cap.
+COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.50"))
 # Fix #6: bundle freshness — abort if any bundle in last N seconds.
 # V41.17g: 60s → 30s. The 60s threshold treated "bundle 4s ago" the same as
 # "bundle 34s ago", which is too coarse. After 30s the bundle's actual buy txs
