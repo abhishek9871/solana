@@ -4091,6 +4091,36 @@ def _st_fetch_top_traders(needed: int = 25):
     return {"wallets": all_wallets} if all_wallets else None
 
 
+def _wallet_hot_signal(wallet: str) -> Optional[dict]:
+    """V41.17r: pull /pnl?showHistoricPnL for a wallet. Returns recent-perf dict or None.
+    Returns:
+      {'new1d_pnl': USD, 'new7d_pnl': USD, 'wr_1d': %, 'wr_7d': %}
+    Path within response: historic.summary.{1d|7d}.newTokens.total_pnl
+    The newTokens.total_pnl is the right signal for memecoin sniping — PnL on tokens
+    BOUGHT in the window (vs total which mixes in older holdings)."""
+    try:
+        r = requests.get(
+            f"{SOLANATRACKER_BASE}/pnl/{wallet}",
+            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            params={"showHistoricPnL": "true", "hideDetails": "true"},
+            timeout=60,
+        )
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        hs = (d.get("historic") or {}).get("summary") or {}
+        d1 = hs.get("1d") or {}
+        d7 = hs.get("7d") or {}
+        new1d_pnl = ((d1.get("newTokens") or {}).get("total_pnl")) or 0
+        new7d_pnl = ((d7.get("newTokens") or {}).get("total_pnl")) or 0
+        wr_1d = d1.get("winPercentage") or 0
+        wr_7d = d7.get("winPercentage") or 0
+        return {"new1d_pnl": new1d_pnl, "new7d_pnl": new7d_pnl,
+                "wr_1d": wr_1d, "wr_7d": wr_7d}
+    except Exception:
+        return None
+
+
 def _wallet_last_trade_ms(wallet: str) -> Optional[int]:
     """V41.17p: most-recent trade timestamp for a wallet via /wallet/{addr}/trades.
     Returns ms-epoch of trades[0].time, or None on error / no trades."""
@@ -5032,50 +5062,38 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                     await asyncio.sleep(60)
                     continue
                 wallets = data.get("wallets", []) if isinstance(data, dict) else []
-                # Filter & rank: require winPercentage >= threshold AND positive realized PnL
-                eligible = []
+                # V41.17r: REPLACED historical WR/realized filter + activity filter
+                # with a HOT filter using /pnl?showHistoricPnL. Diagnostic showed our
+                # all-time-WR top traders are CURRENTLY in drawdown (e.g., JDd3hy3g
+                # at 52% all-time WR is -$9k today, 29% WR_1d). The right signal is
+                # newTokens.total_pnl on 1d AND 7d windows — PnL on tokens BOUGHT
+                # in that window, the actual memecoin-sniping signal.
+                # Costs ~1.6s per wallet × 100 wallets = ~3 min boot. Refresh is
+                # every 6h so it amortizes fine.
+                log(f"COPY-TRADE: hot-filtering {len(wallets)} candidates via /pnl historic "
+                    f"(positive 1d AND 7d new-token PnL, ~{len(wallets)*1.6:.0f}s)")
+                hot = []
+                cold = 0
+                err = 0
                 for w in wallets:
-                    s = w.get("summary", {}) or {}
-                    wr = s.get("winPercentage")
-                    realized = s.get("realized") or 0
-                    if wr is None:
-                        continue
-                    # API returns winPercentage as 0-1 OR 0-100 inconsistently; normalize
-                    wr_n = wr / 100.0 if wr > 1.0 else wr
-                    # V41.17 Fix #5: tighter wallet filter — require both consistency
-                    # (winPercentage >= COPY_TRADE_MIN_WIN_RATE_TIGHT) AND meaningful PnL
-                    # scale (realized >= COPY_TRADE_MIN_REALIZED_SOL). Lottery-ticket
-                    # 1-SOL profit traders are not detectable enough to follow profitably.
-                    floor_wr = max(COPY_TRADE_MIN_WIN_RATE, COPY_TRADE_MIN_WIN_RATE_TIGHT)
-                    if wr_n >= floor_wr and realized >= COPY_TRADE_MIN_REALIZED_SOL:
-                        eligible.append((w["wallet"], wr_n, realized))
-                eligible.sort(key=lambda x: -x[2])  # by realized PnL desc
-                # V41.17p: activity filter. Drop wallets whose most-recent trade is
-                # older than COPY_TRADE_MAX_INACTIVITY_HOURS ago. Costs 1 API call per
-                # candidate (~2.5s/each due to ST 1 RPS); only top COPY_TRADE_TOP_N
-                # candidates are checked to bound boot time.
-                cutoff_ms = int(time.time() * 1000) - COPY_TRADE_MAX_INACTIVITY_HOURS * 3600 * 1000
-                candidates = eligible[:COPY_TRADE_TOP_N]
-                log(f"COPY-TRADE: activity-filtering {len(candidates)} candidates "
-                    f"(must have traded in last {COPY_TRADE_MAX_INACTIVITY_HOURS}h, ~{len(candidates)*1.5:.0f}s)")
-                active = []
-                drops = 0
-                for addr, wr_n, realized in candidates:
-                    last_ms = await asyncio.to_thread(_wallet_last_trade_ms, addr)
-                    if last_ms is not None and last_ms >= cutoff_ms:
-                        age_h = (time.time() * 1000 - last_ms) / 3600000
-                        active.append((addr, wr_n, realized, age_h))
+                    addr = w["wallet"]
+                    sig_ = await asyncio.to_thread(_wallet_hot_signal, addr)
+                    if sig_ is None:
+                        err += 1
+                    elif sig_["new1d_pnl"] > 0 and sig_["new7d_pnl"] > 0:
+                        hot.append((addr, sig_["new7d_pnl"], sig_["new1d_pnl"], sig_["wr_7d"]))
                     else:
-                        drops += 1
-                    await asyncio.sleep(1.3)  # ST 1 RPS rate limit
-                active.sort(key=lambda x: -x[2])  # by realized PnL desc
-                top_traders = [a[0] for a in active]
+                        cold += 1
+                    await asyncio.sleep(1.5)  # ST 1 RPS rate limit
+                hot.sort(key=lambda x: -x[1])  # by 7d new-token PnL desc
+                top_traders = [h[0] for h in hot[:COPY_TRADE_TOP_N]]
                 last_refresh = now
-                log(f"COPY-TRADE: {len(top_traders)} ACTIVE traders kept, {drops} stale dropped")
-                for addr, wr_n, realized, age_h in active[:30]:
-                    log(f"  - {addr} WR={wr_n*100:.1f}% realized={realized:.0f} SOL active={age_h:.1f}h ago")
+                log(f"COPY-TRADE: {len(top_traders)} HOT traders kept "
+                    f"({cold} cold, {err} err)")
+                for addr, p7d, p1d, wr7 in hot[:30]:
+                    log(f"  - {addr} new7d=+${p7d:.0f} new1d=+${p1d:.0f} wr7d={wr7:.0f}%")
                 if not top_traders:
-                    log("COPY-TRADE: no active traders survived filter, retrying in 60s")
+                    log("COPY-TRADE: no HOT traders survived filter, retrying in 60s")
                     await asyncio.sleep(60)
                     continue
             # V41.14: shredSubscribe via Solana Tracker RPC (50-150ms latency).
