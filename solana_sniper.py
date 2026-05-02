@@ -4704,10 +4704,16 @@ async def graduating_sniper(client: Client, kp: Optional[Keypair]):
 
 
 async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
-    """V41.13g: subscribe to top traders' wallets via Helius. Mirror their buys."""
+    """V41.13g: subscribe to top traders' wallets via Helius. Mirror their buys.
+    V41.17c: 5s startup grace prevents boot-time 429 collision with refresh_risk_cache
+    on the Data API 1 RPS budget. Without this grace, /top-traders/all/1 races
+    /tokens/multi/all and one of the two 429s, costing 60s of trader signal."""
     if not COPY_TRADE_ENABLED:
         log("COPY-TRADE: DISABLED")
         return
+    # V41.17c: yield to refresh_risk_cache's first 2 fetches (~1.5s) + buffer
+    log("COPY-TRADE: 5s startup grace before leaderboard fetch (avoids Data API collision)")
+    await asyncio.sleep(5)
     # Fetch top traders once at startup (and refresh every COPY_TRADE_REFRESH_HOURS)
     last_refresh = 0.0
     top_traders: list = []
