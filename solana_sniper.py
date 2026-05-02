@@ -145,6 +145,13 @@ ST_RPC_KEY = os.environ.get("SOLANATRACKER_RPC_KEY", "")
 ST_RPC_HTTP = os.environ.get("SOLANATRACKER_RPC_HTTP", "")
 ST_RPC_WS = os.environ.get("SOLANATRACKER_RPC_WS", "")
 ST_RPC_ENABLED = bool(ST_RPC_KEY and ST_RPC_WS)
+# V41.17t: env override to force Helius logsSubscribe path even when ST keys present.
+# User-flagged hypothesis: shred volume issues started when we moved from V41.13g
+# Helius-per-wallet logsSubscribe to V41.14 ST single-conn shredSubscribe with 56-100
+# accountInclude. This switch lets us A/B without removing keys.
+COPY_TRADE_FORCE_HELIUS = os.environ.get("COPY_TRADE_FORCE_HELIUS", "0") == "1"
+if COPY_TRADE_FORCE_HELIUS:
+    ST_RPC_ENABLED = False
 
 # Pump.fun program (post-2026-04-28 update)
 PUMP_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
