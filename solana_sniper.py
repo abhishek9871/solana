@@ -145,13 +145,6 @@ ST_RPC_KEY = os.environ.get("SOLANATRACKER_RPC_KEY", "")
 ST_RPC_HTTP = os.environ.get("SOLANATRACKER_RPC_HTTP", "")
 ST_RPC_WS = os.environ.get("SOLANATRACKER_RPC_WS", "")
 ST_RPC_ENABLED = bool(ST_RPC_KEY and ST_RPC_WS)
-# V41.17t: env override to force Helius logsSubscribe path even when ST keys present.
-# User-flagged hypothesis: shred volume issues started when we moved from V41.13g
-# Helius-per-wallet logsSubscribe to V41.14 ST single-conn shredSubscribe with 56-100
-# accountInclude. This switch lets us A/B without removing keys.
-COPY_TRADE_FORCE_HELIUS = os.environ.get("COPY_TRADE_FORCE_HELIUS", "0") == "1"
-if COPY_TRADE_FORCE_HELIUS:
-    ST_RPC_ENABLED = False
 
 # Pump.fun program (post-2026-04-28 update)
 PUMP_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
@@ -1186,6 +1179,36 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
 
         log(f"  GRAD WAIT {mint[:8]}: holding {GRAD_INITIAL_DELAY_SEC}s for Jupiter to index PumpSwap pool")
         await asyncio.sleep(GRAD_INITIAL_DELAY_SEC)
+
+        # V41.17t: smart-buyer-confirmed entry path — checks /first-buyers/{mint}
+        # for early-buyer quality. If >=COPY_FAST_SMART_BUYER_MIN early buyers are
+        # winning (realized>1 SOL on this token) AND still holding, the token has
+        # ORGANIC smart-money demand — bypass the strict 40-50% momentum gate.
+        # This is the ST-doc-derived solution: token-anchored signal vs hardcoded
+        # wallet pool.
+        if launchpad in ("pump", "bonk", "st_pump"):
+            smart_count, total_buyers = await asyncio.to_thread(_first_buyers_smart_count, mint)
+            if smart_count >= COPY_FAST_SMART_BUYER_MIN:
+                log(f"  GRAD SMART-BUYER {mint[:8]} ({launchpad}): {smart_count}/{total_buyers} "
+                    f"early buyers winning+holding — entering immediately, bypass momentum gate")
+                pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
+                if not pos:
+                    log(f"  GRAD BUY FAILED {mint[:8]} (smart-buyer path)")
+                    return
+                pos.strategy = "graduation"
+                pos.late_scalp = True
+                pos.entry_progress = 1.0
+                pos.entry_size_sol = GRAD_AMOUNT_SOL
+                pos.quality_score = 9   # smart-buyer signal is strongest
+                pos.launchpad = launchpad + "_smart"
+                pos.signal_time_ms = int(time.time() * 1000)
+                positions[mint] = pos
+                _record_entry_opened()
+                asyncio.create_task(manage_graduation_position(client, kp, pos))
+                return
+            elif smart_count > 0:
+                log(f"  GRAD SMART-BUYER {mint[:8]} ({launchpad}): only {smart_count}/{total_buyers} "
+                    f"smart buyers (<{COPY_FAST_SMART_BUYER_MIN}) — fall through to momentum gate")
 
         # Try to get a baseline quote — retry with backoff if Jupiter hasn't indexed yet
         probe_sol_lamports = int(0.001 * 1e9)  # tiny probe quote, just for price discovery
@@ -3888,6 +3911,12 @@ EXIT_CHECK_TIMEOUT_SEC = float(os.environ.get("EXIT_CHECK_TIMEOUT_SEC", "0.25"))
 EXIT_CHECK_ENABLED = os.environ.get("EXIT_CHECK_ENABLED", "1") == "1"
 # Fix #4: curve % gate at signal time
 COPY_FAST_MAX_CURVE_PCT = float(os.environ.get("COPY_FAST_MAX_CURVE_PCT", "75.0"))
+# V41.17t: smart-buyer-confirmed graduation entry. /first-buyers/{mint} gives the
+# first 100 buyers WITH PnL inline. Count those with realized>1 SOL on this token
+# AND still holding > 0 — these are winners who are still believing. Threshold of 3
+# means 3 distinct profitable holders confirms organic demand. Token-anchored signal:
+# we don't need to know WHICH wallets are smart in advance — the data tells us per token.
+COPY_FAST_SMART_BUYER_MIN = int(os.environ.get("COPY_FAST_SMART_BUYER_MIN", "3"))
 # Fix #11: slippage-vs-trader gate. The first live copy_fast loss (3t8wZxQJ -22% in 2s,
 # peak=1.00x) showed the structural pattern from memory: smart wallet's buy IS the pump,
 # we follow at +1s, curve has already topped. Solution: compare our probe quote price to
@@ -4096,6 +4125,43 @@ def _st_fetch_top_traders(needed: int = 25):
             log(f"  COPY-TRADE fetch err page={page}: {type(e).__name__}: {e}")
             break
     return {"wallets": all_wallets} if all_wallets else None
+
+
+def _first_buyers_smart_count(mint: str, min_realized: float = 1.0) -> tuple[int, int]:
+    """V41.17t: count smart buyers among first 100 buyers of a token via /first-buyers/{mint}.
+    A 'smart buyer' has BOTH realized > min_realized SOL on this token AND is still
+    holding > 0 (winning AND believing — not the same as 'made money then dumped').
+
+    Returns (smart_count, total_buyers). On error returns (0, 0).
+
+    Uses ST's /first-buyers endpoint which returns PnL DATA INLINE — no per-wallet
+    /pnl calls needed. Single call per graduating token (~100ms-2s)."""
+    try:
+        r = requests.get(
+            f"{SOLANATRACKER_BASE}/first-buyers/{mint}",
+            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return (0, 0)
+        data = r.json()
+        if isinstance(data, list):
+            buyers = data
+        elif isinstance(data, dict):
+            buyers = data.get("buyers") or data.get("data") or []
+        else:
+            buyers = []
+        if not buyers:
+            return (0, 0)
+        smart = 0
+        for b in buyers:
+            realized = b.get("realized") or 0
+            holding = b.get("holding") or 0
+            if realized > min_realized and holding > 0:
+                smart += 1
+        return (smart, len(buyers))
+    except Exception:
+        return (0, 0)
 
 
 def _wallet_hot_signal(wallet: str) -> Optional[dict]:
