@@ -4780,9 +4780,13 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
     if not COPY_TRADE_ENABLED:
         log("COPY-TRADE: DISABLED")
         return
-    # V41.17c: yield to refresh_risk_cache's first 2 fetches (~1.5s) + buffer
-    log("COPY-TRADE: 5s startup grace before leaderboard fetch (avoids Data API collision)")
-    await asyncio.sleep(5)
+    # V41.17c: yield to refresh_risk_cache's first 2 fetches.
+    # V41.17e: bumped 5s → 10s after observing the risk cache's first cycle takes
+    # ~6s end-to-end (network latency on /tokens/multi/all + 1.2s gap + /tokens/trending/5m
+    # + processing 1568 tokens). 5s grace caused the leaderboard fetch to land on top of
+    # the second risk-cache fetch, triggering a fresh 429 → 60s retry.
+    log("COPY-TRADE: 10s startup grace before leaderboard fetch (avoids Data API collision)")
+    await asyncio.sleep(10)
     # Fetch top traders once at startup (and refresh every COPY_TRADE_REFRESH_HOURS)
     last_refresh = 0.0
     top_traders: list = []
