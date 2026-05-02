@@ -1116,6 +1116,14 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                                 f"trader_px={trader_price:.4e} ratio={ratio:.3f}x > "
                                 f"{COPY_FAST_MAX_PRICE_RATIO:.2f}x — curve already moved past us")
                             return
+                        # V41.17h: floor — token dumped >15% since trader's buy, momentum broken.
+                        # CsZiG33J was 0.473x; would have caught it.
+                        if ratio < COPY_FAST_MIN_PRICE_RATIO:
+                            _copy_trade_stats["price_blocked"] += 1
+                            log(f"  GRAD ABORT {mint[:8]} (copy_fast): our_px={our_price:.4e} "
+                                f"trader_px={trader_price:.4e} ratio={ratio:.3f}x < "
+                                f"{COPY_FAST_MIN_PRICE_RATIO:.2f}x — token dumped after trader, momentum broken")
+                            return
                         log(f"  GRAD PRICE-OK {mint[:8]}: our/trader ratio={ratio:.3f}x")
                 except Exception:
                     pass
@@ -3860,6 +3868,12 @@ COPY_FAST_MAX_CURVE_PCT = float(os.environ.get("COPY_FAST_MAX_CURVE_PCT", "75.0"
 # the trader's actual buy price (parsed from their tx pre/post balances). If our entry
 # price > trader * 1.05, abort — curve moved against us, we'd be entering at peak.
 COPY_FAST_MAX_PRICE_RATIO = float(os.environ.get("COPY_FAST_MAX_PRICE_RATIO", "1.05"))
+# V41.17h: bidirectional. Second observed loss (CsZiG33J -3.6% capped by Fix #9) showed
+# the inverse pattern: ratio=0.473x meant the curve had ALREADY DUMPED 53% between
+# trader's buy and ours. Catching a falling knife — momentum broken, no rebound. Floor
+# at 0.85 catches obvious post-trader dumps while leaving margin for normal post-buy
+# settling (which moves ratio to ~0.95-1.00 on large trader buys, never to 0.85).
+COPY_FAST_MIN_PRICE_RATIO = float(os.environ.get("COPY_FAST_MIN_PRICE_RATIO", "0.85"))
 # Fix #5: tighter wallet allowlist filter (uses existing top-traders metrics)
 COPY_TRADE_MIN_REALIZED_SOL = float(os.environ.get("COPY_TRADE_MIN_REALIZED_SOL", "5.0"))
 COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.50"))
@@ -4987,7 +5001,7 @@ async def main():
     log(f"  Fix #8: simulateTransaction pre-flight for entries >${SIMULATE_NOTIONAL_USD_THRESHOLD:.0f} (live only)")
     log(f"  Fix #9: 8s no-pump time-stop on copy_fast {'[ACTIVE]' if TIME_STOP_ENABLED else '[disabled]'}")
     log(f"  Fix #10: Raptor /swap path (program-upgrade resilient — Apr 2026 buy 17→18 accts)")
-    log(f"  Fix #11: slippage-vs-trader gate (abort if our_price > trader_price × {COPY_FAST_MAX_PRICE_RATIO:.2f})")
+    log(f"  Fix #11: bidirectional slippage gate (abort if ratio > {COPY_FAST_MAX_PRICE_RATIO:.2f} or < {COPY_FAST_MIN_PRICE_RATIO:.2f})")
     log(f"  V41.17b: dump_rebound {'ENABLED' if DUMP_REBOUND_ENABLED else 'DISABLED'} — copy_fast-only session for clean PnL signal")
     log(f"  V41.17f: weak_scalp {'ENABLED' if WEAK_SCALP_ENABLED else 'DISABLED'} — kept late_breakout (winner this session)")
     log(f"=========================================")
