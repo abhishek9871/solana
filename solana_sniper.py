@@ -1020,7 +1020,8 @@ GRAD_TIMEOUT_ST_SEC = int(os.environ.get("GRAD_TIMEOUT_ST_SEC", "1800")) # 30 mi
 
 
 async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
-                           launchpad: str = "pump", signer: Optional[str] = None):
+                           launchpad: str = "pump", signer: Optional[str] = None,
+                           trader_price: float = 0.0):
     """V41: PumpSwap graduation sniper. V41.7: launchpad-aware (pump | bonk).
 
     When a pump.fun token graduates to PumpSwap, the bonding curve completes and
@@ -1088,6 +1089,28 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             if not baseline_quote or float(baseline_quote.get("outAmount", 0)) == 0:
                 log(f"  GRAD SKIP {mint[:8]}: copy_fast no Raptor/Jupiter route — skipping")
                 return
+            # V41.17d Fix #11: slippage-vs-trader gate. Compute the price our 0.001 SOL
+            # probe quote would yield, in lamports per smallest-unit token. Compare to
+            # trader's actual buy price (parsed in _handle_copy_trader_tx). If our entry
+            # would be > 5% above trader's price, the curve has already pumped past us —
+            # we'd be entering at peak (the structural failure mode that produced the
+            # peak=1.00x, -22% gap loss on 3t8wZxQJ). Skips when trader_price was
+            # unparseable (multi-token tx, etc.) — fail-OPEN.
+            if trader_price > 0:
+                try:
+                    probe_out = float(baseline_quote.get("outAmount", 0))
+                    if probe_out > 0:
+                        our_price = probe_sol_lamports / probe_out
+                        ratio = our_price / trader_price
+                        if ratio > COPY_FAST_MAX_PRICE_RATIO:
+                            _copy_trade_stats["price_blocked"] += 1
+                            log(f"  GRAD ABORT {mint[:8]} (copy_fast): our_px={our_price:.4e} "
+                                f"trader_px={trader_price:.4e} ratio={ratio:.3f}x > "
+                                f"{COPY_FAST_MAX_PRICE_RATIO:.2f}x — curve already moved past us")
+                            return
+                        log(f"  GRAD PRICE-OK {mint[:8]}: our/trader ratio={ratio:.3f}x")
+                except Exception:
+                    pass
             # V41.17 Fix #2: warm pool fast-path. If pre-built tx is fresh, ship it.
             # CRITICAL: the warm path submits the tx itself (no second swap via buy_token).
             # Bookkeeping quote runs AFTER send so its latency doesn't delay entry.
@@ -3819,6 +3842,12 @@ EXIT_CHECK_TIMEOUT_SEC = float(os.environ.get("EXIT_CHECK_TIMEOUT_SEC", "0.25"))
 EXIT_CHECK_ENABLED = os.environ.get("EXIT_CHECK_ENABLED", "1") == "1"
 # Fix #4: curve % gate at signal time
 COPY_FAST_MAX_CURVE_PCT = float(os.environ.get("COPY_FAST_MAX_CURVE_PCT", "75.0"))
+# Fix #11: slippage-vs-trader gate. The first live copy_fast loss (3t8wZxQJ -22% in 2s,
+# peak=1.00x) showed the structural pattern from memory: smart wallet's buy IS the pump,
+# we follow at +1s, curve has already topped. Solution: compare our probe quote price to
+# the trader's actual buy price (parsed from their tx pre/post balances). If our entry
+# price > trader * 1.05, abort — curve moved against us, we'd be entering at peak.
+COPY_FAST_MAX_PRICE_RATIO = float(os.environ.get("COPY_FAST_MAX_PRICE_RATIO", "1.05"))
 # Fix #5: tighter wallet allowlist filter (uses existing top-traders metrics)
 COPY_TRADE_MIN_REALIZED_SOL = float(os.environ.get("COPY_TRADE_MIN_REALIZED_SOL", "5.0"))
 COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.50"))
@@ -4009,6 +4038,8 @@ _copy_trade_stats = {
     # V41.17: new gate counters
     "curve_blocked": 0, "exit_blocked": 0, "first_buyer_blocked": 0,
     "bundle_fresh_blocked": 0, "warm_hit": 0, "warm_miss": 0,
+    # V41.17d Fix #11: price-ratio (slippage-vs-trader) blocks
+    "price_blocked": 0, "trader_price_unparseable": 0,
 }
 
 
@@ -4476,12 +4507,36 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
         # Compare pre/post token balances for the trader's owned token accounts
         pre = {}
         post = {}
+        # V41.17d Fix #11: also capture RAW (smallest-unit) amounts for price math.
+        # ui_amount has float-rounding loss for low-decimal tokens; raw `amount` (string)
+        # is the exact on-chain value. Need this to compute trader's actual buy price.
+        pre_raw = {}     # mint -> int (smallest units)
+        post_raw = {}    # mint -> int (smallest units)
         for b in (getattr(meta, "pre_token_balances", None) or []):
             if str(b.owner) == signer:
-                pre[str(b.mint)] = float(b.ui_token_amount.ui_amount or 0)
+                m = str(b.mint)
+                pre[m] = float(b.ui_token_amount.ui_amount or 0)
+                try:
+                    pre_raw[m] = int(b.ui_token_amount.amount or 0)
+                except Exception:
+                    pre_raw[m] = 0
         for b in (getattr(meta, "post_token_balances", None) or []):
             if str(b.owner) == signer:
-                post[str(b.mint)] = float(b.ui_token_amount.ui_amount or 0)
+                m = str(b.mint)
+                post[m] = float(b.ui_token_amount.ui_amount or 0)
+                try:
+                    post_raw[m] = int(b.ui_token_amount.amount or 0)
+                except Exception:
+                    post_raw[m] = 0
+        # V41.17d Fix #11: trader's SOL spend = pre_balance[0] - post_balance[0]
+        # (signer is account[0]; balance arrays are lamports). Includes ~5-10k lamports
+        # in tx fee + priority fee — negligible vs typical buy size, ignored.
+        try:
+            sol_spent_lamports = int((meta.pre_balances or [0])[0]) - int((meta.post_balances or [0])[0])
+            if sol_spent_lamports < 0:
+                sol_spent_lamports = 0
+        except Exception:
+            sol_spent_lamports = 0
         sol_mint = "So11111111111111111111111111111111111111112"
         # Find token where signer's balance INCREASED (= they bought it)
         found_buy = False
@@ -4540,13 +4595,27 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
                                 log(f"  COPY TRADE FIRST-BUYER-BLOCKED {signer[:8]} -> {mint[:8]}: "
                                     f"holding_rate={rate*100:.0f}% (token age {int(age_s)}s)")
                                 return
+                # V41.17d Fix #11: compute trader's actual buy price (lamports per
+                # smallest-unit token) for the slippage-vs-trader gate. Uses raw
+                # amounts (no float rounding) and the signer's full SOL delta (which
+                # includes trader's fees — same as the protocol-priced quote we'll
+                # compare against, so directly comparable).
+                trader_raw_diff = post_raw.get(mint, 0) - pre_raw.get(mint, 0)
+                trader_price = 0.0
+                if sol_spent_lamports > 0 and trader_raw_diff > 0:
+                    trader_price = sol_spent_lamports / trader_raw_diff
+                else:
+                    _copy_trade_stats["trader_price_unparseable"] += 1
                 _copy_trade_stats["fired"] += 1
-                log(f"*** COPY TRADE *** {signer[:8]} bought {mint} (sig={sig[:16]})")
+                log(f"*** COPY TRADE *** {signer[:8]} bought {mint} (sig={sig[:16]})"
+                    + (f" trader_px={trader_price:.4e}" if trader_price > 0 else " trader_px=unknown"))
                 # V41.14: copy_fast skips the 8s observation window. We had ~200ms
                 # shred-detection latency advantage; observation was killing the edge.
                 # V41.17 Fix #3: pass signer so graduation_snipe can verify smart wallet
                 # hasn't already exited (parallelized with probe quote — no added latency).
-                asyncio.create_task(graduation_snipe(client, kp, mint, launchpad="copy_fast", signer=signer))
+                # V41.17d Fix #11: pass trader_price for slippage-vs-trader gate.
+                asyncio.create_task(graduation_snipe(client, kp, mint, launchpad="copy_fast",
+                                                    signer=signer, trader_price=trader_price))
                 return
         if not found_buy:
             _copy_trade_stats["no_buy"] += 1
@@ -4897,6 +4966,7 @@ async def main():
     log(f"  Fix #8: simulateTransaction pre-flight for entries >${SIMULATE_NOTIONAL_USD_THRESHOLD:.0f} (live only)")
     log(f"  Fix #9: 8s no-pump time-stop on copy_fast {'[ACTIVE]' if TIME_STOP_ENABLED else '[disabled]'}")
     log(f"  Fix #10: Raptor /swap path (program-upgrade resilient — Apr 2026 buy 17→18 accts)")
+    log(f"  Fix #11: slippage-vs-trader gate (abort if our_price > trader_price × {COPY_FAST_MAX_PRICE_RATIO:.2f})")
     log(f"  V41.17b: dump_rebound {'ENABLED' if DUMP_REBOUND_ENABLED else 'DISABLED'} — copy_fast-only session for clean PnL signal")
     log(f"=========================================")
     asyncio.create_task(session_reporter())
