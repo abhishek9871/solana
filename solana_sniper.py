@@ -3712,8 +3712,21 @@ async def manage_position(client: Client, kp: Optional[Keypair], pos: Position):
                             pos.adds_done += 1
                             multiplier = current_price / pos.entry_price if pos.entry_price else multiplier
 
+            # V41.17j: Fix #9 ported into V40. 8s no-pump time-stop catches the dead-peak
+            # pattern that bled -$0.22 each on weak_scalp (14s) and momentum (24s). Faster
+            # exit caps loss at ~-$0.10 instead. Excludes late_breakout — that strategy
+            # legitimately can take 10-15s to start pumping (HTNtt1C1 winner this session
+            # might've been killed by an 8s gate); keep its existing 30s timeout.
+            if (pos.strategy != "late_breakout"
+                    and elapsed > TIME_STOP_NO_PUMP_SEC
+                    and pos.peak_price < GRAD_TRAILING_ACTIVATION):
+                reason = f"V40 8s NO-PUMP exit (age={elapsed:.1f}s peak={pos.peak_price:.3f}x mult={multiplier:.3f}x)"
+                log(f"  {reason} {pos.mint[:8]}")
+                if try_sell_fraction(reason, 1.0, multiplier): break
+
             # No-momentum bailout: V40 treats 1.00x exits as losses in paper, so there is
-            # no reason to sit in flat tokens.
+            # no reason to sit in flat tokens. (Slower fallback for late_breakout and any
+            # strategies the 8s gate skipped.)
             early_timeout = 14 if pos.late_scalp else EARLY_DUMP_TIMEOUT_SEC
             early_peak = 1.018 if pos.late_scalp else EARLY_DUMP_PEAK_THRESHOLD
             if elapsed > early_timeout and pos.peak_price < early_peak:
