@@ -239,7 +239,13 @@ EARLY_DUMP_TIMEOUT_SEC = 30           # V31: 30s (was 2min) — exit no-pump tok
 STARTING_CURVE_TOKENS = 793_100_000_000_000
 COBUY_HARD_NO_RUNWAY = 0.90           # >90% curve = almost no runway, do not chase
 LATE_SCALP_CURVE_START = 0.50         # 50-90% can be scalp-only if breakout confirms
-DUMP_REBOUND_ENABLED = True
+# V41.17b: dump-rebound DISABLED. Contrarian (buy-the-dump → hope for bounce) plays
+# fight the dominant momentum structure of pump.fun memecoins, where dumps mostly keep
+# dumping. Also pollutes the V41.17 copy_fast PnL signal — when we evaluate copy_fast's
+# session win rate, dump-rebound trades dilute the data. Cleanest path: one strategy
+# at a time. Both wait_for_dump_rebound() implementations already early-exit on this
+# flag (lines 826 and 3179), so disabling here cleanly bypasses every call site.
+DUMP_REBOUND_ENABLED = os.environ.get("DUMP_REBOUND_ENABLED", "0") == "1"
 DUMP_REBOUND_WAIT_SEC = 45            # V38.2: watch dumps longer for exhaustion bounce instead of instant skip
 DUMP_REBOUND_MIN_BOUNCE = 0.005       # +0.5% price uptick per tick = rebound confirmation
 MIN_MOMENTUM_GROWTH_3S = 0.003        # was 1.5%; too strict. +0.3% catches ignition
@@ -4885,6 +4891,7 @@ async def main():
     log(f"  Fix #8: simulateTransaction pre-flight for entries >${SIMULATE_NOTIONAL_USD_THRESHOLD:.0f} (live only)")
     log(f"  Fix #9: 8s no-pump time-stop on copy_fast {'[ACTIVE]' if TIME_STOP_ENABLED else '[disabled]'}")
     log(f"  Fix #10: Raptor /swap path (program-upgrade resilient — Apr 2026 buy 17→18 accts)")
+    log(f"  V41.17b: dump_rebound {'ENABLED' if DUMP_REBOUND_ENABLED else 'DISABLED'} — copy_fast-only session for clean PnL signal")
     log(f"=========================================")
     asyncio.create_task(session_reporter())
     asyncio.create_task(pumpportal_migration_listener(client, kp))
