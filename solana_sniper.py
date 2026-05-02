@@ -1263,14 +1263,20 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 return
             log(f"  GRAD MOMENTUM OK {mint[:8]} (st_pump): T+5s +{price_change*100:.1f}%, T+15s +{price_change_15*100:.1f}% — confirmed uptrend")
         else:
-            min_mom, max_mom = 0.40, 0.50
+            # V41.17n: lowered floor 40% → 10%. The 40% gate (V41.5) filtered out most
+            # graduations because they pump 5-20% not 40%+. The HTNtt1C1 winner this
+            # session was peak=1.09x — would never have made it through 40%. Lowering
+            # to 10% captures medium-pump continuations. Ceiling stays 50% (extreme
+            # spikes above 50% in 5s are pump-and-dump bait). Fix #9 8s time-stop
+            # caps losses on entries that don't continue past entry.
+            min_mom, max_mom = 0.10, 0.50
             if price_change < min_mom:
-                log(f"  GRAD SKIP {mint[:8]}: price dropping after 5s ({price_change*100:+.1f}%) — below {min_mom*100:.0f}% floor (40-50% graduation sweet spot)")
+                log(f"  GRAD SKIP {mint[:8]}: price weak after 5s ({price_change*100:+.1f}%) — below {min_mom*100:.0f}% floor")
                 return
             if price_change > max_mom:
-                log(f"  GRAD SKIP {mint[:8]}: extreme spike +{price_change*100:.1f}% in 5s — above {max_mom*100:.0f}% (40-50% graduation sweet spot)")
+                log(f"  GRAD SKIP {mint[:8]}: extreme spike +{price_change*100:.1f}% in 5s — above {max_mom*100:.0f}% (pump-dump bait)")
                 return
-            log(f"  GRAD MOMENTUM OK {mint[:8]} ({launchpad}): +{price_change*100:.1f}% in 5s (band: 40-50% graduation sweet spot)")
+            log(f"  GRAD MOMENTUM OK {mint[:8]} ({launchpad}): +{price_change*100:.1f}% in 5s (band: 10-50%)")
 
         log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): confirmed pump, buying {GRAD_AMOUNT_SOL} SOL")
         pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
