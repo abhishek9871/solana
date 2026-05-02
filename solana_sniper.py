@@ -246,6 +246,14 @@ LATE_SCALP_CURVE_START = 0.50         # 50-90% can be scalp-only if breakout con
 # at a time. Both wait_for_dump_rebound() implementations already early-exit on this
 # flag (lines 826 and 3179), so disabling here cleanly bypasses every call site.
 DUMP_REBOUND_ENABLED = os.environ.get("DUMP_REBOUND_ENABLED", "0") == "1"
+# V41.17f: weak_scalp DISABLED. By construction this strategy enters on WEAK signals
+# (e.g., bad round-trip quote, no Jupiter route in paper, low holders) and uses scout
+# size. Empirical: 5nn6F8sq lost -$0.22 on a 14s no-momentum exit, peak=1.00x — exactly
+# the "follow into something that doesn't pump" failure mode V41.17 was meant to cure
+# in copy_fast (Fix #11). V40's manage_position has no equivalent gate. Late_breakout
+# stays (different profile, just won +$0.54). Gated in choose_entry_amount → returns 0
+# → caller logs "NO ENTRY" and skips cleanly without per-site changes.
+WEAK_SCALP_ENABLED = os.environ.get("WEAK_SCALP_ENABLED", "0") == "1"
 DUMP_REBOUND_WAIT_SEC = 45            # V38.2: watch dumps longer for exhaustion bounce instead of instant skip
 DUMP_REBOUND_MIN_BOUNCE = 0.005       # +0.5% price uptick per tick = rebound confirmation
 MIN_MOMENTUM_GROWTH_3S = 0.003        # was 1.5%; too strict. +0.3% catches ignition
@@ -3264,7 +3272,11 @@ def choose_entry_amount(strategy: str, late_scalp: bool, quality_score: int) -> 
     one rug from wiping 4-8 wins. Bigger wins come from letting runners live and
     post-TP scale-ins, not from full-sizing the first candle.
     """
-    if strategy in {"micro_probe", "very_late_micro"}:
+    # V41.17f: weak_scalp killed (env: WEAK_SCALP_ENABLED=1 to revive).
+    disabled_strategies = {"micro_probe", "very_late_micro"}
+    if not WEAK_SCALP_ENABLED:
+        disabled_strategies.add("weak_scalp")
+    if strategy in disabled_strategies:
         return 0.0
     if strategy in {"dump_rebound", "late_breakout", "weak_scalp"} or late_scalp:
         return SCOUT_AMOUNT_SOL if quality_score >= MIN_IMPULSE_SCORE else 0.0
@@ -4972,6 +4984,7 @@ async def main():
     log(f"  Fix #10: Raptor /swap path (program-upgrade resilient — Apr 2026 buy 17→18 accts)")
     log(f"  Fix #11: slippage-vs-trader gate (abort if our_price > trader_price × {COPY_FAST_MAX_PRICE_RATIO:.2f})")
     log(f"  V41.17b: dump_rebound {'ENABLED' if DUMP_REBOUND_ENABLED else 'DISABLED'} — copy_fast-only session for clean PnL signal")
+    log(f"  V41.17f: weak_scalp {'ENABLED' if WEAK_SCALP_ENABLED else 'DISABLED'} — kept late_breakout (winner this session)")
     log(f"=========================================")
     asyncio.create_task(session_reporter())
     asyncio.create_task(pumpportal_migration_listener(client, kp))
