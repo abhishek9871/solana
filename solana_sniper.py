@@ -3863,8 +3863,13 @@ COPY_FAST_MAX_PRICE_RATIO = float(os.environ.get("COPY_FAST_MAX_PRICE_RATIO", "1
 # Fix #5: tighter wallet allowlist filter (uses existing top-traders metrics)
 COPY_TRADE_MIN_REALIZED_SOL = float(os.environ.get("COPY_TRADE_MIN_REALIZED_SOL", "5.0"))
 COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.50"))
-# Fix #6: bundle freshness — abort if any bundle in last N seconds
-BUNDLE_FRESHNESS_THRESHOLD_SEC = int(os.environ.get("BUNDLE_FRESHNESS_THRESHOLD_SEC", "60"))
+# Fix #6: bundle freshness — abort if any bundle in last N seconds.
+# V41.17g: 60s → 30s. The 60s threshold treated "bundle 4s ago" the same as
+# "bundle 34s ago", which is too coarse. After 30s the bundle's actual buy txs
+# are 6+ blocks deep, so the coordinated-entry risk window is largely past.
+# Empirical session 01:26-01:45 had 7 fresh-bundle blocks: ages 4,10,16,18,34,34,(re)1.
+# Two of those (the 34s ones) likely had survivable signal; recovering ~28% volume.
+BUNDLE_FRESHNESS_THRESHOLD_SEC = int(os.environ.get("BUNDLE_FRESHNESS_THRESHOLD_SEC", "30"))
 # Fix #7: first-buyer holding rate gate (only for tokens >60s old)
 FIRST_BUYER_MIN_HOLD_RATE = float(os.environ.get("FIRST_BUYER_MIN_HOLD_RATE", "0.30"))
 FIRST_BUYER_MIN_TOKEN_AGE_SEC = int(os.environ.get("FIRST_BUYER_MIN_TOKEN_AGE_SEC", "60"))
