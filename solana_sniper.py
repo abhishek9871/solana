@@ -1263,20 +1263,20 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 return
             log(f"  GRAD MOMENTUM OK {mint[:8]} (st_pump): T+5s +{price_change*100:.1f}%, T+15s +{price_change_15*100:.1f}% — confirmed uptrend")
         else:
-            # V41.17n: lowered floor 40% → 10%. The 40% gate (V41.5) filtered out most
-            # graduations because they pump 5-20% not 40%+. The HTNtt1C1 winner this
-            # session was peak=1.09x — would never have made it through 40%. Lowering
-            # to 10% captures medium-pump continuations. Ceiling stays 50% (extreme
-            # spikes above 50% in 5s are pump-and-dump bait). Fix #9 8s time-stop
-            # caps losses on entries that don't continue past entry.
-            min_mom, max_mom = 0.10, 0.50
+            # V41.17q: REVERTED V41.17n's 10% floor back to 40%. V41.17n entries
+            # (uoYL47TP +12%, FNKDEgJz +32.7%) both lost — peak never moved off
+            # 1.00x after entry. The +10-40% band was catching post-spike entries
+            # where the pump was already over. V41.5's 40-50% range is empirically
+            # better: tokens that pump 40%+ in 5s genuinely have momentum, those
+            # at +10-40% are mostly already-faded.
+            min_mom, max_mom = 0.40, 0.50
             if price_change < min_mom:
-                log(f"  GRAD SKIP {mint[:8]}: price weak after 5s ({price_change*100:+.1f}%) — below {min_mom*100:.0f}% floor")
+                log(f"  GRAD SKIP {mint[:8]}: price dropping after 5s ({price_change*100:+.1f}%) — below {min_mom*100:.0f}% floor (40-50% graduation sweet spot)")
                 return
             if price_change > max_mom:
-                log(f"  GRAD SKIP {mint[:8]}: extreme spike +{price_change*100:.1f}% in 5s — above {max_mom*100:.0f}% (pump-dump bait)")
+                log(f"  GRAD SKIP {mint[:8]}: extreme spike +{price_change*100:.1f}% in 5s — above {max_mom*100:.0f}% (40-50% graduation sweet spot)")
                 return
-            log(f"  GRAD MOMENTUM OK {mint[:8]} ({launchpad}): +{price_change*100:.1f}% in 5s (band: 10-50%)")
+            log(f"  GRAD MOMENTUM OK {mint[:8]} ({launchpad}): +{price_change*100:.1f}% in 5s (band: 40-50% graduation sweet spot)")
 
         log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): confirmed pump, buying {GRAD_AMOUNT_SOL} SOL")
         pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
@@ -4713,8 +4713,14 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
             )
             return
     # SLOW PATH: fall back to getTransaction (handles aggregator buys, Helius fallback)
+    # V41.17q: wrap in asyncio.to_thread — solana-py's get_transaction is SYNC and was
+    # blocking the event loop inside this coroutine. Under load (multiple concurrent
+    # shred handlers) the WS reader was backlogged and the server may have been
+    # dropping messages we'd otherwise receive. This is the candidate for the "shred
+    # volume mysteriously low" symptom.
     try:
-        tx = client.get_transaction(
+        tx = await asyncio.to_thread(
+            client.get_transaction,
             Signature.from_string(sig),
             max_supported_transaction_version=0,
             commitment=Confirmed,
