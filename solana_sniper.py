@@ -3889,12 +3889,12 @@ COPY_FAST_MAX_PRICE_RATIO = float(os.environ.get("COPY_FAST_MAX_PRICE_RATIO", "1
 COPY_FAST_MIN_PRICE_RATIO = float(os.environ.get("COPY_FAST_MIN_PRICE_RATIO", "0.85"))
 # Fix #5: tighter wallet allowlist filter (uses existing top-traders metrics)
 COPY_TRADE_MIN_REALIZED_SOL = float(os.environ.get("COPY_TRADE_MIN_REALIZED_SOL", "1.0"))
-COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.50"))
-# V41.17l: dropped realized threshold 5→1 SOL. Same-session pipeline showed 33 shreds /
-# 20 unique mints / 1 fire after gates — 56-trader pool is too narrow to consistently
-# produce entries through the gate cascade. Wallets with realized 1-5 SOL still have
-# >=50% WR (kept as quality floor); they expand the pool ~3-5x → more unique signals,
-# more fires per minute, more chances for the gates to actually pass through.
+# V41.17m: WR threshold 0.50 → 0.40. V41.17l's realized=1 had zero effect because
+# the leaderboard's top 100 all have realized > 5 SOL — WR was the actual binding
+# filter (still gave 56 traders). Lowering WR to 0.40 includes 40-49% WR traders
+# who DID make 1+ SOL realized. Expected pool 56 → ~70-85.
+# Risk: lower-WR wallets are noisier. Gates will catch the noise.
+COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.40"))
 # Fix #6: bundle freshness — abort if any bundle in last N seconds.
 # V41.17g: 60s → 30s. The 60s threshold treated "bundle 4s ago" the same as
 # "bundle 34s ago", which is too coarse. After 30s the bundle's actual buy txs
