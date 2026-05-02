@@ -5021,19 +5021,26 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
             try:
                 if ST_RPC_ENABLED:
                     async with websockets.connect(ST_RPC_WS, ping_interval=10, ping_timeout=20) as ws:
-                        # V41.17i: encoding=jsonParsed unlocks shred-direct buy ix parsing
-                        # (saves the ~600-800ms getTransaction call in the hot path).
+                        # V41.17k: REVERTED to base64 encoding. jsonParsed (V41.17i) caused
+                        # ~10× volume drop on the shred stream — server-side parse seems
+                        # to throttle the firehose. We only got 6 shreds in 7 minutes vs
+                        # prior 10-50/min on base64. Fast-path latency saving was moot
+                        # (0 of 6 shreds were direct pump.fun buys; all 6 were wrong_signer).
+                        # Volume > latency when we have nothing to evaluate. Slow path
+                        # (getTransaction) handles all shreds. _parse_shred_for_pump_buy
+                        # remains in the codebase — it auto-no-ops on base64 (transaction
+                        # field is a [b64, "base64"] array, not a parsed dict).
                         sub_msg = {
                             "jsonrpc": "2.0", "id": 9000,
                             "method": "shredSubscribe",
                             "params": [
                                 {"accountInclude": top_traders, "vote": False},
-                                {"encoding": "jsonParsed", "transactionDetails": "full",
+                                {"encoding": "base64", "transactionDetails": "full",
                                  "maxSupportedTransactionVersion": 0},
                             ],
                         }
                         await ws.send(json.dumps(sub_msg))
-                        log(f"COPY-TRADE: subscribed via ST shredSubscribe (jsonParsed) for {len(top_traders)} wallets")
+                        log(f"COPY-TRADE: subscribed via ST shredSubscribe (base64) for {len(top_traders)} wallets — slow-path always (volume > latency)")
                         async for raw in ws:
                             data = json.loads(raw)
                             if "method" not in data:
