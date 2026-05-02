@@ -4506,11 +4506,146 @@ def _consume_warm_swap_tx(mint: str) -> Optional[tuple[str, int]]:
     return tx_b64, lvbh
 
 
-async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str, trader_set: set):
-    """Parse a transaction emitted by a top trader. If they BOUGHT a token, copy-buy it.
-    V41.15d: REVERTED to Confirmed — getTransaction rejects Processed with
-    'Method does not support commitment below confirmed'. The Processed change
-    was silently failing 100% of the time."""
+# V41.17i: pump.fun program ID + buy ix discriminator for direct shred parsing.
+# Buy ix args (Borsh): u64 amount (tokens to receive), u64 max_sol_cost (slippage cap).
+# Per IDL, mint is at instruction.accounts[2].
+_PUMP_PROGRAM_STR = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+_DISC_BUY_BYTES = bytes([102, 6, 61, 18, 1, 218, 235, 234])
+_BONK_PROGRAM_STR = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+
+
+def _parse_shred_for_pump_buy(shred_result: dict, trader_set: set) -> Optional[dict]:
+    """V41.17i: extract the pump.fun (or bonk.fun) buy ix directly from a jsonParsed
+    shred. Returns dict with signer/mint/amount/max_sol_cost/trader_price — or None
+    if no buy ix found (caller falls back to getTransaction).
+
+    Saves the ~600-800ms getTransaction round-trip that was the dominant cost in
+    the copy_fast hot path. Trade-off: trader_price is computed from max_sol_cost
+    (the slippage limit they set), which is a slight overestimate of their actual
+    fill price — conservative for the Fix #11 gate (errs toward letting entries
+    through on the high side, blocking on the low side).
+
+    Aggregator-routed buys (Jupiter/Raptor) have no direct pump.fun ix in the tx;
+    those drop to the slow path."""
+    try:
+        tx_obj = (shred_result.get("transaction") or {}).get("transaction") or {}
+        message = tx_obj.get("message") or {}
+        account_keys = message.get("accountKeys") or []
+        instructions = message.get("instructions") or []
+        if not account_keys or not instructions:
+            return None
+        # First entry in accountKeys is the fee-payer/signer. jsonParsed gives objects
+        # like {"pubkey": "...", "signer": true, "writable": true, ...}.
+        first = account_keys[0]
+        signer = first.get("pubkey", "") if isinstance(first, dict) else str(first)
+        if signer not in trader_set:
+            return None
+        for ix in instructions:
+            pid = ix.get("programId", "")
+            if pid != _PUMP_PROGRAM_STR and pid != _BONK_PROGRAM_STR:
+                continue
+            data_b58 = ix.get("data", "")
+            if not data_b58:
+                continue
+            try:
+                data_bytes = base58.b58decode(data_b58)
+            except Exception:
+                continue
+            if len(data_bytes) < 24:
+                continue
+            # Pump.fun and bonk.fun share the same buy discriminator
+            if data_bytes[:8] != _DISC_BUY_BYTES:
+                continue
+            amount = int.from_bytes(data_bytes[8:16], "little")
+            max_sol_cost = int.from_bytes(data_bytes[16:24], "little")
+            if amount == 0 or max_sol_cost == 0:
+                continue
+            ix_accounts = ix.get("accounts", [])
+            if len(ix_accounts) < 3:
+                continue
+            # accounts[] in jsonParsed shred MAY be either indices (legacy) OR pubkey
+            # strings (newer servers). Handle both.
+            mint_ref = ix_accounts[2]
+            if isinstance(mint_ref, int):
+                if mint_ref >= len(account_keys):
+                    continue
+                ak = account_keys[mint_ref]
+                mint = ak.get("pubkey", "") if isinstance(ak, dict) else str(ak)
+            else:
+                mint = str(mint_ref)
+            if not mint:
+                continue
+            trader_price = max_sol_cost / amount
+            return {
+                "signer": signer,
+                "mint": mint,
+                "amount": amount,
+                "max_sol_cost": max_sol_cost,
+                "trader_price": trader_price,
+                "launchpad": "bonk" if pid == _BONK_PROGRAM_STR else "pump",
+            }
+        return None
+    except Exception:
+        return None
+
+
+async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
+                                signer: str, mint: str, trader_price: float, source: str):
+    """V41.17i: shared gate cascade for both fast (shred) and slow (getTransaction) paths.
+    Runs dedup → memecoin filter → claim → rug check → curve gate → first-buyer gate,
+    then fires graduation_snipe(launchpad="copy_fast") on success."""
+    if mint in graduated_seen:
+        _copy_trade_stats["dedup"] += 1
+        return
+    mint_lc = mint.lower()
+    if not (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
+        _copy_trade_stats["non_memecoin"] += 1
+        return
+    graduated_seen.add(mint)
+    if len(graduated_seen) > 500:
+        graduated_seen.clear()
+    safe, reason, snap = await asyncio.to_thread(_rug_check_with_snapshot, mint)
+    if not safe:
+        _copy_trade_stats["rug_blocked"] += 1
+        if "fresh bundle" in (reason or ""):
+            _copy_trade_stats["bundle_fresh_blocked"] += 1
+        log(f"  COPY TRADE RUG-BLOCKED {signer[:8]} -> {mint[:8]}: {reason}")
+        return
+    cv_ok, cv_reason = _curve_pct_gate(snap)
+    if not cv_ok:
+        _copy_trade_stats["curve_blocked"] += 1
+        log(f"  COPY TRADE CURVE-BLOCKED {signer[:8]} -> {mint[:8]}: {cv_reason}")
+        return
+    if FIRST_BUYER_GATE_ENABLED and snap is not None:
+        created_at_ms = snap.get("createdAt")
+        if created_at_ms:
+            try:
+                age_s = (time.time() * 1000 - float(created_at_ms)) / 1000
+            except Exception:
+                age_s = 0
+            if age_s > FIRST_BUYER_MIN_TOKEN_AGE_SEC:
+                rate = await asyncio.to_thread(_first_buyer_holding_rate, mint)
+                if rate is not None and rate < FIRST_BUYER_MIN_HOLD_RATE:
+                    _copy_trade_stats["first_buyer_blocked"] += 1
+                    log(f"  COPY TRADE FIRST-BUYER-BLOCKED {signer[:8]} -> {mint[:8]}: "
+                        f"holding_rate={rate*100:.0f}% (token age {int(age_s)}s)")
+                    return
+    _copy_trade_stats["fired"] += 1
+    log(f"*** COPY TRADE *** {signer[:8]} bought {mint} (sig={sig[:16]}) trader_px={trader_price:.4e} [{source}]")
+    asyncio.create_task(graduation_snipe(client, kp, mint, launchpad="copy_fast",
+                                        signer=signer, trader_price=trader_price))
+
+
+async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str,
+                                 trader_set: set, shred_result: Optional[dict] = None):
+    """V41.17i: dual-path dispatch. Fast path parses the pump.fun buy ix directly
+    from the shred (~5ms), saving 600-800ms over getTransaction. Falls back to
+    getTransaction for aggregator-routed buys (Jupiter/Raptor) where there's no
+    direct pump.fun ix in the tx, and for non-shred legacy callers (Helius
+    logsSubscribe path).
+
+    V41.15d: legacy slow path uses commitment=Confirmed (getTransaction rejects
+    Processed; we hit a 100% silent-failure bug there in V41.15c)."""
     _copy_trade_stats["shreds"] += 1
     if sig in _copy_trader_seen_sigs:
         _copy_trade_stats["sig_dedup"] += 1
@@ -4518,6 +4653,15 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
     _copy_trader_seen_sigs.add(sig)
     if len(_copy_trader_seen_sigs) > 5000:
         _copy_trader_seen_sigs.clear()
+    # FAST PATH: parse the shred directly (V41.17i)
+    if shred_result is not None:
+        fast = _parse_shred_for_pump_buy(shred_result, trader_set)
+        if fast is not None:
+            await _dispatch_copy_signal(
+                client, kp, sig, fast["signer"], fast["mint"], fast["trader_price"], "shred",
+            )
+            return
+    # SLOW PATH: fall back to getTransaction (handles aggregator buys, Helius fallback)
     try:
         tx = client.get_transaction(
             Signature.from_string(sig),
@@ -4864,18 +5008,19 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
             try:
                 if ST_RPC_ENABLED:
                     async with websockets.connect(ST_RPC_WS, ping_interval=10, ping_timeout=20) as ws:
-                        # Single shredSubscribe with all wallets in accountInclude
+                        # V41.17i: encoding=jsonParsed unlocks shred-direct buy ix parsing
+                        # (saves the ~600-800ms getTransaction call in the hot path).
                         sub_msg = {
                             "jsonrpc": "2.0", "id": 9000,
                             "method": "shredSubscribe",
                             "params": [
                                 {"accountInclude": top_traders, "vote": False},
-                                {"encoding": "base64", "transactionDetails": "full",
+                                {"encoding": "jsonParsed", "transactionDetails": "full",
                                  "maxSupportedTransactionVersion": 0},
                             ],
                         }
                         await ws.send(json.dumps(sub_msg))
-                        log(f"COPY-TRADE: subscribed via ST shredSubscribe for {len(top_traders)} wallets (50-150ms latency)")
+                        log(f"COPY-TRADE: subscribed via ST shredSubscribe (jsonParsed) for {len(top_traders)} wallets")
                         async for raw in ws:
                             data = json.loads(raw)
                             if "method" not in data:
@@ -4887,7 +5032,8 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                             if time.time() - last_refresh > COPY_TRADE_REFRESH_HOURS * 3600:
                                 log("COPY-TRADE: leaderboard refresh due — reconnecting")
                                 break
-                            asyncio.create_task(_handle_copy_trader_tx(client, kp, sig, trader_set))
+                            # V41.17i: pass the shred result for fast-path direct parse
+                            asyncio.create_task(_handle_copy_trader_tx(client, kp, sig, trader_set, res))
                 else:
                     # Fallback: Helius logsSubscribe (slower, ~500-1500ms)
                     async with websockets.connect(SOLANA_WS_URL, ping_interval=10, ping_timeout=20) as ws:
