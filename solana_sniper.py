@@ -299,6 +299,8 @@ class Position:
     entry_size_sol: float = 0.0        # actual size chosen by V39 sizing logic
     adds_done: int = 0                 # scale-ins already executed
     launchpad: str = "pump"            # V41.7: "pump" or "bonk" — affects fee math + TP threshold
+    # V41.17 Fix #9: copy_fast entries stamp the original shred time for the 8s no-pump time-stop
+    signal_time_ms: int = 0
 
 
 positions: dict[str, Position] = {}
@@ -1011,7 +1013,8 @@ GRAD_TIMEOUT_SEC = int(os.environ.get("GRAD_TIMEOUT_SEC", "90"))        # 90s �
 GRAD_TIMEOUT_ST_SEC = int(os.environ.get("GRAD_TIMEOUT_ST_SEC", "1800")) # 30 min hold for ST clean mints
 
 
-async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str, launchpad: str = "pump"):
+async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
+                           launchpad: str = "pump", signer: Optional[str] = None):
     """V41: PumpSwap graduation sniper. V41.7: launchpad-aware (pump | bonk).
 
     When a pump.fun token graduates to PumpSwap, the bonding curve completes and
@@ -1030,6 +1033,10 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str, lau
       3. Retry up to GRAD_JUPITER_RETRY_MAX if no route yet
       4. Buy GRAD_AMOUNT_SOL
       5. Tight TP ladder + tight SL + short timeout
+
+    V41.17: copy_fast branch parallelizes the probe quote with a smart-wallet
+    exit check (Fix #3) so we abort if the trader has already dumped, AND
+    consults the warm /stream/swap pool (Fix #2) for ~10-30ms entries vs 300-500ms.
     """
     global session_pnl_sol
     try:
@@ -1052,22 +1059,74 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str, lau
         # have ~200ms latency advantage. Burning it on observation wait kills the edge.
         # Skip observation entirely and buy on the same block the trader bought.
         if launchpad == "copy_fast":
+            signal_time_ms = int(time.time() * 1000)
             probe_sol_lamports = int(0.001 * 1e9)
-            baseline_quote = jupiter_quote(SOL_MINT, mint, probe_sol_lamports)
+            # V41.17 Fix #3: race the probe quote with a smart-wallet exit check.
+            # Both calls are ~150-300ms; running them in parallel adds zero hot-path
+            # latency. If the smart wallet has already sold this mint, we'd be
+            # buying their exit liquidity — abort.
+            quote_task = asyncio.create_task(asyncio.to_thread(
+                jupiter_quote, SOL_MINT, mint, probe_sol_lamports
+            ))
+            if EXIT_CHECK_ENABLED and signer:
+                exit_task = asyncio.create_task(_smart_wallet_still_holding(signer, mint))
+            else:
+                exit_task = None
+            baseline_quote = await quote_task
+            if exit_task is not None:
+                still_holding = await exit_task
+                if not still_holding:
+                    _copy_trade_stats["exit_blocked"] += 1
+                    log(f"  GRAD ABORT {mint[:8]} (copy_fast): smart wallet {signer[:8]} already sold")
+                    return
             if not baseline_quote or float(baseline_quote.get("outAmount", 0)) == 0:
                 log(f"  GRAD SKIP {mint[:8]}: copy_fast no Raptor/Jupiter route — skipping")
                 return
-            log(f"  GRAD ENTRY {mint[:8]} (copy_fast): trader signal, entering immediately, buying {GRAD_AMOUNT_SOL} SOL")
-            pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
-            if not pos:
-                log(f"  GRAD BUY FAILED {mint[:8]}")
-                return
+            # V41.17 Fix #2: warm pool fast-path. If pre-built tx is fresh, ship it.
+            # CRITICAL: the warm path submits the tx itself (no second swap via buy_token).
+            # Bookkeeping quote runs AFTER send so its latency doesn't delay entry.
+            pos = None
+            warm = _consume_warm_swap_tx(mint) if (not PAPER_TRADING and kp) else None
+            if warm:
+                tx_b64, _lvbh = warm
+                log(f"  GRAD WARM HIT {mint[:8]} (copy_fast): pre-built tx, shipping immediately")
+                # Skip simulation on warm path — Raptor already validated the tx; latency wins
+                sig_out = execute_swap(kp, client, tx_b64, simulate_first=False)
+                if sig_out:
+                    # Post-send bookkeeping — quote latency now irrelevant for entry timing
+                    bookkeep = jupiter_quote(SOL_MINT, mint, int(GRAD_AMOUNT_SOL * 10**WSOL_DECIMALS))
+                    out_amt = float(bookkeep.get("outAmount", 0)) if bookkeep else 0.0
+                    if out_amt > 0:
+                        entry_price = int(GRAD_AMOUNT_SOL * 10**WSOL_DECIMALS) / out_amt
+                        pos = Position(
+                            mint=mint, entry_price=entry_price,
+                            entry_amount_sol=GRAD_AMOUNT_SOL, token_amount=out_amt,
+                            open_time=time.time(),
+                            bc_pda=derive_bc_pda(Pubkey.from_string(mint)),
+                        )
+                        _copy_trade_stats["warm_hit"] += 1
+                        log(f"  GRAD WARM ENTERED {mint[:8]} @ {entry_price:.6e} (sig={sig_out[:16]})")
+                    else:
+                        log(f"  GRAD WARM bookkeeping quote failed {mint[:8]} — pos lost from accounting")
+                else:
+                    log(f"  GRAD WARM tx send failed {mint[:8]} — falling back to standard buy")
+                    _copy_trade_stats["warm_miss"] += 1
+            # Fallback to standard buy_token (does its own quote+swap+send)
+            if pos is None:
+                log(f"  GRAD ENTRY {mint[:8]} (copy_fast): trader signal, entering immediately, buying {GRAD_AMOUNT_SOL} SOL")
+                pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
+                if not pos:
+                    log(f"  GRAD BUY FAILED {mint[:8]}")
+                    return
             pos.strategy = "graduation"
             pos.late_scalp = True
             pos.entry_progress = 1.0
             pos.entry_size_sol = GRAD_AMOUNT_SOL
             pos.quality_score = 8
             pos.launchpad = launchpad
+            # V41.17 Fix #9: stamp signal time so manage_graduation_position can apply
+            # the 8s no-pump time-stop without affecting non-copy-fast flows.
+            pos.signal_time_ms = signal_time_ms
             positions[mint] = pos
             _record_entry_opened()
             asyncio.create_task(manage_graduation_position(client, kp, pos))
@@ -1249,6 +1308,23 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             multiplier = sol_per_unit / pos.entry_price if pos.entry_price else 1.0
             if multiplier > pos.peak_price:
                 pos.peak_price = multiplier
+
+            # V41.17 Fix #9: 8s no-pump time-stop for copy_fast entries.
+            # Empirical: 4 winners hit 1.04x activation in 3-5s; 3 losers sat dead at
+            # 0.97-1.02x for 15+s before tanking. If peak hasn't reached activation by
+            # TIME_STOP_NO_PUMP_SEC, the pump has died — exit at current price (cap loss
+            # at -1% to break-even rather than trailing's eventual -4%). Only fires BEFORE
+            # trailing activates; once activated, trailing logic owns the exit.
+            if (TIME_STOP_ENABLED and pos.launchpad == "copy_fast"
+                    and pos.signal_time_ms > 0
+                    and pos.peak_price < GRAD_TRAILING_ACTIVATION):
+                age_s = (time.time() * 1000 - pos.signal_time_ms) / 1000
+                if age_s > TIME_STOP_NO_PUMP_SEC:
+                    if try_grad_sell(
+                        f"GRAD 8s NO-PUMP exit (age={age_s:.1f}s peak={pos.peak_price:.3f}x mult={multiplier:.3f}x)",
+                        1.0, multiplier,
+                    ):
+                        break
 
             # V41.13o + V41.14d: TRAILING STOP with slippage protection.
             # Empirical: full-position sell into $5-15k pool slips 2-5%. If trail floor is
@@ -1796,12 +1872,26 @@ def jupiter_swap(quote: dict, user_pubkey: str) -> Optional[str]:
         return None
 
 
-def execute_swap(kp: Keypair, client: Client, swap_tx_b64: str) -> Optional[str]:
-    """Sign and broadcast a Jupiter swap transaction. Returns signature."""
+def execute_swap(kp: Keypair, client: Client, swap_tx_b64: str, simulate_first: bool = False) -> Optional[str]:
+    """Sign and broadcast a Jupiter/Raptor swap transaction. Returns signature.
+
+    V41.17 Fix #8: when simulate_first=True, calls simulateTransaction before
+    sending. If simulation reports an error, abort — saves gas on tx that would
+    fail due to mid-flight slippage races. Adds ~30-50ms latency; only worth on
+    entries above SIMULATE_NOTIONAL_USD_THRESHOLD."""
     try:
         raw = base64.b64decode(swap_tx_b64)
         vt = VersionedTransaction.from_bytes(raw)
         signed = VersionedTransaction(vt.message, [kp])
+        if simulate_first:
+            try:
+                sim = client.simulate_transaction(signed)
+                if sim.value and getattr(sim.value, "err", None):
+                    log(f"  swap SIM REJECTED: {sim.value.err} — aborting send (saves gas)")
+                    return None
+            except Exception as e:
+                # Simulation infra error — log and proceed (don't block on infra)
+                log(f"  swap sim err (proceeding anyway): {type(e).__name__}: {str(e)[:120]}")
         serialized = bytes(signed)
         result = client.send_raw_transaction(serialized)
         sig = str(result.value)
@@ -1880,10 +1970,21 @@ def buy_token(kp: Optional[Keypair], client: Client, mint: str, amount_sol: floa
     if not kp:
         log(f"  ERR: live mode but no keypair")
         return None
-    swap_tx = jupiter_swap(quote, str(kp.pubkey()))
+    # V41.17 Fix #10: prefer Raptor /swap when the quote came from Raptor —
+    # auto-tracks pump.fun program upgrades (Apr-2026 17→18 account upgrade
+    # silently broke raw-ix bots). Fall back to Jupiter if Raptor swap-build fails.
+    swap_tx = None
+    if quote and quote.get("_source") == "raptor":
+        swap_tx = raptor_swap_build(quote, str(kp.pubkey()))
+    if not swap_tx:
+        swap_tx = jupiter_swap(quote, str(kp.pubkey()))
     if not swap_tx:
         return None
-    sig = execute_swap(kp, client, swap_tx)
+    # V41.17 Fix #8: pre-flight simulation for entries above SIMULATE_NOTIONAL_USD_THRESHOLD.
+    # SOL ~$170 → 0.03 SOL ≈ $5. Skips simulation on tiny scout entries.
+    notional_threshold_sol = SIMULATE_NOTIONAL_USD_THRESHOLD / 170.0
+    should_sim = amount_sol >= notional_threshold_sol
+    sig = execute_swap(kp, client, swap_tx, simulate_first=should_sim)
     if not sig:
         return None
     pos = Position(mint=mint, entry_price=entry_price,
@@ -3699,6 +3800,47 @@ COPY_TRADE_MIN_WIN_RATE = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE", "0.0")
 ST_MIN_LIQUIDITY_USD = float(os.environ.get("ST_MIN_LIQUIDITY_USD", "2000.0"))
 ST_MAX_LIQUIDITY_USD = float(os.environ.get("ST_MAX_LIQUIDITY_USD", "500000.0"))
 
+# === V41.17: latency + correctness fixes (mastery-doc-derived) ===
+# Fix #1: pre-cached risk snapshots → 5ms hot-path lookup vs 200-400ms HTTP
+RISK_CACHE_TTL_SEC = int(os.environ.get("RISK_CACHE_TTL_SEC", "30"))
+RISK_CACHE_REFRESH_SEC = int(os.environ.get("RISK_CACHE_REFRESH_SEC", "15"))
+# Fix #2: pre-warmed Raptor /stream/swap pool → ~10-30ms entry vs 300-500ms
+WARM_POOL_SIZE = int(os.environ.get("WARM_POOL_SIZE", "50"))
+WARM_SWAP_TTL_SEC = int(os.environ.get("WARM_SWAP_TTL_SEC", "15"))
+WARM_POOL_ENABLED = os.environ.get("WARM_POOL_ENABLED", "1") == "1"
+# Fix #3: smart-wallet exit pre-flight (overlap with quote — no added latency)
+EXIT_CHECK_TIMEOUT_SEC = float(os.environ.get("EXIT_CHECK_TIMEOUT_SEC", "0.25"))
+EXIT_CHECK_ENABLED = os.environ.get("EXIT_CHECK_ENABLED", "1") == "1"
+# Fix #4: curve % gate at signal time
+COPY_FAST_MAX_CURVE_PCT = float(os.environ.get("COPY_FAST_MAX_CURVE_PCT", "75.0"))
+# Fix #5: tighter wallet allowlist filter (uses existing top-traders metrics)
+COPY_TRADE_MIN_REALIZED_SOL = float(os.environ.get("COPY_TRADE_MIN_REALIZED_SOL", "5.0"))
+COPY_TRADE_MIN_WIN_RATE_TIGHT = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE_TIGHT", "0.50"))
+# Fix #6: bundle freshness — abort if any bundle in last N seconds
+BUNDLE_FRESHNESS_THRESHOLD_SEC = int(os.environ.get("BUNDLE_FRESHNESS_THRESHOLD_SEC", "60"))
+# Fix #7: first-buyer holding rate gate (only for tokens >60s old)
+FIRST_BUYER_MIN_HOLD_RATE = float(os.environ.get("FIRST_BUYER_MIN_HOLD_RATE", "0.30"))
+FIRST_BUYER_MIN_TOKEN_AGE_SEC = int(os.environ.get("FIRST_BUYER_MIN_TOKEN_AGE_SEC", "60"))
+FIRST_BUYER_CACHE_TTL_SEC = int(os.environ.get("FIRST_BUYER_CACHE_TTL_SEC", "30"))
+FIRST_BUYER_GATE_ENABLED = os.environ.get("FIRST_BUYER_GATE_ENABLED", "1") == "1"
+# Fix #8: simulateTransaction pre-flight for entries above $5 (live mode only)
+SIMULATE_NOTIONAL_USD_THRESHOLD = float(os.environ.get("SIMULATE_NOTIONAL_USD_THRESHOLD", "5.0"))
+# Fix #9: 8-second no-pump time-stop for copy_fast entries
+TIME_STOP_NO_PUMP_SEC = float(os.environ.get("TIME_STOP_NO_PUMP_SEC", "8.0"))
+TIME_STOP_ENABLED = os.environ.get("TIME_STOP_ENABLED", "1") == "1"
+
+# === V41.17 STATE ===
+# Risk cache: mint -> (snapshot_dict, fetched_at_epoch)
+_risk_cache: dict = {}
+_risk_cache_stats = {"hits": 0, "misses": 0, "stale": 0, "fills": 0, "live_fallback": 0}
+# Pre-warmed swap tx cache: mint -> (swap_tx_b64, lastValidBlockHeight, fetched_at_epoch)
+_warm_swap_cache: dict = {}
+_warm_pool_stats = {"hits": 0, "misses": 0, "stale": 0, "subscribes": 0, "msgs_in": 0}
+# First-buyer holding-rate cache: mint -> (rate, fetched_at_epoch)
+_first_buyers_cache: dict = {}
+# Wallets currently warm in /stream/swap (single set for all subs on the connection)
+_warm_subscribed_mints: set = set()
+
 
 def _st_fetch(path: str):
     try:
@@ -3854,18 +3996,161 @@ def _st_fetch_top_traders(needed: int = 25):
 
 
 _copy_trader_seen_sigs: set = set()
-_copy_trade_stats = {"shreds": 0, "no_meta": 0, "wrong_signer": 0, "no_buy": 0, "non_memecoin": 0, "dedup": 0, "fired": 0, "exception": 0, "sig_dedup": 0, "rug_blocked": 0}
+_copy_trade_stats = {
+    "shreds": 0, "no_meta": 0, "wrong_signer": 0, "no_buy": 0,
+    "non_memecoin": 0, "dedup": 0, "fired": 0, "exception": 0,
+    "sig_dedup": 0, "rug_blocked": 0,
+    # V41.17: new gate counters
+    "curve_blocked": 0, "exit_blocked": 0, "first_buyer_blocked": 0,
+    "bundle_fresh_blocked": 0, "warm_hit": 0, "warm_miss": 0,
+}
 
 
-def _rug_check(mint: str) -> tuple[bool, str]:
-    """V41.16b: empirically-tuned pre-entry rug check via /tokens/{mint}.
-    Empirical sample (3 tokens, this session):
-       Rugger CFWsZSFd: 137 bundlers, 19% top10, 0% dev → -9% rug
-       Winner GqkStXr3: 96 bundlers, 24% top10, 0% dev → +6% win
-       Winner CJiDhsnv: 74 bundlers, 33% top10, 10% dev → +14% win
+def _evaluate_risk(snap: dict) -> tuple[bool, str]:
+    """V41.17: apply rejection rules to a risk snapshot. Used by both cached
+    and live paths. Empirically-tuned thresholds (V41.16b research):
+       Rugger CFWsZSFd: 137 bundlers, 19% top10, 0% dev → -9%
+       Winner GqkStXr3: 96 bundlers, 24% top10, 0% dev → +6%
+       Winner CJiDhsnv: 74 bundlers, 33% top10, 10% dev → +14%
     Score=9-10 is uniform on pump.fun pre-grad — useless filter.
-    Bundler COUNT is most discriminating: 100+ = coordinated rug bait.
-    Returns (safe, reason). Errors → allow (don't block on infra issues)."""
+    Hard reject markers: rugged flag, bundler count >=100, bundlers >20%,
+    top10 >50%, dev >15%, snipers >25%, fresh bundle in last 60s, freeze/mint authority."""
+    risk = snap.get("risk", {}) or {}
+    if bool(risk.get("rugged", False)):
+        return False, "already rugged"
+    bundlers = risk.get("bundlers", {}) or {}
+    bcount = bundlers.get("count", 0) or 0
+    bp = bundlers.get("totalPercentage")
+    bp = 0.0 if bp is None else float(bp)
+    if bcount >= 100:
+        return False, f"{bcount} bundled wallets"
+    if bp > 20.0:
+        return False, f"bundlers hold {bp:.1f}% of supply"
+    top10 = risk.get("top10")
+    top10 = 100.0 if top10 is None else float(top10)
+    if top10 > 50.0:
+        return False, f"top10 {top10:.1f}%"
+    dev = risk.get("dev", {}) or {}
+    dev_pct = dev.get("percentage")
+    dev_pct = 0.0 if dev_pct is None else float(dev_pct)
+    if dev_pct > 15.0:
+        return False, f"dev {dev_pct:.1f}%"
+    snipers = risk.get("snipers", {}) or {}
+    snipers_pct = snipers.get("totalPercentage")
+    snipers_pct = 0.0 if snipers_pct is None else float(snipers_pct)
+    if snipers_pct > 25.0:
+        return False, f"snipers {snipers_pct:.1f}%"
+    # Fix #6: bundle freshness — any bundleTime within last BUNDLE_FRESHNESS_THRESHOLD_SEC = abort
+    wallets = bundlers.get("wallets", []) or []
+    if wallets:
+        now_ms = int(time.time() * 1000)
+        max_bt = 0
+        for w in wallets:
+            bt = w.get("bundleTime") or 0
+            if bt and bt > max_bt:
+                max_bt = bt
+        if max_bt:
+            age_s = (now_ms - max_bt) / 1000
+            if 0 <= age_s < BUNDLE_FRESHNESS_THRESHOLD_SEC:
+                return False, f"fresh bundle {int(age_s)}s ago"
+    return True, ""
+
+
+def _build_risk_snapshot_from_token(t: dict) -> Optional[dict]:
+    """Extract a compact, cache-friendly snapshot from a TokenInfo response."""
+    try:
+        risk = t.get("risk", {}) or {}
+        pools = t.get("pools") or []
+        pool0 = pools[0] if pools else {}
+        snap = {
+            "risk": risk,
+            "curvePercentage": pool0.get("curvePercentage"),
+            "complete": bool(pool0.get("complete", False)),
+            "liquidity_usd": ((pool0.get("liquidity") or {}).get("usd") or 0) or 0,
+            "createdAt": pool0.get("createdAt"),  # ms epoch
+            "freezeAuthority": (pool0.get("security") or {}).get("freezeAuthority"),
+            "mintAuthority": (pool0.get("security") or {}).get("mintAuthority"),
+        }
+        return snap
+    except Exception:
+        return None
+
+
+async def refresh_risk_cache():
+    """V41.17 Fix #1: pre-fetch /tokens/multi/all + /tokens/trending/5m every
+    RISK_CACHE_REFRESH_SEC seconds. Hot-path lookup becomes O(1) → ~5ms vs
+    200-400ms HTTP. Empirical session bug: rug-check inline added ~250ms to
+    every copy_fast signal; cache eliminates that without changing semantics."""
+    if not SOLANATRACKER_ENABLED:
+        log("RISK CACHE: DISABLED (no SOLANATRACKER_API_KEY)")
+        return
+    log(f"RISK CACHE: prefetching /tokens/multi/all + /tokens/trending/5m every {RISK_CACHE_REFRESH_SEC}s")
+    while True:
+        try:
+            # Serialize to stay under Data API 1 RPS limit (parallel gather hit 429s
+            # in 30s smoke-test). 1.2s gap is conservative; refresh cycle still <2s.
+            r1 = await asyncio.to_thread(_st_fetch, "/tokens/multi/all?limit=500&minCurve=20")
+            await asyncio.sleep(1.2)
+            r2 = await asyncio.to_thread(_st_fetch, "/tokens/trending/5m")
+            results = [r1, r2]
+            now_ts = time.time()
+            new_count = 0
+            for res in results:
+                if isinstance(res, Exception) or not res:
+                    continue
+                if isinstance(res, dict):
+                    items = []
+                    for k in ("latest", "graduating", "graduated"):
+                        items.extend(res.get(k, []) or [])
+                elif isinstance(res, list):
+                    items = res
+                else:
+                    items = []
+                for t in items:
+                    try:
+                        mint = (t.get("token") or {}).get("mint", "")
+                        if not mint:
+                            continue
+                        snap = _build_risk_snapshot_from_token(t)
+                        if snap is None:
+                            continue
+                        _risk_cache[mint] = (snap, now_ts)
+                        _risk_cache_stats["fills"] += 1
+                        new_count += 1
+                    except Exception:
+                        continue
+            # Evict entries older than 5 min to bound memory
+            cutoff = now_ts - 300
+            stale_keys = [m for m, (_, ts) in _risk_cache.items() if ts < cutoff]
+            for m in stale_keys:
+                _risk_cache.pop(m, None)
+            if new_count > 0:
+                hr = _risk_cache_stats["hits"]
+                ms = _risk_cache_stats["misses"]
+                live = _risk_cache_stats["live_fallback"]
+                log(f"  RISK CACHE refresh: +{new_count} entries, {len(_risk_cache)} total, "
+                    f"hits={hr} misses={ms} live={live} evicted={len(stale_keys)}")
+        except Exception as e:
+            log(f"refresh_risk_cache err: {type(e).__name__}: {e}")
+        await asyncio.sleep(RISK_CACHE_REFRESH_SEC)
+
+
+def _rug_check_with_snapshot(mint: str) -> tuple[bool, str, Optional[dict]]:
+    """V41.17 Fix #1+#4+#6: cache-first risk gate. Returns (safe, reason, snapshot).
+    Snapshot enables downstream curve-% gate without an extra fetch."""
+    cached = _risk_cache.get(mint)
+    if cached is not None:
+        snap, fetched_at = cached
+        age = time.time() - fetched_at
+        if age < RISK_CACHE_TTL_SEC:
+            _risk_cache_stats["hits"] += 1
+            safe, reason = _evaluate_risk(snap)
+            return safe, reason, snap
+        _risk_cache_stats["stale"] += 1
+    else:
+        _risk_cache_stats["misses"] += 1
+    # Cache miss / stale — fall back to live HTTP (preserves V41.16b behavior)
+    _risk_cache_stats["live_fallback"] += 1
     try:
         r = requests.get(
             f"{SOLANATRACKER_BASE}/tokens/{mint}",
@@ -3873,27 +4158,284 @@ def _rug_check(mint: str) -> tuple[bool, str]:
             timeout=1.5,
         )
         if r.status_code != 200:
-            return True, "rug-check API error — proceeding"
+            return True, f"rug-check API {r.status_code} — proceeding", None
         d = r.json()
-        risk = d.get("risk", {}) or {}
-        if bool(risk.get("rugged", False)):
-            return False, "already rugged"
-        bundlers = risk.get("bundlers", {}) or {}
-        bcount = bundlers.get("count", 0)
-        bp = bundlers.get("totalPercentage")
-        bp = 0.0 if bp is None else float(bp)
-        if bcount >= 100:
-            return False, f"{bcount} bundled wallets (coordinated)"
-        if bp > 20.0:
-            return False, f"bundlers hold {bp:.1f}% of supply"
-        top10 = risk.get("top10")
-        top10 = 100 if top10 is None else float(top10)
-        if top10 > 50.0:
-            return False, f"top10 holds {top10:.1f}% (extreme concentration)"
-        return True, ""
+        snap = _build_risk_snapshot_from_token(d)
+        if snap is not None:
+            _risk_cache[mint] = (snap, time.time())
+        safe, reason = _evaluate_risk(snap or {"risk": d.get("risk", {}) or {}})
+        return safe, reason, snap
     except Exception:
-        # On any error, allow the trade — don't block on infra issues
-        return True, "rug-check timeout — proceeding"
+        return True, "rug-check timeout — proceeding", None
+
+
+def _rug_check(mint: str) -> tuple[bool, str]:
+    """V41.17: thin shim preserving V41.16b interface for legacy callers."""
+    safe, reason, _snap = _rug_check_with_snapshot(mint)
+    return safe, reason
+
+
+def _curve_pct_gate(snap: Optional[dict]) -> tuple[bool, str]:
+    """V41.17 Fix #4: reject pre-grad entries above COPY_FAST_MAX_CURVE_PCT.
+    Smart wallet entries above 75% curve land past the structural sweet spot —
+    smart wallet's own buy IS the pump and we follow into peak. Post-grad
+    tokens (complete=True) skip this gate; different price dynamics apply."""
+    if not snap:
+        return True, ""
+    if snap.get("complete"):
+        return True, ""  # post-grad — different dynamics
+    cp = snap.get("curvePercentage")
+    if cp is None:
+        return True, ""  # no data — fail-open
+    try:
+        cp = float(cp)
+    except Exception:
+        return True, ""
+    if cp > COPY_FAST_MAX_CURVE_PCT:
+        return False, f"curve {cp:.1f}% > {COPY_FAST_MAX_CURVE_PCT:.0f}% (past sweet spot)"
+    return True, ""
+
+
+def _first_buyer_holding_rate(mint: str) -> Optional[float]:
+    """V41.17 Fix #7: returns fraction of first 100 buyers still holding (0.0-1.0).
+    None if data unavailable. Cached for FIRST_BUYER_CACHE_TTL_SEC."""
+    cached = _first_buyers_cache.get(mint)
+    if cached:
+        rate, fetched_at = cached
+        if time.time() - fetched_at < FIRST_BUYER_CACHE_TTL_SEC:
+            return rate
+    try:
+        r = requests.get(
+            f"{SOLANATRACKER_BASE}/first-buyers/{mint}",
+            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            timeout=2.0,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        # Endpoint returns a list directly per docs; tolerate dict shapes
+        if isinstance(data, list):
+            buyers = data
+        elif isinstance(data, dict):
+            buyers = data.get("buyers") or data.get("data") or []
+        else:
+            buyers = []
+        if not buyers:
+            return None
+        n = len(buyers)
+        held = sum(1 for b in buyers if (b.get("holding") or 0) > 0)
+        rate = held / n if n > 0 else 0.0
+        _first_buyers_cache[mint] = (rate, time.time())
+        # Bound cache size
+        if len(_first_buyers_cache) > 500:
+            oldest = min(_first_buyers_cache, key=lambda k: _first_buyers_cache[k][1])
+            _first_buyers_cache.pop(oldest, None)
+        return rate
+    except Exception:
+        return None
+
+
+def _smart_wallet_still_holding_sync(signer: str, mint: str) -> bool:
+    """V41.17 Fix #3: query the smart wallet's token balance for `mint`.
+    Returns True if balance > 0 (still holding) OR True on RPC error (fail-OPEN —
+    don't block entries on infra issues). False ONLY if confirmed zero balance.
+
+    Uses standard getTokenAccountsByOwner with mint filter — single call, ~80-150ms.
+    Runs synchronously inside asyncio.to_thread so it can race with the probe quote."""
+    if not ST_RPC_HTTP:
+        return True
+    try:
+        body = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [signer, {"mint": mint}, {"encoding": "jsonParsed"}],
+        }
+        r = requests.post(ST_RPC_HTTP, json=body, timeout=EXIT_CHECK_TIMEOUT_SEC)
+        if r.status_code != 200:
+            return True  # fail-OPEN
+        d = r.json()
+        accounts = ((d.get("result") or {}).get("value")) or []
+        for acct in accounts:
+            data = (acct.get("account") or {}).get("data") or {}
+            parsed = (data.get("parsed") or {}).get("info") or {}
+            ta = parsed.get("tokenAmount") or {}
+            ui = ta.get("uiAmount")
+            if ui is not None and float(ui) > 0:
+                return True
+            amt = ta.get("amount")
+            if amt is not None and int(amt) > 0:
+                return True
+        # All accounts checked, all zero → confirmed sold
+        return False
+    except (requests.Timeout, requests.ConnectionError):
+        return True  # fail-OPEN
+    except Exception:
+        return True
+
+
+async def _smart_wallet_still_holding(signer: str, mint: str) -> bool:
+    """Async wrapper — keeps RPC off the event loop."""
+    return await asyncio.to_thread(_smart_wallet_still_holding_sync, signer, mint)
+
+
+def raptor_swap_build(quote: dict, user_pubkey: str, priority: str = "VeryHigh") -> Optional[str]:
+    """V41.17 Fix #10: build swap tx via Raptor /swap. Used for entries when
+    the quote came from Raptor (auto-tracks pump.fun program upgrades; the
+    Apr-2026 17→18 account upgrade silently broke raw-ix bots — Raptor's path
+    is upgrade-resilient)."""
+    if not RAPTOR_ENABLED:
+        return None
+    body = {
+        "userPublicKey": user_pubkey,
+        "quoteResponse": quote,
+        "wrapUnwrapSol": True,
+        "txVersion": "v0",
+        "priorityFee": priority,
+        "maxPriorityFee": 100_000,
+    }
+    try:
+        r = requests.post(f"{RAPTOR_BASE}/swap", json=body, timeout=10)
+        if r.status_code != 200:
+            log(f"raptor swap http {r.status_code}: {r.text[:200]}")
+            return None
+        return r.json().get("swapTransaction")
+    except (requests.Timeout, requests.ConnectionError):
+        return None
+    except Exception as e:
+        log(f"raptor swap err: {e}")
+        return None
+
+
+async def warm_raptor_swap_pool(kp: Optional[Keypair]):
+    """V41.17 Fix #2: maintain a WS connection to wss://raptor-beta/stream/swap
+    with WARM_POOL_SIZE pre-built tx subscriptions for top trending mints.
+    On copy_fast signal: if mint in cache and tx <WARM_SWAP_TTL_SEC old, sign
+    and ship in 10-30ms vs 300-500ms for /quote-and-swap.
+
+    Live mode only: /stream/swap requires userPublicKey to build the tx.
+    In paper mode this still subscribes to receive the data (used for
+    diagnostics / future live readiness)."""
+    if not WARM_POOL_ENABLED or not RAPTOR_ENABLED:
+        log("WARM SWAP POOL: disabled (config)")
+        return
+    if PAPER_TRADING and not kp:
+        log("WARM SWAP POOL: disabled in paper mode without keypair (would need userPublicKey)")
+        return
+    user_pubkey = str(kp.pubkey()) if kp else None
+    if not user_pubkey:
+        log("WARM SWAP POOL: no keypair, cannot build txs")
+        return
+
+    raptor_ws_url = RAPTOR_BASE.replace("https://", "wss://").replace("http://", "ws://") + "/stream/swap"
+    log(f"WARM SWAP POOL: connecting to {raptor_ws_url} (target {WARM_POOL_SIZE} mints)")
+    sol_lamports = int(GRAD_AMOUNT_SOL * 10**WSOL_DECIMALS)
+
+    while True:
+        try:
+            async with websockets.connect(raptor_ws_url, ping_interval=25, ping_timeout=20) as ws:
+                # Refresh subscription set every 30s based on top trending mints
+                async def refresher():
+                    while True:
+                        try:
+                            data = await asyncio.to_thread(_st_fetch, "/tokens/trending/5m")
+                            target_mints = set()
+                            if isinstance(data, list):
+                                for t in data[:WARM_POOL_SIZE]:
+                                    mint = (t.get("token") or {}).get("mint", "")
+                                    mint_lc = mint.lower()
+                                    if mint and (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
+                                        target_mints.add(mint)
+                            # Subscribe new mints
+                            for mint in target_mints - _warm_subscribed_mints:
+                                msg = {
+                                    "type": "subscribe",
+                                    "id": f"warm_{mint[:8]}",
+                                    "inputMint": SOL_MINT,
+                                    "outputMint": mint,
+                                    "amount": sol_lamports,
+                                    "userPublicKey": user_pubkey,
+                                    "slippageBps": "500",
+                                    "priorityFee": "VeryHigh",
+                                    "maxPriorityFee": 100_000,
+                                    "txVersion": "v0",
+                                    "wrapUnwrapSol": True,
+                                }
+                                try:
+                                    await ws.send(json.dumps(msg))
+                                    _warm_subscribed_mints.add(mint)
+                                    _warm_pool_stats["subscribes"] += 1
+                                except Exception:
+                                    break
+                            # Unsubscribe drops
+                            for mint in list(_warm_subscribed_mints - target_mints):
+                                msg = {"type": "unsubscribe", "id": f"warm_{mint[:8]}"}
+                                try:
+                                    await ws.send(json.dumps(msg))
+                                except Exception:
+                                    pass
+                                _warm_subscribed_mints.discard(mint)
+                                _warm_swap_cache.pop(mint, None)
+                        except Exception as e:
+                            log(f"warm pool refresher err: {type(e).__name__}: {e}")
+                        await asyncio.sleep(30)
+
+                async def pinger():
+                    while True:
+                        await asyncio.sleep(25)
+                        try:
+                            await ws.send(json.dumps({"type": "ping"}))
+                        except Exception:
+                            return
+
+                refresher_task = asyncio.create_task(refresher())
+                pinger_task = asyncio.create_task(pinger())
+
+                try:
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                            _warm_pool_stats["msgs_in"] += 1
+                            # Server pushes quote + pre-built swap tx per mint update
+                            sub_id = data.get("id") or ""
+                            tx_b64 = data.get("swapTransaction") or (data.get("data") or {}).get("swapTransaction")
+                            lvbh = data.get("lastValidBlockHeight") or (data.get("data") or {}).get("lastValidBlockHeight") or 0
+                            # Recover mint from sub_id ("warm_<mint8>")
+                            target_mint = None
+                            if sub_id.startswith("warm_"):
+                                short = sub_id[5:]
+                                for m in _warm_subscribed_mints:
+                                    if m.startswith(short):
+                                        target_mint = m
+                                        break
+                            # Some servers echo outputMint in the payload — prefer that
+                            payload_mint = data.get("outputMint") or (data.get("data") or {}).get("outputMint")
+                            if payload_mint and isinstance(payload_mint, str):
+                                target_mint = payload_mint
+                            if target_mint and tx_b64:
+                                _warm_swap_cache[target_mint] = (tx_b64, int(lvbh) if lvbh else 0, time.time())
+                        except Exception:
+                            continue
+                finally:
+                    refresher_task.cancel()
+                    pinger_task.cancel()
+        except Exception as e:
+            log(f"WARM SWAP POOL ws err, reconnecting in 10s: {type(e).__name__}: {e}")
+            await asyncio.sleep(10)
+
+
+def _consume_warm_swap_tx(mint: str) -> Optional[tuple[str, int]]:
+    """V41.17 Fix #2: pop a fresh warm tx if available. Returns (tx_b64, lvbh) or None.
+    Refuses tx older than WARM_SWAP_TTL_SEC."""
+    cached = _warm_swap_cache.get(mint)
+    if not cached:
+        _warm_pool_stats["misses"] += 1
+        return None
+    tx_b64, lvbh, fetched_at = cached
+    if time.time() - fetched_at > WARM_SWAP_TTL_SEC:
+        _warm_pool_stats["misses"] += 1
+        return None
+    _warm_pool_stats["hits"] += 1
+    return tx_b64, lvbh
 
 
 async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str, trader_set: set):
@@ -3959,17 +4501,46 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
                 graduated_seen.add(mint)
                 if len(graduated_seen) > 500:
                     graduated_seen.clear()
-                # V41.16: pre-entry rug check via Solana Tracker.
-                safe, reason = await asyncio.to_thread(_rug_check, mint)
+                # V41.17 Fix #1+#6: cache-first rug check (~5ms hot-path vs 200-400ms).
+                # Bundle freshness check (#6) is integrated inside _evaluate_risk.
+                safe, reason, snap = await asyncio.to_thread(_rug_check_with_snapshot, mint)
                 if not safe:
                     _copy_trade_stats["rug_blocked"] += 1
+                    if "fresh bundle" in (reason or ""):
+                        _copy_trade_stats["bundle_fresh_blocked"] += 1
                     log(f"  COPY TRADE RUG-BLOCKED {signer[:8]} -> {mint[:8]}: {reason}")
                     return
+                # V41.17 Fix #4: curve %-gate. Reject smart-wallet entries past the
+                # structural sweet spot (>75% curve = smart wallet's own buy IS the pump,
+                # we follow into peak). Snapshot already in hand from rug-check.
+                cv_ok, cv_reason = _curve_pct_gate(snap)
+                if not cv_ok:
+                    _copy_trade_stats["curve_blocked"] += 1
+                    log(f"  COPY TRADE CURVE-BLOCKED {signer[:8]} -> {mint[:8]}: {cv_reason}")
+                    return
+                # V41.17 Fix #7: first-buyer holding rate. Only apply to tokens >60s old —
+                # younger tokens don't have a meaningful first-buyer signal yet.
+                if FIRST_BUYER_GATE_ENABLED and snap is not None:
+                    created_at_ms = snap.get("createdAt")
+                    if created_at_ms:
+                        try:
+                            age_s = (time.time() * 1000 - float(created_at_ms)) / 1000
+                        except Exception:
+                            age_s = 0
+                        if age_s > FIRST_BUYER_MIN_TOKEN_AGE_SEC:
+                            rate = await asyncio.to_thread(_first_buyer_holding_rate, mint)
+                            if rate is not None and rate < FIRST_BUYER_MIN_HOLD_RATE:
+                                _copy_trade_stats["first_buyer_blocked"] += 1
+                                log(f"  COPY TRADE FIRST-BUYER-BLOCKED {signer[:8]} -> {mint[:8]}: "
+                                    f"holding_rate={rate*100:.0f}% (token age {int(age_s)}s)")
+                                return
                 _copy_trade_stats["fired"] += 1
                 log(f"*** COPY TRADE *** {signer[:8]} bought {mint} (sig={sig[:16]})")
                 # V41.14: copy_fast skips the 8s observation window. We had ~200ms
                 # shred-detection latency advantage; observation was killing the edge.
-                asyncio.create_task(graduation_snipe(client, kp, mint, launchpad="copy_fast"))
+                # V41.17 Fix #3: pass signer so graduation_snipe can verify smart wallet
+                # hasn't already exited (parallelized with probe quote — no added latency).
+                asyncio.create_task(graduation_snipe(client, kp, mint, launchpad="copy_fast", signer=signer))
                 return
         if not found_buy:
             _copy_trade_stats["no_buy"] += 1
@@ -4154,7 +4725,12 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                         continue
                     # API returns winPercentage as 0-1 OR 0-100 inconsistently; normalize
                     wr_n = wr / 100.0 if wr > 1.0 else wr
-                    if wr_n >= COPY_TRADE_MIN_WIN_RATE and realized > 0:
+                    # V41.17 Fix #5: tighter wallet filter — require both consistency
+                    # (winPercentage >= COPY_TRADE_MIN_WIN_RATE_TIGHT) AND meaningful PnL
+                    # scale (realized >= COPY_TRADE_MIN_REALIZED_SOL). Lottery-ticket
+                    # 1-SOL profit traders are not detectable enough to follow profitably.
+                    floor_wr = max(COPY_TRADE_MIN_WIN_RATE, COPY_TRADE_MIN_WIN_RATE_TIGHT)
+                    if wr_n >= floor_wr and realized >= COPY_TRADE_MIN_REALIZED_SOL:
                         eligible.append((w["wallet"], wr_n, realized))
                 eligible.sort(key=lambda x: -x[2])  # by realized PnL desc
                 top_traders = [t[0] for t in eligible[:COPY_TRADE_TOP_N]]
@@ -4295,10 +4871,29 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17 LATENCY + CORRECTNESS FIXES ===")
+    log(f"  Fix #1: pre-cached rug check (refresh {RISK_CACHE_REFRESH_SEC}s, TTL {RISK_CACHE_TTL_SEC}s) → ~5ms hot-path")
+    log(f"  Fix #2: warm /stream/swap pool ({WARM_POOL_SIZE} mints, TTL {WARM_SWAP_TTL_SEC}s) → ~10-30ms entry"
+        f" {'[ACTIVE]' if (WARM_POOL_ENABLED and (kp or not PAPER_TRADING)) else '[paper-skip]'}")
+    log(f"  Fix #3: smart-wallet exit pre-flight (timeout {EXIT_CHECK_TIMEOUT_SEC*1000:.0f}ms, parallel with quote)"
+        f" {'[ACTIVE]' if EXIT_CHECK_ENABLED else '[disabled]'}")
+    log(f"  Fix #4: curve %-gate at signal time (max {COPY_FAST_MAX_CURVE_PCT:.0f}% — past sweet spot rejected)")
+    log(f"  Fix #5: tighter wallet allowlist (WR>={COPY_TRADE_MIN_WIN_RATE_TIGHT*100:.0f}% AND realized>={COPY_TRADE_MIN_REALIZED_SOL:.0f} SOL)")
+    log(f"  Fix #6: bundle freshness gate (reject if any bundle <{BUNDLE_FRESHNESS_THRESHOLD_SEC}s old)")
+    log(f"  Fix #7: first-buyer holding rate gate (min {FIRST_BUYER_MIN_HOLD_RATE*100:.0f}%, age >{FIRST_BUYER_MIN_TOKEN_AGE_SEC}s)"
+        f" {'[ACTIVE]' if FIRST_BUYER_GATE_ENABLED else '[disabled]'}")
+    log(f"  Fix #8: simulateTransaction pre-flight for entries >${SIMULATE_NOTIONAL_USD_THRESHOLD:.0f} (live only)")
+    log(f"  Fix #9: 8s no-pump time-stop on copy_fast {'[ACTIVE]' if TIME_STOP_ENABLED else '[disabled]'}")
+    log(f"  Fix #10: Raptor /swap path (program-upgrade resilient — Apr 2026 buy 17→18 accts)")
     log(f"=========================================")
     asyncio.create_task(session_reporter())
     asyncio.create_task(pumpportal_migration_listener(client, kp))
     asyncio.create_task(solanatracker_poll_latest(client, kp))
+    # V41.17 Fix #1: pre-cache risk for hot-path lookup
+    asyncio.create_task(refresh_risk_cache())
+    # V41.17 Fix #2: warm /stream/swap pool (live mode + keypair)
+    if not PAPER_TRADING and kp:
+        asyncio.create_task(warm_raptor_swap_pool(kp))
     # V41.15: grad_imminent DISABLED (net -$0.94 in last session vs copy_fast +$3.56).
     # Pre-graduation tokens at curve 95-99% rug too often; the catalyst doesn't reliably pump.
     # Copy-trade is the proven winning strategy.
