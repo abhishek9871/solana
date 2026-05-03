@@ -1186,61 +1186,11 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
         log(f"  GRAD WAIT {mint[:8]}: holding {GRAD_INITIAL_DELAY_SEC}s for Jupiter to index PumpSwap pool")
         await asyncio.sleep(GRAD_INITIAL_DELAY_SEC)
 
-        # V41.17t/v: smart-buyer-ONLY entry path. /first-buyers/{mint} returns the
-        # first 100 buyers with PnL inline. Entry conditions:
-        #   - >=COPY_FAST_SMART_BUYER_MIN early buyers are winning (realized > 1 SOL)
-        #     AND still holding > 0 (winning AND believing); AND
-        #   - V41.17v slippage gate: our probe quote price <= avg_cost_basis of
-        #     smart buyers × SMART_BUYER_MAX_PRICE_RATIO (default 1.10). Catches
-        #     "curve already pumped past us" — same principle as Fix #11 for copy_fast.
-        # The 40-50% momentum gate (V41.5) was REMOVED per user directive — losers
-        # at the +12% / +32.7% bands and same dead-peak pattern. Smart-buyer signal
-        # is the only graduation entry gate now.
-        if launchpad in ("pump", "bonk", "st_pump"):
-            smart_count, total_buyers, avg_cb = await asyncio.to_thread(_first_buyers_smart_count, mint)
-            if smart_count < COPY_FAST_SMART_BUYER_MIN:
-                if smart_count > 0:
-                    log(f"  GRAD SMART-BUYER SKIP {mint[:8]} ({launchpad}): only {smart_count}/{total_buyers} "
-                        f"smart buyers (<{COPY_FAST_SMART_BUYER_MIN})")
-                else:
-                    log(f"  GRAD SMART-BUYER SKIP {mint[:8]} ({launchpad}): 0 smart buyers in {total_buyers}")
-                return
-            # Smart-buyer count passes — now check slippage against their avg cost basis.
-            our_price_proxy = baseline_tokens_per_001  # placeholder; computed below from probe
-            # NOTE: probe quote already obtained in non-copy_fast path; here we don't have
-            # it yet because we're BEFORE the probe quote loop. Fetch it now.
-            probe_sol_lamports = int(0.001 * 1e9)
-            quote_for_check = jupiter_quote(SOL_MINT, mint, probe_sol_lamports)
-            if not quote_for_check or float(quote_for_check.get("outAmount", 0)) == 0:
-                log(f"  GRAD SMART-BUYER SKIP {mint[:8]} ({launchpad}): no Raptor/Jupiter route")
-                return
-            probe_out = float(quote_for_check["outAmount"])
-            # Our marginal price (lamports per smallest unit token)
-            our_price = probe_sol_lamports / probe_out
-            # avg_cb from /first-buyers is in USD per token (TokenSolPriceQuoted by ST).
-            # We can't directly compare different units. Better signal: ratio of our
-            # price to the SMART BUYERS' price needs same currency. ST returns
-            # cost_basis in the quote currency (typically USD). To stay safe and
-            # currency-agnostic, we'll skip the absolute comparison and just log.
-            # Future enhancement: convert via pool quote token. For now, smart-buyer
-            # COUNT is the gate; slippage signal is observability-only.
-            log(f"  GRAD SMART-BUYER {mint[:8]} ({launchpad}): {smart_count}/{total_buyers} winning+holding "
-                f"avg_cb=${avg_cb:.6f} our_px={our_price:.4e} — entering")
-            pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
-            if not pos:
-                log(f"  GRAD BUY FAILED {mint[:8]} (smart-buyer path)")
-                return
-            pos.strategy = "graduation"
-            pos.late_scalp = True
-            pos.entry_progress = 1.0
-            pos.entry_size_sol = GRAD_AMOUNT_SOL
-            pos.quality_score = 9
-            pos.launchpad = launchpad + "_smart"
-            pos.signal_time_ms = int(time.time() * 1000)
-            positions[mint] = pos
-            _record_entry_opened()
-            asyncio.create_task(manage_graduation_position(client, kp, pos))
-            return
+        # V41.17w: smart-buyer-only pump grad lane REMOVED (0/225 in V41.17v overnight —
+        # fresh graduations have no time for buyers to develop realized PnL > 1 SOL).
+        # pump/bonk/st_pump launchpads now fall through to the existing momentum-confirmed
+        # entry path below (40-50% sweet spot for default, sustained uptrend for st_pump,
+        # etc.). Pre-V41.17t behavior restored.
 
         # Try to get a baseline quote — retry with backoff if Jupiter hasn't indexed yet
         probe_sol_lamports = int(0.001 * 1e9)  # tiny probe quote, just for price discovery
@@ -1422,22 +1372,9 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             if multiplier > pos.peak_price:
                 pos.peak_price = multiplier
 
-            # V41.17 Fix #9: 8s no-pump time-stop for copy_fast entries.
-            # Empirical: 4 winners hit 1.04x activation in 3-5s; 3 losers sat dead at
-            # 0.97-1.02x for 15+s before tanking. If peak hasn't reached activation by
-            # TIME_STOP_NO_PUMP_SEC, the pump has died — exit at current price (cap loss
-            # at -1% to break-even rather than trailing's eventual -4%). Only fires BEFORE
-            # trailing activates; once activated, trailing logic owns the exit.
-            if (TIME_STOP_ENABLED and pos.launchpad == "copy_fast"
-                    and pos.signal_time_ms > 0
-                    and pos.peak_price < GRAD_TRAILING_ACTIVATION):
-                age_s = (time.time() * 1000 - pos.signal_time_ms) / 1000
-                if age_s > TIME_STOP_NO_PUMP_SEC:
-                    if try_grad_sell(
-                        f"GRAD 8s NO-PUMP exit (age={age_s:.1f}s peak={pos.peak_price:.3f}x mult={multiplier:.3f}x)",
-                        1.0, multiplier,
-                    ):
-                        break
+            # V41.17w: 8s no-pump time-stop REMOVED. In V41.17v, it closed 2 of 5 trades
+            # flat at peak=1.00x, denying them time to develop. SL + TP + trailing now
+            # own the exit.
 
             # V41.13o + V41.14d: TRAILING STOP with slippage protection.
             # Empirical: full-position sell into $5-15k pool slips 2-5%. If trail floor is
@@ -3925,7 +3862,7 @@ ST_ENDPOINTS = [
 # Verified via /top-traders/all: top 5 traders have realized PnL 1M+ SOL each.
 # DfMxre4c: 21,845W / 6,951L = 75.9% WR. We mirror their buys via Helius logsSubscribe.
 COPY_TRADE_ENABLED = bool(SOLANATRACKER_API_KEY) and os.environ.get("COPY_TRADE_ENABLED", "1") == "1"
-COPY_TRADE_TOP_N = int(os.environ.get("COPY_TRADE_TOP_N", "100"))  # V41.15c: 60s test confirmed 100 wallets = 43 msgs/min (2x of 50). Earlier 15s test was statistically meaningless.
+COPY_TRADE_TOP_N = int(os.environ.get("COPY_TRADE_TOP_N", "200"))  # V41.17w: bumped 100→200 per ST Recipe A. 1 conn covers ~100 comfortably; pushing to 200 to expand signal volume. Watch shred volume — if dropped, dial back to 150.
 COPY_TRADE_REFRESH_HOURS = int(os.environ.get("COPY_TRADE_REFRESH_HOURS", "6"))
 COPY_TRADE_MIN_WIN_RATE = float(os.environ.get("COPY_TRADE_MIN_WIN_RATE", "0.0"))   # WR filter dropped — even lottery-ticket traders are profitable in absolute SOL
 # Post-grad tokens skip curve check; instead require real liquidity to avoid empty pools.
@@ -4142,30 +4079,159 @@ async def solanatracker_poll_latest(client: Client, kp: Optional[Keypair]):
 # V41.13g: smart-money copy-trade. Subscribe to top traders via Helius (free), copy buys.
 def _st_fetch_top_traders(needed: int = 25):
     """Fetch top profitable traders from Solana Tracker, paginated. Each page=25.
-    Returns flat list of wallet entries. Costs 1 ST API call per 25 traders."""
-    pages_needed = max(1, (needed + 24) // 25)
+    Returns flat list of wallet entries. Costs 1 ST API call per 25 traders.
+    V41.17w: overfetch by 1.5× so post-filter (WR>=50% AND realized>=1 SOL) we
+    can still hit `needed` wallets. Caps at 20 pages = 500 wallets (full leaderboard).
+    V41.17w fix: retry per-page on HTTP 429 (up to 2 retries with backoff). On a
+    page that finally fails, CONTINUE to subsequent pages rather than abort —
+    losing 25 wallets is better than losing the rest of the leaderboard."""
+    overfetch = max(needed, int(needed * 1.5))
+    pages_needed = max(1, min(20, (overfetch + 24) // 25))
     all_wallets = []
     for page in range(1, pages_needed + 1):
-        try:
-            r = requests.get(
-                f"{SOLANATRACKER_BASE}/top-traders/all/{page}",
-                headers={"x-api-key": SOLANATRACKER_API_KEY},
-                params={"expandPnl": "true"},
-                timeout=15,
-            )
-            if r.status_code != 200:
-                log(f"  COPY-TRADE fetch err page={page}: HTTP {r.status_code}")
-                break
-            data = r.json()
-            wallets = data.get("wallets", []) if isinstance(data, dict) else []
-            if not wallets:
-                break
-            all_wallets.extend(wallets)
-            time.sleep(2.5)  # V41.15: 1.1→2.5s — avoid 429 from concurrent /tokens/latest poll
-        except Exception as e:
-            log(f"  COPY-TRADE fetch err page={page}: {type(e).__name__}: {e}")
-            break
+        attempt = 0
+        while attempt < 3:
+            try:
+                r = requests.get(
+                    f"{SOLANATRACKER_BASE}/top-traders/all/{page}",
+                    headers={"x-api-key": SOLANATRACKER_API_KEY},
+                    params={"expandPnl": "true"},
+                    timeout=15,
+                )
+                if r.status_code == 429:
+                    backoff = 4 * (attempt + 1)  # 4s, 8s, 12s
+                    log(f"  COPY-TRADE fetch 429 page={page} attempt={attempt+1}, backing off {backoff}s")
+                    time.sleep(backoff)
+                    attempt += 1
+                    continue
+                if r.status_code != 200:
+                    log(f"  COPY-TRADE fetch err page={page}: HTTP {r.status_code} (skipping page)")
+                    break  # break inner retry loop, continue to next page
+                data = r.json()
+                wallets = data.get("wallets", []) if isinstance(data, dict) else []
+                if not wallets:
+                    log(f"  COPY-TRADE fetch page={page}: empty (end of leaderboard)")
+                    return {"wallets": all_wallets} if all_wallets else None
+                all_wallets.extend(wallets)
+                break  # success, exit retry loop
+            except Exception as e:
+                log(f"  COPY-TRADE fetch err page={page} attempt={attempt+1}: {type(e).__name__}: {e}")
+                attempt += 1
+                time.sleep(3)
+        else:
+            log(f"  COPY-TRADE fetch gave up on page={page} after 3 attempts — continuing")
+        time.sleep(3.0)  # V41.17w: 2.5→3.0 — broader margin against /tokens/multi/all collisions
     return {"wallets": all_wallets} if all_wallets else None
+
+
+# ============================================================================
+# V41.17x: ACTIVE-SNIPER POOL — fixes the wrong assumption that /top-traders/all
+# (sorted by all-time PnL) gives us currently-active memecoin snipers. Audit
+# proved 77% of that pool is INACTIVE (median 0 trades/24h). Real grad snipers
+# are found by aggregating /top-traders/{mint} across recent graduations.
+# ============================================================================
+
+ACTIVE_SNIPER_POOL_FILE = "active_snipers.txt"
+ACTIVE_SNIPER_REFRESH_HOURS = float(os.environ.get("ACTIVE_SNIPER_REFRESH_HOURS", "1.0"))
+ACTIVE_SNIPER_MIN_GRAD_HITS = int(os.environ.get("ACTIVE_SNIPER_MIN_GRAD_HITS", "2"))
+ACTIVE_SNIPER_GRAD_SAMPLE = int(os.environ.get("ACTIVE_SNIPER_GRAD_SAMPLE", "80"))
+ACTIVE_SNIPER_POOL_ENABLED = os.environ.get("ACTIVE_SNIPER_POOL_ENABLED", "1") == "1"
+
+
+def _load_active_sniper_pool() -> list[str]:
+    """Read active_snipers.txt → list of wallet addresses (sorted by frequency desc)."""
+    if not os.path.exists(ACTIVE_SNIPER_POOL_FILE):
+        return []
+    out = []
+    try:
+        for line in open(ACTIVE_SNIPER_POOL_FILE, "r", encoding="utf-8"):
+            parts = line.strip().split("\t")
+            if parts and len(parts[0]) >= 32:
+                out.append(parts[0])
+    except Exception as e:
+        log(f"  active-sniper file read err: {type(e).__name__}: {e}")
+    return out
+
+
+def _st_build_active_sniper_pool() -> list[str]:
+    """V41.17x: build a current active-sniper pool by aggregating /top-traders/{mint}
+    across recent graduations. Returns wallets appearing in >= ACTIVE_SNIPER_MIN_GRAD_HITS
+    graduations' top-10. Costs ~80 ST API calls per build.
+
+    Replaces /top-traders/all (all-time PnL → 77% inactive). Audit data:
+    median trades/24h was 0 in old pool, 472 in active pool.
+    """
+    from collections import Counter
+    # Step 1: gather recent graduations
+    mints: set[str] = set()
+    try:
+        r = requests.get(f"{SOLANATRACKER_BASE}/tokens/multi/all",
+                         headers={"x-api-key": SOLANATRACKER_API_KEY}, timeout=15)
+        if r.status_code == 200:
+            d = r.json()
+            for t in (d.get("graduated") or []) if isinstance(d, dict) else []:
+                m = (t.get("token") or {}).get("mint")
+                if m and m.lower().endswith("pump"):
+                    mints.add(m)
+    except Exception as e:
+        log(f"  active-sniper /tokens/multi/all err: {type(e).__name__}: {e}")
+    grads = list(mints)[: ACTIVE_SNIPER_GRAD_SAMPLE]
+    if not grads:
+        log("  active-sniper build: no graduations found, returning empty")
+        return []
+    # Step 2: aggregate top-traders for each
+    counter: Counter[str] = Counter()
+    skipped = 0
+    for i, mint in enumerate(grads):
+        try:
+            r = requests.get(f"{SOLANATRACKER_BASE}/top-traders/{mint}",
+                             headers={"x-api-key": SOLANATRACKER_API_KEY}, timeout=10)
+            if r.status_code == 429:
+                time.sleep(4); continue
+            if r.status_code != 200:
+                skipped += 1; continue
+            d = r.json()
+            traders = d if isinstance(d, list) else (d.get("traders") if isinstance(d, dict) else [])
+            if not isinstance(traders, list): traders = []
+            for t in traders[:10]:
+                w = t.get("wallet")
+                if w:
+                    counter[w] += 1
+        except Exception:
+            skipped += 1
+        time.sleep(0.8)
+    if not counter:
+        return []
+    # Step 3: filter by frequency
+    candidates = [w for w, c in counter.items() if c >= ACTIVE_SNIPER_MIN_GRAD_HITS]
+    candidates.sort(key=lambda w: -counter[w])
+    log(f"  active-sniper build: {len(counter)} unique wallets across "
+        f"{len(grads)-skipped}/{len(grads)} grads, {len(candidates)} active "
+        f"(>= {ACTIVE_SNIPER_MIN_GRAD_HITS} grads)")
+    # Step 4: persist for next startup
+    try:
+        with open(ACTIVE_SNIPER_POOL_FILE, "w", encoding="utf-8") as f:
+            for w in candidates:
+                f.write(f"{w}\t{counter[w]}\n")
+    except Exception as e:
+        log(f"  active-sniper file write err: {type(e).__name__}: {e}")
+    return candidates
+
+
+async def active_sniper_refresh_loop():
+    """Background task — rebuild active sniper pool every ACTIVE_SNIPER_REFRESH_HOURS.
+    Active grad snipers shift over time; without refresh, pool decays."""
+    if not ACTIVE_SNIPER_POOL_ENABLED:
+        return
+    while True:
+        try:
+            await asyncio.sleep(ACTIVE_SNIPER_REFRESH_HOURS * 3600)
+            log("ACTIVE-SNIPER refresh starting (background)")
+            t0 = time.time()
+            pool = await asyncio.to_thread(_st_build_active_sniper_pool)
+            log(f"ACTIVE-SNIPER refresh done in {time.time()-t0:.0f}s — {len(pool)} wallets")
+        except Exception as e:
+            log(f"active_sniper_refresh_loop err: {type(e).__name__}: {e}")
 
 
 def _first_buyers_smart_count(mint: str, min_realized: float = 1.0) -> tuple[int, int, float]:
@@ -4726,6 +4792,69 @@ _DISC_BUY_BYTES = bytes([102, 6, 61, 18, 1, 218, 235, 234])
 _BONK_PROGRAM_STR = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
 
 
+def _parse_base64_shred_for_pump_buy(shred_result: dict, trader_set: set) -> Optional[dict]:
+    """V41.17y: parse a BASE64-encoded shredSubscribe message locally with `solders`,
+    extract the pump.fun (or bonk.fun) buy ix WITHOUT calling getTransaction.
+
+    Test-confirmed: median 0.01ms, p99 0.05ms (vs getTransaction's 200-400ms).
+    Yellowstone-equivalent for direct pump.fun buys; aggregator-routed buys
+    (Jupiter/Raptor swap → pump.fun internal) drop to slow path.
+
+    Returns one of:
+      - dict {signer, mint, amount, max_sol_cost, trader_price, launchpad}: direct buy found
+      - "WRONG_SIGNER": parsed OK but signer not in trader_set — slow path won't help
+      - None: parse failed OR signer is ours but no direct buy ix (aggregator route possible)
+    """
+    try:
+        tx_outer = (shred_result.get("transaction") or {}).get("transaction")
+        # base64 shred shape: result.transaction.transaction == [b64_str, "base64"]
+        if not (isinstance(tx_outer, list) and len(tx_outer) >= 1):
+            return None
+        b64_str = tx_outer[0]
+        raw = base64.b64decode(b64_str)
+        vt = VersionedTransaction.from_bytes(raw)
+        msg = vt.message
+        keys = list(msg.account_keys)
+        if not keys:
+            return None
+        signer_str = str(keys[0])
+        if signer_str not in trader_set:
+            return "WRONG_SIGNER"  # short-circuit signal — skip slow path entirely
+        for ix in msg.instructions:
+            try:
+                prog = str(keys[ix.program_id_index])
+            except Exception:
+                continue
+            if prog not in (_PUMP_PROGRAM_STR, _BONK_PROGRAM_STR):
+                continue
+            data = bytes(ix.data)
+            if len(data) < 24 or data[:8] != _DISC_BUY_BYTES:
+                continue
+            amount = int.from_bytes(data[8:16], "little")
+            max_sol_cost = int.from_bytes(data[16:24], "little")
+            if amount == 0 or max_sol_cost == 0:
+                continue
+            try:
+                mint_idx = ix.accounts[2]
+            except (IndexError, TypeError):
+                continue
+            if mint_idx >= len(keys):
+                # mint may be in v0 address-table lookups — those need full tx
+                # resolution that solders' VersionedTransaction doesn't auto-load.
+                # Fall back to slow path.
+                return None
+            mint = str(keys[mint_idx])
+            return {
+                "signer": signer_str, "mint": mint,
+                "amount": amount, "max_sol_cost": max_sol_cost,
+                "trader_price": max_sol_cost / amount,
+                "launchpad": "bonk" if prog == _BONK_PROGRAM_STR else "pump",
+            }
+        return None
+    except Exception:
+        return None
+
+
 def _parse_shred_for_pump_buy(shred_result: dict, trader_set: set) -> Optional[dict]:
     """V41.17i: extract the pump.fun (or bonk.fun) buy ix directly from a jsonParsed
     shred. Returns dict with signer/mint/amount/max_sol_cost/trader_price — or None
@@ -4816,32 +4945,15 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
     graduated_seen.add(mint)
     if len(graduated_seen) > 500:
         graduated_seen.clear()
-    safe, reason, snap = await asyncio.to_thread(_rug_check_with_snapshot, mint)
+    # V41.17w: stripped curve_pct + first_buyer gates (no proven save in V41.17v overnight).
+    # Rug check + Fix #11 ratio band (in graduation_snipe) are the kept gates.
+    safe, reason, _snap = await asyncio.to_thread(_rug_check_with_snapshot, mint)
     if not safe:
         _copy_trade_stats["rug_blocked"] += 1
         if "fresh bundle" in (reason or ""):
             _copy_trade_stats["bundle_fresh_blocked"] += 1
         log(f"  COPY TRADE RUG-BLOCKED {signer[:8]} -> {mint[:8]}: {reason}")
         return
-    cv_ok, cv_reason = _curve_pct_gate(snap)
-    if not cv_ok:
-        _copy_trade_stats["curve_blocked"] += 1
-        log(f"  COPY TRADE CURVE-BLOCKED {signer[:8]} -> {mint[:8]}: {cv_reason}")
-        return
-    if FIRST_BUYER_GATE_ENABLED and snap is not None:
-        created_at_ms = snap.get("createdAt")
-        if created_at_ms:
-            try:
-                age_s = (time.time() * 1000 - float(created_at_ms)) / 1000
-            except Exception:
-                age_s = 0
-            if age_s > FIRST_BUYER_MIN_TOKEN_AGE_SEC:
-                rate = await asyncio.to_thread(_first_buyer_holding_rate, mint)
-                if rate is not None and rate < FIRST_BUYER_MIN_HOLD_RATE:
-                    _copy_trade_stats["first_buyer_blocked"] += 1
-                    log(f"  COPY TRADE FIRST-BUYER-BLOCKED {signer[:8]} -> {mint[:8]}: "
-                        f"holding_rate={rate*100:.0f}% (token age {int(age_s)}s)")
-                    return
     _copy_trade_stats["fired"] += 1
     log(f"*** COPY TRADE *** {signer[:8]} bought {mint} (sig={sig[:16]}) trader_px={trader_price:.4e} [{source}]")
     asyncio.create_task(graduation_snipe(client, kp, mint, launchpad="copy_fast",
@@ -4865,10 +4977,20 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
     _copy_trader_seen_sigs.add(sig)
     if len(_copy_trader_seen_sigs) > 5000:
         _copy_trader_seen_sigs.clear()
-    # FAST PATH: parse the shred directly (V41.17i)
+    # FAST PATH: parse the shred directly without getTransaction.
+    # V41.17y: solders-based base64 parse — median 0.01ms, p99 0.05ms.
     if shred_result is not None:
-        fast = _parse_shred_for_pump_buy(shred_result, trader_set)
-        if fast is not None:
+        fast = _parse_base64_shred_for_pump_buy(shred_result, trader_set)
+        if fast == "WRONG_SIGNER":
+            # Short-circuit: parsed OK but signer is not one of ours. Slow path
+            # would just confirm wrong_signer at 200-400ms cost. Skip it.
+            _copy_trade_stats["wrong_signer"] += 1
+            return
+        if fast is None:
+            # Try jsonParsed parser as a second attempt (legacy/compat path)
+            fast = _parse_shred_for_pump_buy(shred_result, trader_set)
+        if isinstance(fast, dict):
+            _copy_trade_stats["fast_path_hit"] = _copy_trade_stats.get("fast_path_hit", 0) + 1
             await _dispatch_copy_signal(
                 client, kp, sig, fast["signer"], fast["mint"], fast["trader_price"], "shred",
             )
@@ -4955,39 +5077,15 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
                 graduated_seen.add(mint)
                 if len(graduated_seen) > 500:
                     graduated_seen.clear()
-                # V41.17 Fix #1+#6: cache-first rug check (~5ms hot-path vs 200-400ms).
-                # Bundle freshness check (#6) is integrated inside _evaluate_risk.
-                safe, reason, snap = await asyncio.to_thread(_rug_check_with_snapshot, mint)
+                # V41.17w: stripped curve_pct + first_buyer gates (no proven save).
+                # Keep only rug check; Fix #11 ratio band runs inside graduation_snipe.
+                safe, reason, _snap = await asyncio.to_thread(_rug_check_with_snapshot, mint)
                 if not safe:
                     _copy_trade_stats["rug_blocked"] += 1
                     if "fresh bundle" in (reason or ""):
                         _copy_trade_stats["bundle_fresh_blocked"] += 1
                     log(f"  COPY TRADE RUG-BLOCKED {signer[:8]} -> {mint[:8]}: {reason}")
                     return
-                # V41.17 Fix #4: curve %-gate. Reject smart-wallet entries past the
-                # structural sweet spot (>75% curve = smart wallet's own buy IS the pump,
-                # we follow into peak). Snapshot already in hand from rug-check.
-                cv_ok, cv_reason = _curve_pct_gate(snap)
-                if not cv_ok:
-                    _copy_trade_stats["curve_blocked"] += 1
-                    log(f"  COPY TRADE CURVE-BLOCKED {signer[:8]} -> {mint[:8]}: {cv_reason}")
-                    return
-                # V41.17 Fix #7: first-buyer holding rate. Only apply to tokens >60s old —
-                # younger tokens don't have a meaningful first-buyer signal yet.
-                if FIRST_BUYER_GATE_ENABLED and snap is not None:
-                    created_at_ms = snap.get("createdAt")
-                    if created_at_ms:
-                        try:
-                            age_s = (time.time() * 1000 - float(created_at_ms)) / 1000
-                        except Exception:
-                            age_s = 0
-                        if age_s > FIRST_BUYER_MIN_TOKEN_AGE_SEC:
-                            rate = await asyncio.to_thread(_first_buyer_holding_rate, mint)
-                            if rate is not None and rate < FIRST_BUYER_MIN_HOLD_RATE:
-                                _copy_trade_stats["first_buyer_blocked"] += 1
-                                log(f"  COPY TRADE FIRST-BUYER-BLOCKED {signer[:8]} -> {mint[:8]}: "
-                                    f"holding_rate={rate*100:.0f}% (token age {int(age_s)}s)")
-                                return
                 # V41.17d Fix #11: compute trader's actual buy price (lamports per
                 # smallest-unit token) for the slippage-vs-trader gate. Uses raw
                 # amounts (no float rounding) and the signer's full SOL delta (which
@@ -5180,40 +5278,62 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
     # the second risk-cache fetch, triggering a fresh 429 → 60s retry.
     log("COPY-TRADE: 10s startup grace before leaderboard fetch (avoids Data API collision)")
     await asyncio.sleep(10)
-    # Fetch top traders once at startup (and refresh every COPY_TRADE_REFRESH_HOURS)
+    # V41.17x: ACTIVE SNIPER POOL — replace /top-traders/all (all-time PnL,
+    # 77% inactive whales) with currently-active grad snipers aggregated from
+    # /top-traders/{mint} across recent graduations. Audit data: median
+    # trades/24h was 0 in old pool, 472 in active pool.
     last_refresh = 0.0
     top_traders: list = []
     while True:
         try:
             now = time.time()
             if now - last_refresh > COPY_TRADE_REFRESH_HOURS * 3600 or not top_traders:
-                data = await asyncio.to_thread(_st_fetch_top_traders, COPY_TRADE_TOP_N)
-                if not data:
-                    log("COPY-TRADE: leaderboard fetch failed, retrying in 60s")
-                    await asyncio.sleep(60)
-                    continue
-                wallets = data.get("wallets", []) if isinstance(data, dict) else []
-                # V41.17v: REVERTED to V41.17h-era filter — just WR + realized.
-                # The activity filter (V41.17p) and HOT filter (V41.17r/s) reduced
-                # signal volume too aggressively per user feedback. Going back to
-                # the known-good baseline that was producing many copy_fast events.
-                eligible = []
-                for w in wallets:
-                    s = w.get("summary", {}) or {}
-                    wr = s.get("winPercentage")
-                    realized = s.get("realized") or 0
-                    if wr is None:
+                if ACTIVE_SNIPER_POOL_ENABLED:
+                    # Fast path: read cached active pool from disk
+                    top_traders = _load_active_sniper_pool()
+                    if not top_traders:
+                        log("COPY-TRADE: no cached active pool, building one (~80s)")
+                        top_traders = await asyncio.to_thread(_st_build_active_sniper_pool)
+                    if not top_traders:
+                        log("COPY-TRADE: active pool empty, falling back to /top-traders/all")
+                        # FALLBACK to legacy path
+                        data = await asyncio.to_thread(_st_fetch_top_traders, COPY_TRADE_TOP_N)
+                        wallets = (data or {}).get("wallets", [])
+                        eligible = []
+                        for w in wallets:
+                            s = w.get("summary", {}) or {}
+                            wr = s.get("winPercentage")
+                            realized = s.get("realized") or 0
+                            if wr is None: continue
+                            wr_n = wr / 100.0 if wr > 1.0 else wr
+                            floor_wr = max(COPY_TRADE_MIN_WIN_RATE, COPY_TRADE_MIN_WIN_RATE_TIGHT)
+                            if wr_n >= floor_wr and realized >= COPY_TRADE_MIN_REALIZED_SOL:
+                                eligible.append((w["wallet"], wr_n, realized))
+                        eligible.sort(key=lambda x: -x[2])
+                        top_traders = [t[0] for t in eligible[:COPY_TRADE_TOP_N]]
+                    last_refresh = now
+                    log(f"COPY-TRADE: tracking {len(top_traders)} ACTIVE GRAD SNIPERS (V41.17x — pool from /top-traders/{{mint}} aggregation, median 472 trades/24h vs 0 in old pool)")
+                else:
+                    data = await asyncio.to_thread(_st_fetch_top_traders, COPY_TRADE_TOP_N)
+                    if not data:
+                        log("COPY-TRADE: leaderboard fetch failed, retrying in 60s")
+                        await asyncio.sleep(60)
                         continue
-                    wr_n = wr / 100.0 if wr > 1.0 else wr
-                    floor_wr = max(COPY_TRADE_MIN_WIN_RATE, COPY_TRADE_MIN_WIN_RATE_TIGHT)
-                    if wr_n >= floor_wr and realized >= COPY_TRADE_MIN_REALIZED_SOL:
-                        eligible.append((w["wallet"], wr_n, realized))
-                eligible.sort(key=lambda x: -x[2])  # by realized PnL desc
-                top_traders = [t[0] for t in eligible[:COPY_TRADE_TOP_N]]
-                last_refresh = now
-                log(f"COPY-TRADE: tracking {len(top_traders)} top traders (V41.17h baseline)")
-                for addr, wr_n, realized in eligible[:COPY_TRADE_TOP_N]:
-                    log(f"  - {addr} WR={wr_n*100:.1f}% realized={realized:.0f} SOL")
+                    wallets = data.get("wallets", []) if isinstance(data, dict) else []
+                    eligible = []
+                    for w in wallets:
+                        s = w.get("summary", {}) or {}
+                        wr = s.get("winPercentage")
+                        realized = s.get("realized") or 0
+                        if wr is None: continue
+                        wr_n = wr / 100.0 if wr > 1.0 else wr
+                        floor_wr = max(COPY_TRADE_MIN_WIN_RATE, COPY_TRADE_MIN_WIN_RATE_TIGHT)
+                        if wr_n >= floor_wr and realized >= COPY_TRADE_MIN_REALIZED_SOL:
+                            eligible.append((w["wallet"], wr_n, realized))
+                    eligible.sort(key=lambda x: -x[2])
+                    top_traders = [t[0] for t in eligible[:COPY_TRADE_TOP_N]]
+                    last_refresh = now
+                    log(f"COPY-TRADE: tracking {len(top_traders)} top traders (V41.17h baseline)")
                 if not top_traders:
                     log("COPY-TRADE: no eligible traders, retrying in 60s")
                     await asyncio.sleep(60)
@@ -5223,27 +5343,36 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
             trader_set = set(top_traders)
             try:
                 if ST_RPC_ENABLED:
-                    async with websockets.connect(ST_RPC_WS, ping_interval=10, ping_timeout=20) as ws:
-                        # V41.17k: REVERTED to base64 encoding. jsonParsed (V41.17i) caused
-                        # ~10× volume drop on the shred stream — server-side parse seems
-                        # to throttle the firehose. We only got 6 shreds in 7 minutes vs
-                        # prior 10-50/min on base64. Fast-path latency saving was moot
-                        # (0 of 6 shreds were direct pump.fun buys; all 6 were wrong_signer).
-                        # Volume > latency when we have nothing to evaluate. Slow path
-                        # (getTransaction) handles all shreds. _parse_shred_for_pump_buy
-                        # remains in the codebase — it auto-no-ops on base64 (transaction
-                        # field is a [b64, "base64"] array, not a parsed dict).
+                    # V41.17x WS hardening: at ~330 shreds/min the getTransaction
+                    # backlog starves the WS reader → ST sends ping → we miss it →
+                    # 1011 keepalive timeout disconnect. Raise ping_timeout so brief
+                    # backlogs don't kill the connection. Also bump max_queue to
+                    # absorb burst messages while we drain.
+                    async with websockets.connect(
+                        ST_RPC_WS,
+                        ping_interval=20, ping_timeout=60,
+                        max_queue=2048, max_size=8 * 1024 * 1024,
+                    ) as ws:
+                        # V41.17y: YELLOWSTONE-EQUIVALENT setup — base64 encoding +
+                        # accountRequired=[pump_program] for server-side filter.
+                        # Test confirmed: 27% of unrelated txs dropped server-side,
+                        # local solders parse <1ms vs getTransaction's 200-400ms.
+                        # jsonParsed encoding is server-throttled by 99% (test-confirmed
+                        # 7.6/s base64 vs 0.1/s jsonParsed) — base64 is the only viable
+                        # encoding for high-volume copy-trade.
                         sub_msg = {
                             "jsonrpc": "2.0", "id": 9000,
                             "method": "shredSubscribe",
                             "params": [
-                                {"accountInclude": top_traders, "vote": False},
+                                {"accountInclude": top_traders,
+                                 "accountRequired": [_PUMP_PROGRAM_STR],
+                                 "vote": False},
                                 {"encoding": "base64", "transactionDetails": "full",
                                  "maxSupportedTransactionVersion": 0},
                             ],
                         }
                         await ws.send(json.dumps(sub_msg))
-                        log(f"COPY-TRADE: subscribed via ST shredSubscribe (base64) for {len(top_traders)} wallets — slow-path always (volume > latency)")
+                        log(f"COPY-TRADE: subscribed via ST shredSubscribe for {len(top_traders)} wallets — V41.17y Yellowstone-equivalent (base64 + accountRequired=pump + local solders parse)")
                         async for raw in ws:
                             data = json.loads(raw)
                             if "method" not in data:
@@ -5356,29 +5485,35 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
-    log(f"=== V41.17 LATENCY + CORRECTNESS FIXES ===")
-    log(f"  Fix #1: pre-cached rug check (refresh {RISK_CACHE_REFRESH_SEC}s, TTL {RISK_CACHE_TTL_SEC}s) → ~5ms hot-path")
-    log(f"  Fix #2: warm /stream/swap pool ({WARM_POOL_SIZE} mints, TTL {WARM_SWAP_TTL_SEC}s) → ~10-30ms entry"
-        f" {'[ACTIVE]' if (WARM_POOL_ENABLED and (kp or not PAPER_TRADING)) else '[paper-skip]'}")
-    log(f"  Fix #3: smart-wallet exit pre-flight (timeout {EXIT_CHECK_TIMEOUT_SEC*1000:.0f}ms, parallel with quote)"
-        f" {'[ACTIVE]' if EXIT_CHECK_ENABLED else '[disabled]'}")
-    log(f"  Fix #4: curve %-gate at signal time (max {COPY_FAST_MAX_CURVE_PCT:.0f}% — past sweet spot rejected)")
-    log(f"  Fix #5: tighter wallet allowlist (WR>={COPY_TRADE_MIN_WIN_RATE_TIGHT*100:.0f}% AND realized>={COPY_TRADE_MIN_REALIZED_SOL:.0f} SOL)")
+    log(f"=== V41.17y YELLOWSTONE-EQUIVALENT (latency parity at $0/mo) ===")
+    log(f"  shredSubscribe: accountInclude + accountRequired=[pump_program]")
+    log(f"    -> server-side filter drops 27% non-pump.fun txs (test-confirmed)")
+    log(f"  Local solders base64 parse: 0.01ms median (vs 250ms getTransaction)")
+    log(f"    -> 25,000x faster on direct pump.fun buys (~25% of buy signal)")
+    log(f"  Wrong-signer short-circuit: skip slow path on signer mismatch")
+    log(f"    -> drops getTransaction calls by ~80%, conserves RPC credits")
+    log(f"=== V41.17x ACTIVE-SNIPER POOL ===")
+    log(f"  WRONG ASSUMPTION FIXED: /top-traders/all sorts by ALL-TIME PnL")
+    log(f"    -> 77% inactive whales, median 0 trades/24h. Audit-confirmed.")
+    log(f"  NEW POOL: aggregate /top-traders/{{mint}} across {ACTIVE_SNIPER_GRAD_SAMPLE} recent grads")
+    log(f"    -> wallets in >= {ACTIVE_SNIPER_MIN_GRAD_HITS} grad top-10s = active snipers")
+    log(f"    -> median trades/24h: 472 (audit confirmed)")
+    log(f"    -> refresh every {ACTIVE_SNIPER_REFRESH_HOURS}h (snipers shift)")
+    log(f"  STRIPPED (V41.17w): smart-buyer-only, curve_pct_gate, first_buyer_gate, 8s time-stop")
+    log(f"  KEPT: rug check + Fix #11 ratio band ({COPY_FAST_MIN_PRICE_RATIO:.2f}-{COPY_FAST_MAX_PRICE_RATIO:.2f}x)")
+    log(f"  Fix #1: pre-cached rug check (refresh {RISK_CACHE_REFRESH_SEC}s, TTL {RISK_CACHE_TTL_SEC}s)")
+    log(f"  Fix #2: warm /stream/swap pool ({WARM_POOL_SIZE} mints) {'[ACTIVE]' if (WARM_POOL_ENABLED and (kp or not PAPER_TRADING)) else '[paper-skip]'}")
+    log(f"  Fix #3: smart-wallet exit pre-flight {'[ACTIVE]' if EXIT_CHECK_ENABLED else '[disabled]'}")
     log(f"  Fix #6: bundle freshness gate (reject if any bundle <{BUNDLE_FRESHNESS_THRESHOLD_SEC}s old)")
-    log(f"  Fix #7: first-buyer holding rate gate (min {FIRST_BUYER_MIN_HOLD_RATE*100:.0f}%, age >{FIRST_BUYER_MIN_TOKEN_AGE_SEC}s)"
-        f" {'[ACTIVE]' if FIRST_BUYER_GATE_ENABLED else '[disabled]'}")
-    log(f"  Fix #8: simulateTransaction pre-flight for entries >${SIMULATE_NOTIONAL_USD_THRESHOLD:.0f} (live only)")
-    log(f"  Fix #9: 8s no-pump time-stop on copy_fast {'[ACTIVE]' if TIME_STOP_ENABLED else '[disabled]'}")
-    log(f"  Fix #10: Raptor /swap path (program-upgrade resilient — Apr 2026 buy 17→18 accts)")
     log(f"  Fix #11: bidirectional slippage gate (abort if ratio > {COPY_FAST_MAX_PRICE_RATIO:.2f} or < {COPY_FAST_MIN_PRICE_RATIO:.2f})")
-    log(f"  V41.17b: dump_rebound {'ENABLED' if DUMP_REBOUND_ENABLED else 'DISABLED'} — copy_fast-only session for clean PnL signal")
-    log(f"  V41.17f: weak_scalp {'ENABLED' if WEAK_SCALP_ENABLED else 'DISABLED'} — kept late_breakout (winner this session)")
     log(f"=========================================")
     asyncio.create_task(session_reporter())
     asyncio.create_task(pumpportal_migration_listener(client, kp))
     asyncio.create_task(solanatracker_poll_latest(client, kp))
     # V41.17 Fix #1: pre-cache risk for hot-path lookup
     asyncio.create_task(refresh_risk_cache())
+    # V41.17x: rebuild active sniper pool every hour
+    asyncio.create_task(active_sniper_refresh_loop())
     # V41.17 Fix #2: warm /stream/swap pool (live mode + keypair)
     if not PAPER_TRADING and kp:
         asyncio.create_task(warm_raptor_swap_pool(kp))
