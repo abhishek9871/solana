@@ -1294,6 +1294,7 @@ COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS = int(os.environ.get("COPY_FAST_CONFIRM_CACHE
 COPY_FAST_CONFIRM_MIN_SWARM = int(os.environ.get("COPY_FAST_CONFIRM_MIN_SWARM", "4"))
 COPY_FAST_CONFIRM_SWARM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM_WINDOW_SEC", "10.0"))
 COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC", "1.0"))
+COPY_FAST_SWARM_ENTRY_ENABLED = os.environ.get("COPY_FAST_SWARM_ENTRY_ENABLED", "0") == "1"
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
 MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
 MARKET_TAPE_AMOUNT_SOL = float(os.environ.get("MARKET_TAPE_AMOUNT_SOL", "0.0125"))
@@ -1357,6 +1358,10 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
     global session_pnl_sol
     claimed_entry = False
     try:
+        if launchpad == "copy_fast_swarm" and not COPY_FAST_SWARM_ENTRY_ENABLED:
+            _swarm_override_entered.discard(mint)
+            log(f"  GRAD SKIP {mint[:8]} (copy_fast_swarm): disabled; market_tape owns speed lane")
+            return
         # V41.17za: copy_fast_swarm bypasses circuit breakers. These entries are
         # explicit overrides: capped 0.025 SOL, 30s hard timeout, dead-peak guard.
         # Streak-pause and consec_loss caps don't apply — we're knowingly riding
@@ -6804,7 +6809,11 @@ async def main():
     log(f"  SWARM-3+ rug overrides are candidates only until the confirm gate passes.")
     log(f"  Dead-peak threshold tightened: 1.005 -> 1.020 (catches false-pump-then-crash).")
     log(f"=== V41.17za bypass circuit breakers for swarm-override ===")
-    log(f"  copy_fast_swarm entries skip streak-pause and consec_loss halts.")
+    if COPY_FAST_SWARM_ENTRY_ENABLED:
+        log(f"  copy_fast_swarm entries skip streak-pause and consec_loss halts.")
+    else:
+        log(f"  copy_fast_swarm entries DISABLED by default after oversized confirmed-swarm losses; "
+            f"swarm still feeds market_tape.")
     log(f"=== V41.17z9/V41.18 SWARM-OVERRIDE CANDIDATE ===")
     log(f"  When SWARM-3+ forms within 30s on a rug-blocked mint, allow confirm-gated override")
     log(f"  If confirmed: 0.025 SOL position (half), 30s hard timeout, dead-peak guard active")
