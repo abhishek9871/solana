@@ -344,6 +344,7 @@ daily_loss_reset_ts = time.time()
 daily_loss_halt_reason = ""
 _positions_closing: set[str] = set()
 _swarm_compound_locks: dict[str, asyncio.Lock] = {}
+_recently_closed_mints: dict[str, float] = {}
 # V41.5: trade-counting and pause state
 daily_trade_count = 0                  # count of entries opened this session
 daily_count_reset_ts = time.time()     # when the daily counter last reset
@@ -566,6 +567,12 @@ def _remove_open_position(pos: Position) -> None:
         positions.pop(pos.mint, None)
     elif pos.mint in positions and positions[pos.mint].open_time == pos.open_time:
         positions.pop(pos.mint, None)
+    _recently_closed_mints[pos.mint] = time.time()
+    if len(_recently_closed_mints) > 1000:
+        cutoff = time.time() - max(RECENT_CLOSE_REENTRY_COOLDOWN_SEC, 60.0)
+        for mint, ts in list(_recently_closed_mints.items()):
+            if ts < cutoff:
+                _recently_closed_mints.pop(mint, None)
     _positions_closing.discard(pos.mint)
     _swarm_compound_locks.pop(pos.mint, None)
     _persist_positions()
@@ -593,6 +600,14 @@ def _position_open_for_compound(pos: Position) -> bool:
         and pos.mint not in _positions_closing
         and pos.remaining_pct > 0.01
     )
+
+
+def _mint_recently_closed(mint: str, now: Optional[float] = None) -> bool:
+    if not mint:
+        return False
+    now = time.time() if now is None else now
+    ts = _recently_closed_mints.get(mint, 0.0)
+    return bool(ts and now - ts < RECENT_CLOSE_REENTRY_COOLDOWN_SEC)
 
 
 def _get_swarm_compound_lock(mint: str) -> asyncio.Lock:
@@ -1250,6 +1265,8 @@ GRAD_COPY_FAST_POLL_SEC = float(os.environ.get("GRAD_COPY_FAST_POLL_SEC", "0.50"
 GRAD_SWARM_POLL_SEC = float(os.environ.get("GRAD_SWARM_POLL_SEC", "0.25"))
 GRAD_JUPITER_FALLBACK_SEC = float(os.environ.get("GRAD_JUPITER_FALLBACK_SEC", "2.0"))
 GRAD_BC_CACHE_MAX_AGE_MS = int(os.environ.get("GRAD_BC_CACHE_MAX_AGE_MS", "1500"))
+SWARM_COMPOUND_MIN_MULT = float(os.environ.get("SWARM_COMPOUND_MIN_MULT", "1.06"))
+RECENT_CLOSE_REENTRY_COOLDOWN_SEC = float(os.environ.get("RECENT_CLOSE_REENTRY_COOLDOWN_SEC", "45"))
 COPY_FAST_CONFIRM_ENABLED = os.environ.get("COPY_FAST_CONFIRM_ENABLED", "1") == "1"
 COPY_FAST_CONFIRM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_WINDOW_SEC", "3.0"))
 COPY_FAST_CONFIRM_POLL_SEC = float(os.environ.get("COPY_FAST_CONFIRM_POLL_SEC", "0.10"))
@@ -5732,14 +5749,26 @@ async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
         if (pos.adds_done or 0) >= 2:
             return  # already compounded twice — cap
         age_s = time.time() - pos.open_time
-        if age_s >= 30 or pos.peak_price < 0.95:
+        if age_s >= 30 or pos.peak_price < SWARM_COMPOUND_MIN_MULT:
+            return
+        cached = _bc_cache_price_for_pos(pos)
+        if not cached:
+            log(f"  SWARM-COMPOUND SKIP {mint[:8]}: no fresh bc-cache price")
+            return
+        current_price, complete, age_ms = cached
+        if complete or not pos.entry_price:
+            return
+        current_mult = current_price / pos.entry_price
+        if current_mult < SWARM_COMPOUND_MIN_MULT:
+            log(f"  SWARM-COMPOUND SKIP {mint[:8]}: mult={current_mult:.3f}x "
+                f"< {SWARM_COMPOUND_MIN_MULT:.3f}x (age={age_ms}ms)")
             return
         pos.adds_done = (pos.adds_done or 0) + 1
         reserved = True
         _persist_positions()
     add_amount = GRAD_AMOUNT_SOL * 0.5 if swarm_size == 2 else GRAD_AMOUNT_SOL
     log(f"  SWARM-COMPOUND {mint[:8]} (SWARM-{swarm_size}): reserved add #{pos.adds_done}, "
-        f"adding {add_amount:.4f} SOL on {signer[:8]}")
+        f"adding {add_amount:.4f} SOL on {signer[:8]} only after >={SWARM_COMPOUND_MIN_MULT:.3f}x")
 
     async def rollback_reservation() -> None:
         nonlocal reserved
@@ -5816,7 +5845,7 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
             existing = positions.get(mint)
             if (existing and _position_open_for_compound(existing) and (existing.adds_done or 0) < 2):
                 age_s = time.time() - existing.open_time
-                if age_s < 30 and existing.peak_price >= 0.95:
+                if age_s < 30 and existing.peak_price >= SWARM_COMPOUND_MIN_MULT:
                     asyncio.create_task(_swarm_compound_position(
                         client, kp, mint, len(recent_signers), signer))
             # V41.18: SWARM-3+ on a rug-blocked mint is only a candidate now.
@@ -6035,6 +6064,11 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
                 f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x "
                 f"bc={move_mult:.3f}x")
             return
+    if _mint_recently_closed(mint, now_ms / 1000.0):
+        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        log(f"  MARKET-TAPE BLOCK {mint[:8]}: closed within "
+            f"{RECENT_CLOSE_REENTRY_COOLDOWN_SEC:.0f}s cooldown")
+        return
 
     graduated_seen.add(mint)
     if len(graduated_seen) > 500:
@@ -6695,6 +6729,8 @@ async def main():
     log(f"=== V41.17z8 SWARM COMPOUND ===")
     log(f"  When SWARM-N (>=2 pool wallets) on a mint we have an open position on,")
     log(f"  ADD to position: 0.5x size for SWARM-2, 1x size for SWARM-3+. Cap 2 adds.")
+    log(f"  Only compounds while fresh bc-cache mult >= {SWARM_COMPOUND_MIN_MULT:.3f}x; "
+        f"closed mints have {RECENT_CLOSE_REENTRY_COOLDOWN_SEC:.0f}s re-entry cooldown.")
     log(f"  Token-weighted-avg entry (never averages down). 30s age window only.")
     log(f"=== V41.17z7 EXPANDED POOL + SWARM DETECTION ===")
     log(f"  Pool sample: {ACTIVE_SNIPER_GRAD_SAMPLE} mints x top {ACTIVE_SNIPER_TOP_N_PER_GRAD} traders, hits>={ACTIVE_SNIPER_MIN_GRAD_HITS}")
