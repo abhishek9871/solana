@@ -1333,6 +1333,8 @@ COPY_FAST_ALPHA_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_ALPHA_TIMEOUT_SEC"
 MARKET_TAPE_ALPHA_ENABLED = os.environ.get("MARKET_TAPE_ALPHA_ENABLED", "1") == "1"
 MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_SEC", "6.0"))
 MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SELL_SOL", "0.004"))
+MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC", "0.12"))
+MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
 MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
@@ -5291,9 +5293,9 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
-            "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL,
-            "quality": 7,
-            "reason": f"alpha_pair n={n} wr={wr:.0%} avg_best={avg_best:+.1%} ctx={context}",
+            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "quality": 6,
+            "reason": f"alpha_pair_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} ctx={context}",
         }
     if _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2) and _alpha_promoted(context_stat):
         wn, wwr, wavg, _wexit = _alpha_stat_view(wallet_stat)
@@ -6895,6 +6897,27 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         len(unique_buyers), len(tracked_buyers), buy_sol, sell_sol, observed_age_ms,
     )
     if alpha_plan:
+        if not alpha_cached_price or alpha_cached_price[1] or alpha_cached_price[0] <= 0:
+            _mt_gate("mt_alpha_no_price")
+            return
+        trigger_price = float(alpha_cached_price[0])
+        if MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC > 0:
+            await asyncio.sleep(MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC)
+            confirm_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+            if not confirm_price or confirm_price[1] or confirm_price[0] <= 0:
+                _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                _mt_gate("mt_alpha_confirm")
+                log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: no fresh confirm price after "
+                    f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s")
+                return
+            confirm_mult = float(confirm_price[0]) / trigger_price
+            if confirm_mult < MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:
+                _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                _mt_gate("mt_alpha_confirm")
+                log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: confirm_mult={confirm_mult:.3f}x "
+                    f"< {MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x after "
+                    f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s")
+                return
         graduated_seen.add(mint)
         if len(graduated_seen) > 500:
             graduated_seen.clear()
@@ -7787,7 +7810,9 @@ async def main():
             f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
         if MARKET_TAPE_ALPHA_ENABLED:
             log(f"  Market-tape alpha: context-promoted tape enters scout size before static gates "
-                f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s and sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL.")
+                f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s, sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, "
+                f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
+                f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s.")
     log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
         f"{COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s confirm window.")
     log(f"=== V41.19 MARKET-WIDE TAPE SCALPER ===")
