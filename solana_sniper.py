@@ -1209,90 +1209,61 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
 
         baseline_tokens_per_001 = float(baseline_quote["outAmount"])
 
-        # V41.3 MOMENTUM-CONFIRMED ENTRY: observe price action for 5s before entering.
-        # Empirical V41 data showed graduations split into 3 outcomes in the first 10s:
-        #   - Price up >=5%  -> usually keeps running to TP (rare but real wins)
-        #   - Price flat     -> 90s timeout, small drag loss
-        #   - Price down     -> immediate -15% to -50% gap dump
-        # Waiting 5s and only entering on confirmed +5% momentum filters out ~80% of losers.
-        log(f"  GRAD OBSERVE {mint[:8]}: baseline set, waiting 5s for momentum confirmation")
-        await asyncio.sleep(5)
-        confirm_quote = jupiter_quote(SOL_MINT, mint, probe_sol_lamports)
-        if not confirm_quote or float(confirm_quote.get("outAmount", 0)) == 0:
-            log(f"  GRAD SKIP {mint[:8]}: Jupiter route disappeared during observe window")
-            return
-        confirm_tokens_per_001 = float(confirm_quote["outAmount"])
-        # Price went UP if we get fewer tokens for the same SOL.
-        price_change = (baseline_tokens_per_001 / confirm_tokens_per_001) - 1.0 if confirm_tokens_per_001 else 0.0
-        # V41.4: dual-threshold momentum gate. Empirical V41.3 data:
-        #   +25% momentum -> 2.73x win
-        #   +77% momentum -> -30% loss
-        #   +97% momentum -> -50% loss
-        # Extreme spikes (>50% in 5s) are single-whale pumps that get dumped on us.
-        # Real continuations are gradual — 5-50% range is the sweet spot.
-        # V41.5 graduation tightening: +40-50% sweet spot for graduation pumps.
-        # V41.12: ST CLEAN MINTs are mid-curve tokens already vetted by Solana Tracker's
-        # multi-heuristic risk engine. We trust their filter — only require the price
-        # isn't actively dropping (-3% floor). Skip extreme spikes since they're bait.
-        if launchpad == "momentum":
-            # V41.13j: momentum sniper already verified 5m/15m uptrend via ST events.
-            # No additional gate needed. Only reject if price collapsed in the 5s observe window.
-            if price_change < -0.10:
-                log(f"  GRAD SKIP {mint[:8]}: collapsed during observe ({price_change*100:+.1f}%)")
+        # V41.17z5: launchpad-specific entry path.
+        #   - "pump" / "bonk" (default graduation lane): ENTER IMMEDIATELY (no 5s
+        #     observation, no momentum gate). Yesterday's OHLCV backtest showed
+        #     graduation peaks happen 1-5 minutes post-grad — every second of
+        #     observation costs us upside %. Dead-peak guard (V41.17z2) handles
+        #     the no-movement cases at -2 to -4% capped loss.
+        #   - "momentum" / "grad_imminent" / "st_pump": KEEP existing 5s observe +
+        #     specialized momentum/uptrend confirmation (these lanes have other
+        #     entry signals that need confirmation).
+        if launchpad in ("momentum", "grad_imminent", "st_pump"):
+            log(f"  GRAD OBSERVE {mint[:8]}: baseline set, waiting 5s for momentum confirmation")
+            await asyncio.sleep(5)
+            confirm_quote = jupiter_quote(SOL_MINT, mint, probe_sol_lamports)
+            if not confirm_quote or float(confirm_quote.get("outAmount", 0)) == 0:
+                log(f"  GRAD SKIP {mint[:8]}: Jupiter route disappeared during observe window")
                 return
-            log(f"  GRAD MOMENTUM OK {mint[:8]} (momentum): {price_change*100:+.1f}% — riding hot token")
-        elif launchpad == "grad_imminent":
-            # V41.13h: grad-imminent tokens (curve 95-99%) are flat by nature — buying
-            # fills the curve without raising price. We don't need momentum, the catalyst
-            # is the imminent graduation event. Only reject if price is actively dumping.
-            if price_change < -0.05:
-                log(f"  GRAD SKIP {mint[:8]}: dumping pre-grad ({price_change*100:+.1f}% in 5s)")
-                return
-            log(f"  GRAD MOMENTUM OK {mint[:8]} (grad_imminent): {price_change*100:+.1f}% — entering pre-grad")
-        elif launchpad == "st_pump":
-            # V41.13f: ST entries now require MONOTONIC RISING price over 15s (3 samples).
-            # Previous "anywhere from -3% allowed" let too many flat/declining tokens enter.
-            # Real winners (HfpkGDz1) showed sustained uptrend BEFORE we entered. We need
-            # to confirm the uptrend exists, not just that it isn't dumping.
-            log(f"  GRAD ST-CONFIRM {mint[:8]}: T+5s={price_change*100:+.1f}%, watching 10 more")
-            await asyncio.sleep(10)
-            tx_quote = jupiter_quote(SOL_MINT, mint, probe_sol_lamports)
-            if not tx_quote or float(tx_quote.get("outAmount", 0)) == 0:
-                log(f"  GRAD SKIP {mint[:8]}: Jupiter route lost during ST confirmation")
-                return
-            tx_tokens_per_001 = float(tx_quote["outAmount"])
-            price_change_15 = (baseline_tokens_per_001 / tx_tokens_per_001) - 1.0 if tx_tokens_per_001 else 0.0
-            # Require: rising at T+5s (>+1%), still rising at T+15s, total +3% to +50%
-            if price_change < 0.01:
-                log(f"  GRAD SKIP {mint[:8]}: T+5s flat/down ({price_change*100:+.1f}%) — no uptrend confirmed")
-                return
-            if price_change_15 < price_change:
-                log(f"  GRAD SKIP {mint[:8]}: T+15s reversed ({price_change_15*100:+.1f}% < T+5s {price_change*100:+.1f}%) — momentum stalled")
-                return
-            if price_change_15 < 0.03:
-                log(f"  GRAD SKIP {mint[:8]}: T+15s only {price_change_15*100:+.1f}% — below +3% confirmation floor")
-                return
-            if price_change_15 > 0.50:
-                log(f"  GRAD SKIP {mint[:8]}: T+15s spike +{price_change_15*100:.1f}% — pump-and-dump bait")
-                return
-            log(f"  GRAD MOMENTUM OK {mint[:8]} (st_pump): T+5s +{price_change*100:.1f}%, T+15s +{price_change_15*100:.1f}% — confirmed uptrend")
+            confirm_tokens_per_001 = float(confirm_quote["outAmount"])
+            price_change = (baseline_tokens_per_001 / confirm_tokens_per_001) - 1.0 if confirm_tokens_per_001 else 0.0
+            if launchpad == "momentum":
+                if price_change < -0.10:
+                    log(f"  GRAD SKIP {mint[:8]}: collapsed during observe ({price_change*100:+.1f}%)")
+                    return
+                log(f"  GRAD MOMENTUM OK {mint[:8]} (momentum): {price_change*100:+.1f}% — riding hot token")
+            elif launchpad == "grad_imminent":
+                if price_change < -0.05:
+                    log(f"  GRAD SKIP {mint[:8]}: dumping pre-grad ({price_change*100:+.1f}% in 5s)")
+                    return
+                log(f"  GRAD MOMENTUM OK {mint[:8]} (grad_imminent): {price_change*100:+.1f}% — entering pre-grad")
+            elif launchpad == "st_pump":
+                log(f"  GRAD ST-CONFIRM {mint[:8]}: T+5s={price_change*100:+.1f}%, watching 10 more")
+                await asyncio.sleep(10)
+                tx_quote = jupiter_quote(SOL_MINT, mint, probe_sol_lamports)
+                if not tx_quote or float(tx_quote.get("outAmount", 0)) == 0:
+                    log(f"  GRAD SKIP {mint[:8]}: Jupiter route lost during ST confirmation")
+                    return
+                tx_tokens_per_001 = float(tx_quote["outAmount"])
+                price_change_15 = (baseline_tokens_per_001 / tx_tokens_per_001) - 1.0 if tx_tokens_per_001 else 0.0
+                if price_change < 0.01:
+                    log(f"  GRAD SKIP {mint[:8]}: T+5s flat/down ({price_change*100:+.1f}%) — no uptrend confirmed")
+                    return
+                if price_change_15 < price_change:
+                    log(f"  GRAD SKIP {mint[:8]}: T+15s reversed ({price_change_15*100:+.1f}% < T+5s {price_change*100:+.1f}%) — momentum stalled")
+                    return
+                if price_change_15 < 0.03:
+                    log(f"  GRAD SKIP {mint[:8]}: T+15s only {price_change_15*100:+.1f}% — below +3% confirmation floor")
+                    return
+                if price_change_15 > 0.50:
+                    log(f"  GRAD SKIP {mint[:8]}: T+15s spike +{price_change_15*100:.1f}% — pump-and-dump bait")
+                    return
+                log(f"  GRAD MOMENTUM OK {mint[:8]} (st_pump): T+5s +{price_change*100:.1f}%, T+15s +{price_change_15*100:.1f}% — confirmed uptrend")
         else:
-            # V41.17z4: WIDENED graduation momentum band. Yesterday's OHLCV backtest
-            # on 16 grads showed peaks happen 1-5 minutes post-grad, not 5 seconds.
-            # The old 40-50%-in-5s gate filtered out 75%+ of real winners. New
-            # band: enter on any non-dumping curve, skip only obvious pump-and-dump
-            # bait (>50% spike in 5s = whale-pumped, dumps next).
-            # Dead-peak guard (5s/<1.005x) catches no-movement entries post-buy.
-            min_mom, max_mom = -0.05, 0.50
-            if price_change < min_mom:
-                log(f"  GRAD SKIP {mint[:8]}: dumping {price_change*100:+.1f}% in 5s (below {min_mom*100:+.0f}% floor)")
-                return
-            if price_change > max_mom:
-                log(f"  GRAD SKIP {mint[:8]}: extreme spike +{price_change*100:.1f}% in 5s — pump-and-dump bait")
-                return
-            log(f"  GRAD MOMENTUM OK {mint[:8]} ({launchpad}): {price_change*100:+.1f}% in 5s (band: {min_mom*100:+.0f}% to {max_mom*100:+.0f}%)")
+            # V41.17z5: default graduation lane — enter on the spot, no observation.
+            log(f"  GRAD INSTANT-ENTRY {mint[:8]} ({launchpad}): no observation, dead-peak guard owns downside")
 
-        log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): confirmed pump, buying {GRAD_AMOUNT_SOL} SOL")
+        log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): buying {GRAD_AMOUNT_SOL} SOL")
         pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
         if not pos:
             log(f"  GRAD BUY FAILED {mint[:8]}")
@@ -5650,6 +5621,9 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17z5 INSTANT GRADUATION ENTRY ===")
+    log(f"  pump/bonk grads: enter immediately after Jupiter indexing (no 5s observe)")
+    log(f"  Captures more upside on fast-pumping grads; dead-peak guard handles duds")
     log(f"=== V41.17z4 GRADUATION LANE OPENED ===")
     log(f"  Default grad branch: enter on -5% to +50% (was 40-50% in 5s)")
     log(f"  Dead-peak guard now covers: copy_fast + pump + bonk + grad_imminent + momentum + st_pump")
