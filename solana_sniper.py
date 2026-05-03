@@ -1277,20 +1277,20 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 return
             log(f"  GRAD MOMENTUM OK {mint[:8]} (st_pump): T+5s +{price_change*100:.1f}%, T+15s +{price_change_15*100:.1f}% — confirmed uptrend")
         else:
-            # V41.17q: REVERTED V41.17n's 10% floor back to 40%. V41.17n entries
-            # (uoYL47TP +12%, FNKDEgJz +32.7%) both lost — peak never moved off
-            # 1.00x after entry. The +10-40% band was catching post-spike entries
-            # where the pump was already over. V41.5's 40-50% range is empirically
-            # better: tokens that pump 40%+ in 5s genuinely have momentum, those
-            # at +10-40% are mostly already-faded.
-            min_mom, max_mom = 0.40, 0.50
+            # V41.17z4: WIDENED graduation momentum band. Yesterday's OHLCV backtest
+            # on 16 grads showed peaks happen 1-5 minutes post-grad, not 5 seconds.
+            # The old 40-50%-in-5s gate filtered out 75%+ of real winners. New
+            # band: enter on any non-dumping curve, skip only obvious pump-and-dump
+            # bait (>50% spike in 5s = whale-pumped, dumps next).
+            # Dead-peak guard (5s/<1.005x) catches no-movement entries post-buy.
+            min_mom, max_mom = -0.05, 0.50
             if price_change < min_mom:
-                log(f"  GRAD SKIP {mint[:8]}: price dropping after 5s ({price_change*100:+.1f}%) — below {min_mom*100:.0f}% floor (40-50% graduation sweet spot)")
+                log(f"  GRAD SKIP {mint[:8]}: dumping {price_change*100:+.1f}% in 5s (below {min_mom*100:+.0f}% floor)")
                 return
             if price_change > max_mom:
-                log(f"  GRAD SKIP {mint[:8]}: extreme spike +{price_change*100:.1f}% in 5s — above {max_mom*100:.0f}% (40-50% graduation sweet spot)")
+                log(f"  GRAD SKIP {mint[:8]}: extreme spike +{price_change*100:.1f}% in 5s — pump-and-dump bait")
                 return
-            log(f"  GRAD MOMENTUM OK {mint[:8]} ({launchpad}): +{price_change*100:.1f}% in 5s (band: 40-50% graduation sweet spot)")
+            log(f"  GRAD MOMENTUM OK {mint[:8]} ({launchpad}): {price_change*100:+.1f}% in 5s (band: {min_mom*100:+.0f}% to {max_mom*100:+.0f}%)")
 
         log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): confirmed pump, buying {GRAD_AMOUNT_SOL} SOL")
         pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
@@ -1304,6 +1304,8 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
         pos.entry_size_sol = GRAD_AMOUNT_SOL
         pos.quality_score = 8     # graduated tokens are inherently higher quality
         pos.launchpad = launchpad
+        # V41.17z4: stamp signal time so dead-peak guard works for grad lane too
+        pos.signal_time_ms = int(time.time() * 1000)
         positions[mint] = pos
         _record_entry_opened()
         asyncio.create_task(manage_graduation_position(client, kp, pos))
@@ -1384,7 +1386,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # which closed real winners; live data now confirms the proper params.
             DEAD_PEAK_TIME_SEC = 5.0
             DEAD_PEAK_THRESHOLD = 1.005
-            if (pos.launchpad == "copy_fast"
+            if (pos.launchpad in ("copy_fast", "pump", "bonk", "grad_imminent",
+                                  "momentum", "st_pump")
                     and pos.signal_time_ms > 0
                     and pos.peak_price < DEAD_PEAK_THRESHOLD):
                 age_s = (time.time() * 1000 - pos.signal_time_ms) / 1000
@@ -5647,6 +5650,10 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17z4 GRADUATION LANE OPENED ===")
+    log(f"  Default grad branch: enter on -5% to +50% (was 40-50% in 5s)")
+    log(f"  Dead-peak guard now covers: copy_fast + pump + bonk + grad_imminent + momentum + st_pump")
+    log(f"  Backtest: 37.5% WR / +4.56% EV at TP+18%/SL-7% with NO momentum gate")
     log(f"=== V41.17z3 WIDER FIX#11 BAND ===")
     log(f"  Fix #11 ratio band: {COPY_FAST_MIN_PRICE_RATIO:.2f}x - {COPY_FAST_MAX_PRICE_RATIO:.2f}x (was 0.85-1.05)")
     log(f"  Dead-peak guard makes wider band safe — borderline duds capped at -3% via 5s exit")
