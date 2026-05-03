@@ -5236,16 +5236,22 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
         _copy_trade_stats["alpha_toxic"] = _copy_trade_stats.get("alpha_toxic", 0) + 1
         return None
 
-    if _alpha_promoted(pair_stat) or (
-        _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2)
-        and _alpha_promoted(context_stat)
-    ):
+    if _alpha_promoted(pair_stat):
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
-        n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat or wallet_stat)
+        n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat)
         return {
             "launchpad": "copy_fast_alpha",
             "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL,
             "reason": f"promoted n={n} wr={wr:.0%} avg_best={avg_best:+.1%}",
+        }
+    if _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2) and _alpha_promoted(context_stat):
+        _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
+        wn, wwr, wavg, _wexit = _alpha_stat_view(wallet_stat)
+        cn, cwr, cavg, _cexit = _alpha_stat_view(context_stat)
+        return {
+            "launchpad": "copy_fast_alpha",
+            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "reason": f"wallet_context scout w={wn}/{wwr:.0%}/{wavg:+.1%} c={cn}/{cwr:.0%}/{cavg:+.1%}",
         }
 
     if (ALPHA_EXPLORATION_ENABLED
@@ -5281,16 +5287,23 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
     if _alpha_toxic(pair_stat) or _alpha_toxic(context_stat) or _alpha_toxic(wallet_stat):
         _copy_trade_stats["alpha_toxic"] = _copy_trade_stats.get("alpha_toxic", 0) + 1
         return None
-    if _alpha_promoted(pair_stat) or (
-        _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2)
-        and _alpha_promoted(context_stat)
-    ):
-        n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat or wallet_stat)
+    if _alpha_promoted(pair_stat):
+        n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
             "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL,
             "quality": 7,
             "reason": f"alpha_pair n={n} wr={wr:.0%} avg_best={avg_best:+.1%} ctx={context}",
+        }
+    if _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2) and _alpha_promoted(context_stat):
+        wn, wwr, wavg, _wexit = _alpha_stat_view(wallet_stat)
+        cn, cwr, cavg, _cexit = _alpha_stat_view(context_stat)
+        _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
+        return {
+            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "quality": 6,
+            "reason": f"alpha_wallet_context w={wn}/{wwr:.0%}/{wavg:+.1%} "
+                      f"c={cn}/{cwr:.0%}/{cavg:+.1%} ctx={context}",
         }
     if _alpha_promoted(context_stat):
         n, wr, avg_best, _avg_exit = _alpha_stat_view(context_stat)
