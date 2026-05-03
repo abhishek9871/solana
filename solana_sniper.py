@@ -1364,7 +1364,10 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # any winner. This is much TIGHTER than the V41.17v version (8s/1.04)
             # which closed real winners; live data now confirms the proper params.
             DEAD_PEAK_TIME_SEC = 5.0
-            DEAD_PEAK_THRESHOLD = 1.005
+            # V41.17zc: tightened 1.005 -> 1.020. Live data (HCqzUnse peak 1.01,
+            # CVZHqoMv peak 1.000, both crashed -22% to -26% past SL) showed
+            # the 1.005 threshold leaked too many false-pump-then-crash entries.
+            DEAD_PEAK_THRESHOLD = 1.020
             # V41.17z9: hard 30s timeout for swarm-override entries (bundle pumps
             # are typically over within 30-60s; cap exposure)
             if (pos.launchpad == "copy_fast_swarm"
@@ -5171,21 +5174,23 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                 if age_s < 30 and existing.peak_price >= 0.95:
                     asyncio.create_task(_swarm_compound_position(
                         client, kp, mint, len(recent_signers), signer))
-            # V41.17zb: SWARM-OVERRIDE-RUG with SUSTAIN FILTER. SWARM-3+ on a
-            # rug-blocked mint kicks off a 3-second observation. If swarm GROWS
-            # within that window (4+ wallets), enter. If it stalls, skip.
-            # Decoded from C25kDotw (sustained 3->8) won vs HCqzUnse (stalled at 3) lost.
+            # V41.17zc: REVERTED the 3s sustain-wait — too much latency on
+            # ultra-fast bundle pumps. By T+3s curves often crashed past Fix #11.
+            # Restored immediate SWARM-3+ entry. Tighter dead-peak threshold
+            # (1.020 vs 1.005) below catches the false-pump-then-crash pattern
+            # that the wait was trying to filter.
             elif (not existing
                     and len(recent_signers) >= 3
                     and mint in _rug_blocked_recent
                     and (now_ms - _rug_blocked_recent[mint]) < 30_000
-                    and mint not in _swarm_override_entered
-                    and mint not in _swarm_pending):
-                _swarm_pending.add(mint)
-                log(f"  *** SWARM-PENDING *** {mint[:8]}: SWARM-{len(recent_signers)} detected, "
-                    f"watching 3s for sustain (skip if swarm stalls)")
-                asyncio.create_task(_delayed_swarm_override_entry(
-                    client, kp, mint, signer, trader_price, len(recent_signers)))
+                    and mint not in _swarm_override_entered):
+                _swarm_override_entered.add(mint)
+                _copy_trade_stats["swarm_override"] = _copy_trade_stats.get("swarm_override", 0) + 1
+                log(f"  *** SWARM-OVERRIDE-RUG *** {mint[:8]}: {len(recent_signers)} wallets agree, "
+                    f"overriding rug-block with capped 0.025 SOL")
+                asyncio.create_task(graduation_snipe(
+                    client, kp, mint, launchpad="copy_fast_swarm",
+                    signer=signer, trader_price=trader_price))
         return
     mint_lc = mint.lower()
     if not (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
@@ -5788,9 +5793,10 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
-    log(f"=== V41.17zb SWARM-SUSTAIN FILTER (decoded from C25kDotw) ===")
-    log(f"  SWARM-3+ on rug-blocked mint waits 3s — only enters if swarm GREW.")
-    log(f"  Backtested: catches C25kDotw (3->8) and 6iPsKe4j wins, skips HCqzUnse (3->3) and CVZHqoMv (4->4).")
+    log(f"=== V41.17zc REVERT WAIT + TIGHTER DEAD-PEAK ===")
+    log(f"  Reverted V41.17zb 3s sustain-wait — too much latency, killed winners.")
+    log(f"  Restored immediate SWARM-OVERRIDE-RUG entry on SWARM-3+.")
+    log(f"  Dead-peak threshold tightened: 1.005 -> 1.020 (catches false-pump-then-crash).")
     log(f"=== V41.17za bypass circuit breakers for swarm-override ===")
     log(f"  copy_fast_swarm entries skip streak-pause and consec_loss halts.")
     log(f"=== V41.17z9 SWARM-OVERRIDE-RUG ===")
