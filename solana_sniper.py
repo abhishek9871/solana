@@ -1297,6 +1297,7 @@ COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_
 COPY_FAST_SWARM_ENTRY_ENABLED = os.environ.get("COPY_FAST_SWARM_ENTRY_ENABLED", "0") == "1"
 COPY_FAST_SOLO_ROCKET_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_ENABLED", "1") == "1"
 COPY_FAST_SOLO_ROCKET_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_MULT", "1.35"))
+COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT", "1.20"))
 COPY_FAST_SOLO_ROCKET_AMOUNT_SOL = float(os.environ.get("COPY_FAST_SOLO_ROCKET_AMOUNT_SOL", "0.00625"))
 COPY_FAST_SOLO_ROCKET_TP_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TP_MULT", "1.055"))
 COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC", "2.0"))
@@ -5534,9 +5535,13 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                 log(f"  GRAD CONFIRM-OK {mint[:8]} ({launchpad}): mult={last_mult:.3f}x "
                     f"peak={peak_price / baseline_price:.3f}x swarm={len(recent)} age={last_age_ms}ms")
                 return True
+            solo_rocket_ok = (
+                last_mult >= COPY_FAST_SOLO_ROCKET_MIN_MULT
+                or (len(recent) >= 2 and last_mult >= COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT)
+            )
             if (COPY_FAST_SOLO_ROCKET_ENABLED
                     and launchpad == "copy_fast"
-                    and last_mult >= COPY_FAST_SOLO_ROCKET_MIN_MULT
+                    and solo_rocket_ok
                     and off_peak_ok):
                 _copy_fast_solo_rocket_mints.add(mint)
                 _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
@@ -6928,6 +6933,7 @@ async def main():
     if COPY_FAST_SOLO_ROCKET_ENABLED:
         log(f"  Solo rocket scout: copy_fast may enter {COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL "
             f"at >={COPY_FAST_SOLO_ROCKET_MIN_MULT:.2f}x without swarm; "
+            f"SWARM-2 lowers trigger to {COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT:.2f}x; "
             f"TP={COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x fast-kill "
             f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s/{COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK:.3f}x.")
     log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
