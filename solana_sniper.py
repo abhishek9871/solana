@@ -1383,6 +1383,9 @@ MARKET_TAPE_EXIT_WINDOW_MS = int(os.environ.get("MARKET_TAPE_EXIT_WINDOW_MS", "9
 MARKET_TAPE_EXIT_DROP_MULT = float(os.environ.get("MARKET_TAPE_EXIT_DROP_MULT", "0.985"))
 MARKET_TAPE_EXIT_MIN_SELL_SOL = float(os.environ.get("MARKET_TAPE_EXIT_MIN_SELL_SOL", "0.020"))
 MARKET_TAPE_EXIT_SELL_BUY_RATIO = float(os.environ.get("MARKET_TAPE_EXIT_SELL_BUY_RATIO", "0.35"))
+MARKET_TAPE_EXIT_SINGLE_TRACKED_SELL_MIN_AGE_SEC = float(os.environ.get(
+    "MARKET_TAPE_EXIT_SINGLE_TRACKED_SELL_MIN_AGE_SEC", "0.75"
+))
 MARKET_TAPE_SCOUT_ENABLED = os.environ.get("MARKET_TAPE_SCOUT_ENABLED", "1") == "1"
 MARKET_TAPE_SCOUT_AMOUNT_SOL = float(os.environ.get("MARKET_TAPE_SCOUT_AMOUNT_SOL", "0.00625"))
 MARKET_TAPE_SCOUT_MIN_BC_MOVE = float(os.environ.get("MARKET_TAPE_SCOUT_MIN_BC_MOVE", "1.015"))
@@ -6731,11 +6734,18 @@ async def _maybe_market_tape_exit(client: Client, kp: Optional[Keypair],
             multiplier,
         )
 
+    age_since_open = max(0.0, now_ms / 1000.0 - pos.open_time)
+    single_tracked_sell = bool(
+        event
+        and not event.get("is_buy")
+        and event.get("tracked")
+        and age_since_open >= MARKET_TAPE_EXIT_SINGLE_TRACKED_SELL_MIN_AGE_SEC
+    )
     sell_pressure = bool(sells) and (
         len(sells) >= 2
         or sell_sol >= MARKET_TAPE_EXIT_MIN_SELL_SOL
         or (buy_sol > 0 and sell_sol >= buy_sol * MARKET_TAPE_EXIT_SELL_BUY_RATIO)
-        or bool(event and not event.get("is_buy") and event.get("tracked"))
+        or single_tracked_sell
     )
     if sell_pressure and (multiplier < 1.030 or pos.peak_price < 1.040):
         return await _close_grad_position_from_market_tape(
@@ -7860,7 +7870,8 @@ async def main():
     if MARKET_TAPE_EXIT_ENABLED:
         log(f"  Tape exits: {MARKET_TAPE_EXIT_WINDOW_MS}ms sell-pressure window, "
             f"drop<= {MARKET_TAPE_EXIT_DROP_MULT:.3f}x, sell>={MARKET_TAPE_EXIT_MIN_SELL_SOL:.3f} SOL "
-            f"or sell/buy>={MARKET_TAPE_EXIT_SELL_BUY_RATIO:.2f}.")
+            f"or sell/buy>={MARKET_TAPE_EXIT_SELL_BUY_RATIO:.2f}; single tracked sell after "
+            f"{MARKET_TAPE_EXIT_SINGLE_TRACKED_SELL_MIN_AGE_SEC:.2f}s.")
     if MARKET_TAPE_SCOUT_ENABLED:
         log(f"  Scout lane: {MARKET_TAPE_SCOUT_AMOUNT_SOL:.4f} SOL at "
             f"{MARKET_TAPE_SCOUT_MIN_BC_MOVE:.3f}-{MARKET_TAPE_SCOUT_MAX_BC_MOVE:.3f}x "
