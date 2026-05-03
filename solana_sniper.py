@@ -1294,6 +1294,8 @@ MARKET_TAPE_LOW_MOVE_STRONG_BELOW = float(os.environ.get("MARKET_TAPE_LOW_MOVE_S
 MARKET_TAPE_LOW_MOVE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_UNIQUE", "8"))
 MARKET_TAPE_LOW_MOVE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_TRACKED", "3"))
 MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL", "5.0"))
+MARKET_TAPE_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_CONFIRM_DELAY_SEC", "0.35"))
+MARKET_TAPE_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_CONFIRM_MIN_MULT", "1.003"))
 MARKET_TAPE_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_COOLDOWN_SEC", "25"))
 MARKET_TAPE_MAX_ENTRIES_PER_MIN = int(os.environ.get("MARKET_TAPE_MAX_ENTRIES_PER_MIN", "18"))
 MARKET_TAPE_TP_MULT = float(os.environ.get("MARKET_TAPE_TP_MULT", "1.08"))
@@ -6061,8 +6063,10 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
         return
     latest_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+    if not latest_price:
+        return
     trader_price = float(trade.get("trader_price") or 0)
-    if latest_price and trader_price > 0:
+    if trader_price > 0:
         price_ratio = latest_price[0] / trader_price
         if price_ratio < MARKET_TAPE_MIN_PRICE_RATIO or price_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
@@ -6075,6 +6079,21 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         log(f"  MARKET-TAPE BLOCK {mint[:8]}: closed within "
             f"{RECENT_CLOSE_REENTRY_COOLDOWN_SEC:.0f}s cooldown")
         return
+    if MARKET_TAPE_CONFIRM_DELAY_SEC > 0:
+        trigger_price = latest_price[0]
+        await asyncio.sleep(MARKET_TAPE_CONFIRM_DELAY_SEC)
+        confirm_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+        if not confirm_price or confirm_price[1]:
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            log(f"  MARKET-TAPE BLOCK {mint[:8]}: no fresh confirm price after "
+                f"{MARKET_TAPE_CONFIRM_DELAY_SEC:.2f}s")
+            return
+        confirm_mult = confirm_price[0] / trigger_price if trigger_price > 0 else 0.0
+        if confirm_mult < MARKET_TAPE_CONFIRM_MIN_MULT:
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            log(f"  MARKET-TAPE BLOCK {mint[:8]}: confirm_mult={confirm_mult:.3f}x "
+                f"< {MARKET_TAPE_CONFIRM_MIN_MULT:.3f}x after {MARKET_TAPE_CONFIRM_DELAY_SEC:.2f}s")
+            return
 
     graduated_seen.add(mint)
     if len(graduated_seen) > 500:
@@ -6723,6 +6742,8 @@ async def main():
         f"bc<{MARKET_TAPE_LOW_MOVE_STRONG_BELOW:.3f}x requires "
         f"({MARKET_TAPE_LOW_MOVE_MIN_UNIQUE}+ unique and {MARKET_TAPE_LOW_MOVE_MIN_TRACKED}+ tracked) "
         f"or {MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL:.1f}+ SOL buy pressure.")
+    log(f"  Micro-confirm: wait {MARKET_TAPE_CONFIRM_DELAY_SEC:.2f}s and require "
+        f"{MARKET_TAPE_CONFIRM_MIN_MULT:.3f}x continuation before entry.")
     log(f"=== V41.17zc/V41.18 DEAD-PEAK + CONFIRM-GATED SWARM ===")
     log(f"  Reverted fixed 3s sustain-wait; V41.18 uses price-confirm polling instead.")
     log(f"  SWARM-3+ rug overrides are candidates only until the confirm gate passes.")
