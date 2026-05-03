@@ -1260,6 +1260,24 @@ COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS = int(os.environ.get("COPY_FAST_CONFIRM_CACHE
 COPY_FAST_CONFIRM_MIN_SWARM = int(os.environ.get("COPY_FAST_CONFIRM_MIN_SWARM", "4"))
 COPY_FAST_CONFIRM_SWARM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM_WINDOW_SEC", "10.0"))
 COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC", "1.0"))
+MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
+MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
+MARKET_TAPE_AMOUNT_SOL = float(os.environ.get("MARKET_TAPE_AMOUNT_SOL", "0.0125"))
+MARKET_TAPE_WINDOW_MS = int(os.environ.get("MARKET_TAPE_WINDOW_MS", "1200"))
+MARKET_TAPE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_MIN_UNIQUE", "4"))
+MARKET_TAPE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_MIN_TRACKED", "1"))
+MARKET_TAPE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_MIN_BUY_SOL", "0.08"))
+MARKET_TAPE_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_MAX_SELL_SOL", "0.01"))
+MARKET_TAPE_MIN_BC_MOVE = float(os.environ.get("MARKET_TAPE_MIN_BC_MOVE", "1.015"))
+MARKET_TAPE_MAX_BC_MOVE = float(os.environ.get("MARKET_TAPE_MAX_BC_MOVE", "1.35"))
+MARKET_TAPE_BC_CACHE_MAX_AGE_MS = int(os.environ.get("MARKET_TAPE_BC_CACHE_MAX_AGE_MS", "700"))
+MARKET_TAPE_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_COOLDOWN_SEC", "25"))
+MARKET_TAPE_MAX_ENTRIES_PER_MIN = int(os.environ.get("MARKET_TAPE_MAX_ENTRIES_PER_MIN", "18"))
+MARKET_TAPE_TP_MULT = float(os.environ.get("MARKET_TAPE_TP_MULT", "1.08"))
+MARKET_TAPE_FAST_KILL_SEC = float(os.environ.get("MARKET_TAPE_FAST_KILL_SEC", "3.0"))
+MARKET_TAPE_FAST_KILL_PEAK = float(os.environ.get("MARKET_TAPE_FAST_KILL_PEAK", "1.025"))
+MARKET_TAPE_TIMEOUT_SEC = float(os.environ.get("MARKET_TAPE_TIMEOUT_SEC", "25"))
+PUMP_GRADUATION_ENABLED = os.environ.get("PUMP_GRADUATION_ENABLED", "0") == "1"
 # V41.12c: ST clean mid-curve tokens grow over minutes/hours, not seconds. Extended timeout.
 GRAD_TIMEOUT_ST_SEC = int(os.environ.get("GRAD_TIMEOUT_ST_SEC", "1800")) # 30 min hold for ST clean mints
 
@@ -1573,6 +1591,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
     last_quote_check = 0.0
 
     def poll_delay() -> float:
+        if pos.launchpad == "market_tape":
+            return GRAD_SWARM_POLL_SEC
         if pos.launchpad == "copy_fast_swarm":
             return GRAD_SWARM_POLL_SEC
         if pos.launchpad == "copy_fast":
@@ -1581,7 +1601,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
 
     async def current_price(force_quote: bool = False) -> Optional[tuple[float, str]]:
         nonlocal last_quote_check
-        if pos.launchpad in ("copy_fast", "copy_fast_swarm"):
+        if pos.launchpad in ("copy_fast", "copy_fast_swarm", "market_tape"):
             cached = _bc_cache_price_for_pos(pos)
             if cached:
                 price, complete, age_ms = cached
@@ -1589,7 +1609,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     return price, f"bc_cache:{age_ms}ms"
         now = time.time()
         if (not force_quote
-                and pos.launchpad in ("copy_fast", "copy_fast_swarm")
+                and pos.launchpad in ("copy_fast", "copy_fast_swarm", "market_tape")
                 and now - last_quote_check < GRAD_JUPITER_FALLBACK_SEC):
             return None
         last_quote_check = now
@@ -1606,6 +1626,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # V41.13-14: ST, grad-imminent, momentum, copy_fast entries have NO timeout.
             if pos.launchpad in ("st_pump", "grad_imminent", "momentum", "copy_fast"):
                 timeout_for_pos = float("inf")
+            elif pos.launchpad == "market_tape":
+                timeout_for_pos = MARKET_TAPE_TIMEOUT_SEC
             else:
                 timeout_for_pos = GRAD_TIMEOUT_SEC
 
@@ -1646,8 +1668,18 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     1.0, multiplier,
                 ):
                     break
+            if (pos.launchpad == "market_tape"
+                    and pos.signal_time_ms > 0
+                    and (now * 1000 - pos.signal_time_ms) > MARKET_TAPE_FAST_KILL_SEC * 1000
+                    and pos.peak_price < MARKET_TAPE_FAST_KILL_PEAK):
+                if try_grad_sell(
+                    f"MARKET-TAPE FAST-KILL {MARKET_TAPE_FAST_KILL_SEC:.1f}s "
+                    f"peak={pos.peak_price:.3f}x mult={multiplier:.3f}x",
+                    1.0, multiplier,
+                ):
+                    break
             if (pos.launchpad in ("copy_fast", "copy_fast_swarm", "pump", "bonk",
-                                  "grad_imminent", "momentum", "st_pump")
+                                  "grad_imminent", "momentum", "st_pump", "market_tape")
                     and pos.signal_time_ms > 0
                     and pos.peak_price < DEAD_PEAK_THRESHOLD):
                 age_s = (now * 1000 - pos.signal_time_ms) / 1000
@@ -1665,6 +1697,9 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # 1.01x but slippage takes us back to 0.98x, "trail win" becomes real loss.
             # Require: trail_floor must be > 1 + GRAD_TRAILING_MIN_LOCK (clear slippage).
             change = (sol_per_unit - pos.entry_price) / pos.entry_price
+            if pos.launchpad == "market_tape" and multiplier >= MARKET_TAPE_TP_MULT:
+                if try_grad_sell(f"MARKET-TAPE TP {MARKET_TAPE_TP_MULT:.3f}x mult={multiplier:.3f}x", 1.0, multiplier):
+                    break
             if pos.peak_price >= GRAD_TRAILING_ACTIVATION:
                 trail_floor = pos.peak_price * GRAD_TRAILING_DISTANCE
                 # Only honor trail exit if lock >= 4% (covers round-trip slippage)
@@ -2472,6 +2507,8 @@ async def monitor_pump_fun(client: Client, kp: Optional[Keypair]):
                         # Both are routable via Jupiter (LaunchLab → Raydium AMM/CPMM).
                         # Source: chainstacklabs/letsbonk-fun-bot, bitquery LetsBonk docs.
                         if sub_type == "bonk":
+                            if not PUMP_GRADUATION_ENABLED:
+                                continue
                             is_bonk_init = any(
                                 "Program log: Instruction: initialize_v2" in l
                                 for l in logs
@@ -2516,6 +2553,8 @@ async def monitor_pump_fun(client: Client, kp: Optional[Keypair]):
                         # the 99.5% rug filter, PumpSwap pool just opened.
                         is_migrate = any("Program log: Instruction: Migrate" in l for l in logs)
                         if is_migrate and sig:
+                            if not PUMP_GRADUATION_ENABLED:
+                                continue
                             try:
                                 tx = client.get_transaction(Signature.from_string(sig),
                                                               max_supported_transaction_version=0,
@@ -3109,7 +3148,9 @@ async def session_reporter():
                 f"no_meta={s['no_meta']} wrong_signer={s['wrong_signer']} no_buy={s['no_buy']} "
                 f"non_memecoin={s['non_memecoin']} dedup={s['dedup']} rug_blocked={s['rug_blocked']} fired={s['fired']} "
                 f"confirm_ok={s.get('confirm_ok', 0)} confirm_blocked={s.get('confirm_blocked', 0)} "
-                f"confirm_dump={s.get('confirm_dump_blocked', 0)} ===")
+                f"confirm_dump={s.get('confirm_dump_blocked', 0)} "
+                f"mt_seen={s.get('market_tape_seen', 0)} mt_trig={s.get('market_tape_triggers', 0)} "
+                f"mt_ent={s.get('market_tape_entered', 0)} mt_blk={s.get('market_tape_blocked', 0)} ===")
 
 
 # === MAIN ===
@@ -4178,6 +4219,9 @@ RISK_CACHE_REFRESH_SEC = int(os.environ.get("RISK_CACHE_REFRESH_SEC", "15"))
 WARM_POOL_SIZE = int(os.environ.get("WARM_POOL_SIZE", "50"))
 WARM_SWAP_TTL_SEC = int(os.environ.get("WARM_SWAP_TTL_SEC", "15"))
 WARM_POOL_ENABLED = os.environ.get("WARM_POOL_ENABLED", "1") == "1"
+WARM_SWAP_AMOUNT_SOL = float(os.environ.get("WARM_SWAP_AMOUNT_SOL", str(MARKET_TAPE_AMOUNT_SOL)))
+WARM_PRIORITY_TTL_SEC = float(os.environ.get("WARM_PRIORITY_TTL_SEC", "45"))
+WARM_POOL_REFRESH_SEC = float(os.environ.get("WARM_POOL_REFRESH_SEC", "1.0"))
 # Fix #3: smart-wallet exit pre-flight (overlap with quote — no added latency)
 EXIT_CHECK_TIMEOUT_SEC = float(os.environ.get("EXIT_CHECK_TIMEOUT_SEC", "0.25"))
 EXIT_CHECK_ENABLED = os.environ.get("EXIT_CHECK_ENABLED", "1") == "1"
@@ -4250,6 +4294,12 @@ _warm_pool_stats = {"hits": 0, "misses": 0, "stale": 0, "subscribes": 0, "msgs_i
 _first_buyers_cache: dict = {}
 # Wallets currently warm in /stream/swap (single set for all subs on the connection)
 _warm_subscribed_mints: set = set()
+_warm_priority_mints: dict[str, float] = {}
+
+
+def _mark_warm_priority_mint(mint: str) -> None:
+    if mint:
+        _warm_priority_mints[mint] = time.time()
 
 
 def _st_fetch(path: str):
@@ -4672,6 +4722,13 @@ _swarm_override_entered: set = set()
 # Prevents re-scheduling the same delayed-entry coroutine for a mint.
 _swarm_pending: set = set()
 
+# V41.19: market-wide direct pump.fun tape. This is the speed lane: parse every
+# direct buy/sell from ST shreds, build a sub-second per-mint tape, and enter
+# clustered organic pressure before waiting for a copy-trade confirmation.
+_market_tape_per_mint: dict[str, deque] = defaultdict(lambda: deque(maxlen=80))
+_market_tape_entered_recent: dict[str, int] = {}
+_market_tape_entry_times: deque = deque(maxlen=200)
+
 _copy_trade_stats = {
     "shreds": 0, "no_meta": 0, "wrong_signer": 0, "no_buy": 0,
     "non_memecoin": 0, "dedup": 0, "fired": 0, "exception": 0,
@@ -4683,6 +4740,9 @@ _copy_trade_stats = {
     "price_blocked": 0, "trader_price_unparseable": 0,
     # V41.18 confirm-then-enter gate
     "confirm_ok": 0, "confirm_blocked": 0, "confirm_dump_blocked": 0,
+    # V41.19 market-wide tape
+    "market_tape_seen": 0, "market_tape_triggers": 0, "market_tape_entered": 0,
+    "market_tape_blocked": 0,
 }
 
 
@@ -5008,23 +5068,37 @@ async def warm_raptor_swap_pool(kp: Optional[Keypair]):
 
     raptor_ws_url = RAPTOR_BASE.replace("https://", "wss://").replace("http://", "ws://") + "/stream/swap"
     log(f"WARM SWAP POOL: connecting to {raptor_ws_url} (target {WARM_POOL_SIZE} mints)")
-    sol_lamports = int(GRAD_AMOUNT_SOL * 10**WSOL_DECIMALS)
+    sol_lamports = int(WARM_SWAP_AMOUNT_SOL * 10**WSOL_DECIMALS)
 
     while True:
         try:
             async with websockets.connect(raptor_ws_url, ping_interval=25, ping_timeout=20) as ws:
-                # Refresh subscription set every 30s based on top trending mints
+                # Refresh subscription set frequently for hot priority mints. Data API
+                # trending still refreshes every 30s to avoid 429s.
                 async def refresher():
+                    trending_targets: set[str] = set()
+                    next_trending_fetch = 0.0
                     while True:
                         try:
-                            data = await asyncio.to_thread(_st_fetch, "/tokens/trending/5m")
-                            target_mints = set()
-                            if isinstance(data, list):
-                                for t in data[:WARM_POOL_SIZE]:
-                                    mint = (t.get("token") or {}).get("mint", "")
-                                    mint_lc = mint.lower()
-                                    if mint and (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
-                                        target_mints.add(mint)
+                            now_ts = time.time()
+                            if now_ts >= next_trending_fetch:
+                                data = await asyncio.to_thread(_st_fetch, "/tokens/trending/5m")
+                                trending_targets = set()
+                                if isinstance(data, list):
+                                    for t in data[:WARM_POOL_SIZE]:
+                                        mint = (t.get("token") or {}).get("mint", "")
+                                        mint_lc = mint.lower()
+                                        if mint and (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
+                                            trending_targets.add(mint)
+                                next_trending_fetch = now_ts + 30
+                            for mint, ts in list(_warm_priority_mints.items()):
+                                if now_ts - ts > WARM_PRIORITY_TTL_SEC:
+                                    _warm_priority_mints.pop(mint, None)
+                            priority = set(_warm_priority_mints.keys())
+                            target_mints = set(list(priority)[:WARM_POOL_SIZE])
+                            room_left = max(0, WARM_POOL_SIZE - len(target_mints))
+                            if room_left:
+                                target_mints |= set(list(trending_targets)[:room_left])
                             # Subscribe new mints
                             for mint in target_mints - _warm_subscribed_mints:
                                 msg = {
@@ -5057,7 +5131,7 @@ async def warm_raptor_swap_pool(kp: Optional[Keypair]):
                                 _warm_swap_cache.pop(mint, None)
                         except Exception as e:
                             log(f"warm pool refresher err: {type(e).__name__}: {e}")
-                        await asyncio.sleep(30)
+                        await asyncio.sleep(WARM_POOL_REFRESH_SEC)
 
                 async def pinger():
                     while True:
@@ -5123,6 +5197,7 @@ def _consume_warm_swap_tx(mint: str) -> Optional[tuple[str, int]]:
 # Per IDL, mint is at instruction.accounts[2].
 _PUMP_PROGRAM_STR = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 _DISC_BUY_BYTES = bytes([102, 6, 61, 18, 1, 218, 235, 234])
+_DISC_SELL_BYTES = bytes([51, 230, 133, 164, 1, 127, 131, 173])
 _BONK_PROGRAM_STR = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
 
 # V41.17z: BondingCurve account discriminator (per pump.fun IDL).
@@ -5183,6 +5258,40 @@ def _bc_cache_price_for_mint(mint: str, max_age_ms: int) -> Optional[tuple[float
         if age_ms > max_age_ms or not vtoken:
             return None
         return (float(vsol) / float(vtoken), complete, age_ms)
+    except Exception:
+        return None
+
+
+def _bc_cache_move_for_mint(mint: str, window_ms: int,
+                            max_age_ms: int) -> Optional[tuple[float, int, bool]]:
+    """Return (last/first price multiplier, latest age_ms, complete) for a recent window."""
+    try:
+        bc_pda, _ = Pubkey.find_program_address(
+            [b"bonding-curve", bytes(Pubkey.from_string(mint))],
+            Pubkey.from_string(_PUMP_PROGRAM_STR),
+        )
+        items = list(_bc_state_cache.get(str(bc_pda), ()))
+        if len(items) < 2:
+            return None
+        now_ms = int(time.time() * 1000)
+        latest = items[-1]
+        latest_age = now_ms - int(latest[0])
+        if latest_age > max_age_ms:
+            return None
+        cutoff = now_ms - window_ms
+        recent = [it for it in items if it[0] >= cutoff]
+        if len(recent) < 2:
+            return None
+        first = recent[0]
+        last = recent[-1]
+        if not first[2] or not last[2]:
+            return None
+        first_px = float(first[1]) / float(first[2])
+        last_px = float(last[1]) / float(last[2])
+        if first_px <= 0:
+            return None
+        complete = bool(last[3]) if len(last) > 3 else False
+        return last_px / first_px, latest_age, complete
     except Exception:
         return None
 
@@ -5414,6 +5523,81 @@ def _parse_base64_shred_for_pump_buy(shred_result: dict, trader_set: set) -> Opt
                 "launchpad": "bonk" if prog == _BONK_PROGRAM_STR else "pump",
             }
         return None
+    except Exception:
+        return None
+
+
+def _parse_base64_shred_for_pump_trades_any(shred_result: dict) -> list[dict]:
+    """Parse direct pump.fun/bonk buy/sell instructions from a base64 shred.
+
+    This is intentionally signer-agnostic. V41.19 uses it as a market-wide tape:
+    watched wallets are a boost, but the trigger is clustered buy pressure on the
+    mint itself.
+    """
+    trades: list[dict] = []
+    try:
+        tx_outer = (shred_result.get("transaction") or {}).get("transaction")
+        if not (isinstance(tx_outer, list) and len(tx_outer) >= 1):
+            return trades
+        raw = base64.b64decode(tx_outer[0])
+        vt = VersionedTransaction.from_bytes(raw)
+        msg = vt.message
+        keys = list(msg.account_keys)
+        if not keys:
+            return trades
+        signer = str(keys[0])
+        for ix in msg.instructions:
+            try:
+                prog = str(keys[ix.program_id_index])
+            except Exception:
+                continue
+            if prog not in (_PUMP_PROGRAM_STR, _BONK_PROGRAM_STR):
+                continue
+            data = bytes(ix.data)
+            if len(data) < 24:
+                continue
+            disc = data[:8]
+            if disc == _DISC_BUY_BYTES:
+                is_buy = True
+            elif disc == _DISC_SELL_BYTES:
+                is_buy = False
+            else:
+                continue
+            amount = int.from_bytes(data[8:16], "little")
+            sol_lamports = int.from_bytes(data[16:24], "little")
+            if amount <= 0 or sol_lamports <= 0:
+                continue
+            try:
+                mint_idx = ix.accounts[2]
+            except (IndexError, TypeError):
+                continue
+            if mint_idx >= len(keys):
+                continue
+            mint = str(keys[mint_idx])
+            trades.append({
+                "signer": signer,
+                "mint": mint,
+                "is_buy": is_buy,
+                "amount": amount,
+                "sol_lamports": sol_lamports,
+                "trader_price": sol_lamports / amount,
+                "program": prog,
+            })
+    except Exception:
+        return trades
+    return trades
+
+
+def _base64_shred_fee_payer(shred_result: dict) -> Optional[str]:
+    """Return account[0] from a base64 shred, or None if it cannot be decoded."""
+    try:
+        tx_outer = (shred_result.get("transaction") or {}).get("transaction")
+        if not (isinstance(tx_outer, list) and len(tx_outer) >= 1):
+            return None
+        raw = base64.b64decode(tx_outer[0])
+        vt = VersionedTransaction.from_bytes(raw)
+        keys = list(vt.message.account_keys)
+        return str(keys[0]) if keys else None
     except Exception:
         return None
 
@@ -5686,6 +5870,158 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                                         signer=signer, trader_price=trader_price))
 
 
+def _market_tape_rate_limited(now_ms: int) -> bool:
+    cutoff = now_ms - 60_000
+    while _market_tape_entry_times and _market_tape_entry_times[0] < cutoff:
+        _market_tape_entry_times.popleft()
+    return len(_market_tape_entry_times) >= MARKET_TAPE_MAX_ENTRIES_PER_MIN
+
+
+def _market_tape_cleanup(now_ms: int) -> None:
+    stale = now_ms - int(max(MARKET_TAPE_COOLDOWN_SEC * 1000, 60_000))
+    for mint, ts in list(_market_tape_entered_recent.items()):
+        if ts < stale:
+            _market_tape_entered_recent.pop(mint, None)
+
+
+async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], mint: str,
+                                      signal_time_ms: int, reason: str) -> None:
+    try:
+        blocked, why = _entry_circuit_breakers_open()
+        if blocked:
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            graduated_seen.discard(mint)
+            log(f"  MARKET-TAPE HALT {mint[:8]}: {why}")
+            return
+        if mint in positions:
+            graduated_seen.discard(mint)
+            return
+        log(f"  MARKET-TAPE ENTRY {mint[:8]}: {reason}, buying {MARKET_TAPE_AMOUNT_SOL:.4f} SOL")
+        pos = None
+        if (not PAPER_TRADING and kp
+                and abs(WARM_SWAP_AMOUNT_SOL - MARKET_TAPE_AMOUNT_SOL) < 1e-9):
+            warm = _consume_warm_swap_tx(mint)
+            if warm:
+                tx_b64, _lvbh = warm
+                log(f"  MARKET-TAPE WARM HIT {mint[:8]}: pre-built tx, shipping")
+                sig_out = await asyncio.to_thread(execute_swap, kp, client, tx_b64, False)
+                if sig_out:
+                    entry_lamports = int(MARKET_TAPE_AMOUNT_SOL * 10**WSOL_DECIMALS)
+                    bookkeep = await asyncio.to_thread(jupiter_quote, SOL_MINT, mint, entry_lamports)
+                    out_amt = float(bookkeep.get("outAmount", 0)) if bookkeep else 0.0
+                    if out_amt > 0:
+                        pos = Position(
+                            mint=mint,
+                            entry_price=entry_lamports / out_amt,
+                            entry_amount_sol=MARKET_TAPE_AMOUNT_SOL,
+                            token_amount=out_amt,
+                            open_time=time.time(),
+                            bc_pda=derive_bc_pda(Pubkey.from_string(mint)),
+                        )
+        if pos is None:
+            pos = await asyncio.to_thread(buy_token, kp, client, mint, MARKET_TAPE_AMOUNT_SOL)
+        if not pos:
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            graduated_seen.discard(mint)
+            log(f"  MARKET-TAPE BUY FAILED {mint[:8]}")
+            return
+        pos.strategy = "graduation"
+        pos.late_scalp = True
+        pos.entry_progress = 1.0
+        pos.entry_size_sol = MARKET_TAPE_AMOUNT_SOL
+        pos.quality_score = 7
+        pos.launchpad = "market_tape"
+        pos.signal_time_ms = signal_time_ms
+        _store_open_position(pos)
+        _record_entry_opened()
+        _copy_trade_stats["market_tape_entered"] = _copy_trade_stats.get("market_tape_entered", 0) + 1
+        asyncio.create_task(manage_graduation_position(client, kp, pos))
+    except Exception as e:
+        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        graduated_seen.discard(mint)
+        log(f"  MARKET-TAPE ENTRY ERR {mint[:8]}: {type(e).__name__}: {e}")
+
+
+async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: str,
+                                    trade: dict, trader_set: set) -> None:
+    if not MARKET_TAPE_ENABLED:
+        return
+    mint = trade.get("mint") or ""
+    mint_lc = mint.lower()
+    if not mint or not mint_lc.endswith("pump"):
+        return
+    now_ms = int(time.time() * 1000)
+    signer = trade.get("signer") or ""
+    event = {
+        "ts": now_ms,
+        "signer": signer,
+        "is_buy": bool(trade.get("is_buy")),
+        "sol": float(trade.get("sol_lamports") or 0) / 1e9,
+        "tracked": signer in trader_set,
+        "sig": sig,
+    }
+    tape = _market_tape_per_mint[mint]
+    tape.append(event)
+    cutoff_10s = now_ms - 10_000
+    while tape and tape[0]["ts"] < cutoff_10s:
+        tape.popleft()
+    _copy_trade_stats["market_tape_seen"] = _copy_trade_stats.get("market_tape_seen", 0) + 1
+
+    if not event["is_buy"]:
+        return
+    # Do not block on graduated_seen here. The copy lane claims mints before it
+    # awaits slow checks; market_tape must still be allowed to fire if clustered
+    # flow proves up before the copy confirm gate does.
+    if mint in positions or mint in _positions_closing:
+        return
+    _market_tape_cleanup(now_ms)
+    if now_ms - _market_tape_entered_recent.get(mint, 0) < MARKET_TAPE_COOLDOWN_SEC * 1000:
+        return
+    if _market_tape_rate_limited(now_ms):
+        return
+
+    cutoff = now_ms - MARKET_TAPE_WINDOW_MS
+    recent = [e for e in tape if e["ts"] >= cutoff]
+    buys = [e for e in recent if e["is_buy"]]
+    sells = [e for e in recent if not e["is_buy"]]
+    unique_buyers = {e["signer"] for e in buys if e["signer"]}
+    tracked_buyers = {e["signer"] for e in buys if e.get("tracked")}
+    if event["tracked"] or len(unique_buyers) >= 2:
+        _mark_warm_priority_mint(mint)
+    buy_sol = sum(e["sol"] for e in buys)
+    sell_sol = sum(e["sol"] for e in sells)
+    if len(unique_buyers) < MARKET_TAPE_MIN_UNIQUE:
+        return
+    if len(tracked_buyers) < MARKET_TAPE_MIN_TRACKED:
+        return
+    if buy_sol < MARKET_TAPE_MIN_BUY_SOL or sell_sol > MARKET_TAPE_MAX_SELL_SOL:
+        return
+    bc_move = _bc_cache_move_for_mint(
+        mint,
+        max(MARKET_TAPE_WINDOW_MS + 800, 1500),
+        MARKET_TAPE_BC_CACHE_MAX_AGE_MS,
+    )
+    if not bc_move:
+        return
+    move_mult, age_ms, complete = bc_move
+    if complete:
+        return
+    if move_mult < MARKET_TAPE_MIN_BC_MOVE or move_mult > MARKET_TAPE_MAX_BC_MOVE:
+        return
+
+    graduated_seen.add(mint)
+    if len(graduated_seen) > 500:
+        graduated_seen.clear()
+        graduated_seen.add(mint)
+    _market_tape_entered_recent[mint] = now_ms
+    _market_tape_entry_times.append(now_ms)
+    _copy_trade_stats["market_tape_triggers"] = _copy_trade_stats.get("market_tape_triggers", 0) + 1
+    reason = (f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
+              f"buy={buy_sol:.3f} sell={sell_sol:.3f} bc={move_mult:.3f}x age={age_ms}ms")
+    log(f"  *** MARKET-TAPE TRIGGER *** {mint[:8]}: {reason}")
+    asyncio.create_task(_enter_market_tape_position(client, kp, mint, now_ms, reason))
+
+
 async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str,
                                  trader_set: set, shred_result: Optional[dict] = None):
     """V41.17i: dual-path dispatch. Fast path parses the pump.fun buy ix directly
@@ -5721,6 +6057,13 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
                 client, kp, sig, fast["signer"], fast["mint"], fast["trader_price"], "shred",
             )
             return
+        if MARKET_TAPE_ENABLED and MARKET_TAPE_ALL_PUMP:
+            signer = _base64_shred_fee_payer(shred_result)
+            if signer not in trader_set:
+                # With market-wide pump.fun scope, most shreds are intentionally
+                # not ours. Never let those fall through to getTransaction.
+                _copy_trade_stats["wrong_signer"] += 1
+                return
     # SLOW PATH: fall back to getTransaction (handles aggregator buys, Helius fallback)
     # V41.17q: wrap in asyncio.to_thread — solana-py's get_transaction is SYNC and was
     # blocking the event loop inside this coroutine. Under load (multiple concurrent
@@ -6089,13 +6432,19 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                         # V41.17z: MULTIPLEX both subscriptions on the SAME WS conn
                         # to stay under ST RPC's 2-conn cap. shredSubscribe = trader
                         # buys; programSubscribe = bonding-curve cache for trend gate.
+                        shred_filter = {
+                            "accountRequired": [_PUMP_PROGRAM_STR],
+                            "vote": False,
+                        }
+                        if MARKET_TAPE_ENABLED and MARKET_TAPE_ALL_PUMP:
+                            shred_filter["accountInclude"] = [_PUMP_PROGRAM_STR]
+                        else:
+                            shred_filter["accountInclude"] = top_traders
                         shred_sub = {
                             "jsonrpc": "2.0", "id": 9000,
                             "method": "shredSubscribe",
                             "params": [
-                                {"accountInclude": top_traders,
-                                 "accountRequired": [_PUMP_PROGRAM_STR],
-                                 "vote": False},
+                                shred_filter,
                                 {"encoding": "base64", "transactionDetails": "full",
                                  "maxSupportedTransactionVersion": 0},
                             ],
@@ -6111,7 +6460,9 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                         }
                         await ws.send(json.dumps(shred_sub))
                         await ws.send(json.dumps(bc_sub))
-                        log(f"COPY-TRADE: subscribed via ST shredSubscribe for {len(top_traders)} wallets — V41.17y Yellowstone-equivalent + V41.17z trend cache (multiplexed on 1 WS)")
+                        scope = "ALL pump.fun direct txs" if (MARKET_TAPE_ENABLED and MARKET_TAPE_ALL_PUMP) else f"{len(top_traders)} wallets"
+                        log(f"COPY-TRADE: subscribed via ST shredSubscribe for {scope} — "
+                            f"V41.19 market tape + V41.17z trend cache (multiplexed on 1 WS)")
                         async for raw in ws:
                             data = json.loads(raw)
                             method = data.get("method", "")
@@ -6125,6 +6476,9 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                                 if time.time() - last_refresh > COPY_TRADE_REFRESH_HOURS * 3600:
                                     log("COPY-TRADE: leaderboard refresh due — reconnecting")
                                     break
+                                if MARKET_TAPE_ENABLED:
+                                    for tr in _parse_base64_shred_for_pump_trades_any(res):
+                                        asyncio.create_task(_handle_market_tape_trade(client, kp, sig, tr, trader_set))
                                 asyncio.create_task(_handle_copy_trader_tx(client, kp, sig, trader_set, res))
                             elif "program" in method.lower():
                                 # Update bc state cache for trend gate
@@ -6197,7 +6551,7 @@ async def wallet_balance_monitor(client: Client, kp: Optional[Keypair]):
 
 def _resume_recovered_position_managers(client: Client, kp: Optional[Keypair]) -> None:
     grad_launchpads = {
-        "copy_fast", "copy_fast_swarm", "pump", "bonk", "bonk_pregrad",
+        "copy_fast", "copy_fast_swarm", "market_tape", "pump", "bonk", "bonk_pregrad",
         "grad_imminent", "momentum", "st_pump",
     }
     for pos in list(positions.values()):
@@ -6289,6 +6643,15 @@ async def main():
         f"SWARM-{COPY_FAST_CONFIRM_MIN_SWARM} or continued SWARM-3.")
     log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
         f"{COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s confirm window.")
+    log(f"=== V41.19 MARKET-WIDE TAPE SCALPER ===")
+    log(f"  {'ENABLED' if MARKET_TAPE_ENABLED else 'DISABLED'}: parse "
+        f"{'ALL pump.fun shreds' if MARKET_TAPE_ALL_PUMP else 'tracked-wallet shreds'} into sub-second per-mint buy/sell tape.")
+    log(f"  Entry: {MARKET_TAPE_AMOUNT_SOL:.4f} SOL when {MARKET_TAPE_MIN_UNIQUE}+ unique buyers, "
+        f"{MARKET_TAPE_MIN_TRACKED}+ active sniper, buy>={MARKET_TAPE_MIN_BUY_SOL:.3f} SOL, "
+        f"sell<={MARKET_TAPE_MAX_SELL_SOL:.3f} SOL in {MARKET_TAPE_WINDOW_MS}ms.")
+    log(f"  Curve gate: bc-cache move {MARKET_TAPE_MIN_BC_MOVE:.3f}x-{MARKET_TAPE_MAX_BC_MOVE:.3f}x, "
+        f"cache <= {MARKET_TAPE_BC_CACHE_MAX_AGE_MS}ms. TP={MARKET_TAPE_TP_MULT:.3f}x, "
+        f"fast-kill {MARKET_TAPE_FAST_KILL_SEC:.1f}s if peak<{MARKET_TAPE_FAST_KILL_PEAK:.3f}x.")
     log(f"=== V41.17zc/V41.18 DEAD-PEAK + CONFIRM-GATED SWARM ===")
     log(f"  Reverted fixed 3s sustain-wait; V41.18 uses price-confirm polling instead.")
     log(f"  SWARM-3+ rug overrides are candidates only until the confirm gate passes.")
@@ -6306,9 +6669,12 @@ async def main():
     log(f"  Pool sample: {ACTIVE_SNIPER_GRAD_SAMPLE} mints x top {ACTIVE_SNIPER_TOP_N_PER_GRAD} traders, hits>={ACTIVE_SNIPER_MIN_GRAD_HITS}")
     log(f"  Sources: /tokens/multi/all (graduated+graduating+latest) + /tokens/trending/5m")
     log(f"  Swarm detection: log SWARM-N when N>=2 pool wallets buy same mint within 10s")
-    log(f"=== V41.17z5 INSTANT GRADUATION ENTRY ===")
-    log(f"  pump/bonk grads: enter immediately after Jupiter indexing (no 5s observe)")
-    log(f"  Captures more upside on fast-pumping grads; dead-peak guard handles duds")
+    log(f"=== V41.17z5/V41.19 GRADUATION ENTRY ===")
+    if PUMP_GRADUATION_ENABLED:
+        log(f"  pump/bonk grads: enter immediately after Jupiter indexing (no 5s observe)")
+        log(f"  Captures more upside on fast-pumping grads; dead-peak guard handles duds")
+    else:
+        log(f"  pump/bonk PumpPortal graduation lane disabled after fresh -0.0056 SOL blind-grad loss.")
     log(f"=== V41.17z4 GRADUATION LANE OPENED ===")
     log(f"  Default grad branch: enter on -5% to +50% (was 40-50% in 5s)")
     log(f"  Dead-peak guard now covers: copy_fast + pump + bonk + grad_imminent + momentum + st_pump")
@@ -6346,7 +6712,10 @@ async def main():
     log(f"  Fix #11: bidirectional slippage gate (abort if ratio > {COPY_FAST_MAX_PRICE_RATIO:.2f} or < {COPY_FAST_MIN_PRICE_RATIO:.2f})")
     log(f"=========================================")
     asyncio.create_task(session_reporter())
-    asyncio.create_task(pumpportal_migration_listener(client, kp))
+    if PUMP_GRADUATION_ENABLED:
+        asyncio.create_task(pumpportal_migration_listener(client, kp))
+    else:
+        log("PumpPortal graduation entries: DISABLED by default; V41.19 market_tape is primary speed lane")
     asyncio.create_task(solanatracker_poll_latest(client, kp))
     # V41.17 Fix #1: pre-cache risk for hot-path lookup
     asyncio.create_task(refresh_risk_cache())
