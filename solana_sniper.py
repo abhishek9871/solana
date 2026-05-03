@@ -1063,10 +1063,15 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
     """
     global session_pnl_sol
     try:
-        blocked, reason = _entry_circuit_breakers_open()
-        if blocked:
-            log(f"  GRAD HALT {mint[:8]}: {reason}")
-            return
+        # V41.17za: copy_fast_swarm bypasses circuit breakers. These entries are
+        # explicit overrides: capped 0.025 SOL, 30s hard timeout, dead-peak guard.
+        # Streak-pause and consec_loss caps don't apply — we're knowingly riding
+        # bundle pumps with bounded loss per trade.
+        if launchpad != "copy_fast_swarm":
+            blocked, reason = _entry_circuit_breakers_open()
+            if blocked:
+                log(f"  GRAD HALT {mint[:8]}: {reason}")
+                return
         # V41.14: ST/copy_fast/grad_imminent/momentum entries have NO concurrent cap —
         # quality is pre-verified, position size intentional, paper-mode bankroll unlimited.
         # Was silently dropping copy_fast entries when 5 grad-imminent slots were open.
@@ -5745,6 +5750,8 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17za bypass circuit breakers for swarm-override ===")
+    log(f"  copy_fast_swarm entries skip streak-pause and consec_loss halts.")
     log(f"=== V41.17z9 SWARM-OVERRIDE-RUG ===")
     log(f"  When SWARM-3+ forms within 30s on a rug-blocked mint, OVERRIDE the rug check")
     log(f"  Capped: 0.025 SOL position (half), 30s hard timeout, dead-peak guard active")
