@@ -343,6 +343,7 @@ daily_pnl_sol = 0.0
 daily_loss_reset_ts = time.time()
 daily_loss_halt_reason = ""
 _positions_closing: set[str] = set()
+_entry_inflight_mints: set[str] = set()
 _swarm_compound_locks: dict[str, asyncio.Lock] = {}
 _recently_closed_mints: dict[str, float] = {}
 # V41.5: trade-counting and pause state
@@ -558,6 +559,7 @@ def _reconcile_recovered_positions(client: Client, kp: Optional[Keypair]) -> Non
 
 def _store_open_position(pos: Position) -> None:
     positions[pos.mint] = pos
+    _entry_inflight_mints.discard(pos.mint)
     _positions_closing.discard(pos.mint)
     _persist_positions()
 
@@ -574,6 +576,7 @@ def _remove_open_position(pos: Position) -> None:
             if ts < cutoff:
                 _recently_closed_mints.pop(mint, None)
     _positions_closing.discard(pos.mint)
+    _entry_inflight_mints.discard(pos.mint)
     _swarm_compound_locks.pop(pos.mint, None)
     _persist_positions()
 
@@ -608,6 +611,20 @@ def _mint_recently_closed(mint: str, now: Optional[float] = None) -> bool:
     now = time.time() if now is None else now
     ts = _recently_closed_mints.get(mint, 0.0)
     return bool(ts and now - ts < RECENT_CLOSE_REENTRY_COOLDOWN_SEC)
+
+
+def _claim_entry_mint(mint: str, source: str) -> bool:
+    if not mint:
+        return False
+    if mint in positions or mint in _positions_closing or mint in _entry_inflight_mints:
+        log(f"  ENTRY SKIP {mint[:8]} ({source}): position/in-flight dedup")
+        return False
+    _entry_inflight_mints.add(mint)
+    return True
+
+
+def _release_entry_mint(mint: str) -> None:
+    _entry_inflight_mints.discard(mint)
 
 
 def _get_swarm_compound_lock(mint: str) -> asyncio.Lock:
@@ -1334,6 +1351,7 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
     consults the warm /stream/swap pool (Fix #2) for ~10-30ms entries vs 300-500ms.
     """
     global session_pnl_sol
+    claimed_entry = False
     try:
         # V41.17za: copy_fast_swarm bypasses circuit breakers. These entries are
         # explicit overrides: capped 0.025 SOL, 30s hard timeout, dead-peak guard.
@@ -1428,6 +1446,9 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             # V41.17z9: SWARM-OVERRIDE entries use HALF size (0.025 vs 0.05) for
             # risk management since they bypass the rug check.
             entry_amount = GRAD_AMOUNT_SOL * 0.5 if launchpad == "copy_fast_swarm" else GRAD_AMOUNT_SOL
+            if not _claim_entry_mint(mint, launchpad):
+                return
+            claimed_entry = True
 
             # V41.17 Fix #2: warm pool fast-path. If pre-built tx is fresh, ship it.
             # CRITICAL: the warm path submits the tx itself (no second swap via buy_token).
@@ -1469,6 +1490,7 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 pos = buy_token(kp, client, mint, entry_amount)
                 if not pos:
                     log(f"  GRAD BUY FAILED {mint[:8]}")
+                    _release_entry_mint(mint)
                     return
             pos.strategy = "graduation"
             pos.late_scalp = True
@@ -1562,10 +1584,14 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             # V41.17z5: default graduation lane — enter on the spot, no observation.
             log(f"  GRAD INSTANT-ENTRY {mint[:8]} ({launchpad}): no observation, dead-peak guard owns downside")
 
+        if not _claim_entry_mint(mint, launchpad):
+            return
+        claimed_entry = True
         log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): buying {GRAD_AMOUNT_SOL} SOL")
         pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
         if not pos:
             log(f"  GRAD BUY FAILED {mint[:8]}")
+            _release_entry_mint(mint)
             return
         # Mark this as a graduation snipe — uses GRAD ladder, GRAD timeout
         pos.strategy = "graduation"
@@ -1580,6 +1606,8 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
         _record_entry_opened()
         asyncio.create_task(manage_graduation_position(client, kp, pos))
     except Exception as e:
+        if claimed_entry:
+            _release_entry_mint(mint)
         log(f"  graduation_snipe err for {mint[:8]}: {e}")
 
 
@@ -5929,6 +5957,7 @@ def _market_tape_cleanup(now_ms: int) -> None:
 
 async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], mint: str,
                                       signal_time_ms: int, reason: str) -> None:
+    claimed_entry = False
     try:
         blocked, why = _entry_circuit_breakers_open()
         if blocked:
@@ -5939,6 +5968,11 @@ async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], min
         if mint in positions:
             graduated_seen.discard(mint)
             return
+        if not _claim_entry_mint(mint, "market_tape"):
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            graduated_seen.discard(mint)
+            return
+        claimed_entry = True
         log(f"  MARKET-TAPE ENTRY {mint[:8]}: {reason}, buying {MARKET_TAPE_AMOUNT_SOL:.4f} SOL")
         pos = None
         if (not PAPER_TRADING and kp
@@ -5966,6 +6000,7 @@ async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], min
         if not pos:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
             graduated_seen.discard(mint)
+            _release_entry_mint(mint)
             log(f"  MARKET-TAPE BUY FAILED {mint[:8]}")
             return
         pos.strategy = "graduation"
@@ -5980,6 +6015,8 @@ async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], min
         _copy_trade_stats["market_tape_entered"] = _copy_trade_stats.get("market_tape_entered", 0) + 1
         asyncio.create_task(manage_graduation_position(client, kp, pos))
     except Exception as e:
+        if claimed_entry:
+            _release_entry_mint(mint)
         _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
         graduated_seen.discard(mint)
         log(f"  MARKET-TAPE ENTRY ERR {mint[:8]}: {type(e).__name__}: {e}")
