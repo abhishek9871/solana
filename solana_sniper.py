@@ -1346,6 +1346,13 @@ MARKET_TAPE_SCOUT_TP_MULT = float(os.environ.get("MARKET_TAPE_SCOUT_TP_MULT", "1
 MARKET_TAPE_SCOUT_FAST_KILL_SEC = float(os.environ.get("MARKET_TAPE_SCOUT_FAST_KILL_SEC", "2.0"))
 MARKET_TAPE_SCOUT_FAST_KILL_PEAK = float(os.environ.get("MARKET_TAPE_SCOUT_FAST_KILL_PEAK", "1.012"))
 MARKET_TAPE_SCOUT_TIMEOUT_SEC = float(os.environ.get("MARKET_TAPE_SCOUT_TIMEOUT_SEC", "8.0"))
+SWARM_SCOUT_ENABLED = os.environ.get("SWARM_SCOUT_ENABLED", "1") == "1"
+SWARM_SCOUT_MIN_SIGNERS = int(os.environ.get("SWARM_SCOUT_MIN_SIGNERS", "3"))
+SWARM_SCOUT_AMOUNT_SOL = float(os.environ.get("SWARM_SCOUT_AMOUNT_SOL", str(MARKET_TAPE_SCOUT_AMOUNT_SOL)))
+SWARM_SCOUT_MIN_BC_MOVE = float(os.environ.get("SWARM_SCOUT_MIN_BC_MOVE", "1.015"))
+SWARM_SCOUT_MAX_BC_MOVE = float(os.environ.get("SWARM_SCOUT_MAX_BC_MOVE", "1.120"))
+SWARM_SCOUT_CONFIRM_DELAY_SEC = float(os.environ.get("SWARM_SCOUT_CONFIRM_DELAY_SEC", "0.35"))
+SWARM_SCOUT_CONFIRM_MIN_MULT = float(os.environ.get("SWARM_SCOUT_CONFIRM_MIN_MULT", "1.003"))
 PUMP_GRADUATION_ENABLED = os.environ.get("PUMP_GRADUATION_ENABLED", "0") == "1"
 # V41.12c: ST clean mid-curve tokens grow over minutes/hours, not seconds. Extended timeout.
 GRAD_TIMEOUT_ST_SEC = int(os.environ.get("GRAD_TIMEOUT_ST_SEC", "1800")) # 30 min hold for ST clean mints
@@ -3297,6 +3304,13 @@ async def session_reporter():
                 f"mid={s.get('mt_weak_mid', 0)} no_px={s.get('mt_no_price', 0)} "
                 f"ratio={s.get('mt_ratio', 0)} close={s.get('mt_recent_close', 0)} "
                 f"confirm={s.get('mt_confirm', 0)} trig={s.get('market_tape_triggers', 0)} ===")
+            log(f"=== SWARM-SCOUT: cand={s.get('swarm_scout_candidates', 0)} "
+                f"trig={s.get('swarm_scout_triggers', 0)} "
+                f"no_px={s.get('swarm_scout_no_price', 0)} "
+                f"rng={s.get('swarm_scout_range', 0)} "
+                f"ratio={s.get('swarm_scout_ratio', 0)} "
+                f"confirm={s.get('swarm_scout_confirm', 0)} "
+                f"busy={s.get('swarm_scout_busy', 0)} ===")
 
 
 # === MAIN ===
@@ -4864,6 +4878,7 @@ _rug_blocked_recent: dict[str, int] = {}
 # re-enter the same one repeatedly.
 _swarm_override_entered: set = set()
 _copy_fast_solo_rocket_mints: set = set()
+_swarm_scout_pending: set = set()
 
 # V41.17zb: track mints with a pending swarm-sustain check (3s wait).
 # Prevents re-scheduling the same delayed-entry coroutine for a mint.
@@ -5951,6 +5966,98 @@ async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
         await rollback_reservation()
 
 
+async def _swarm_scout_position(client: Client, kp: Optional[Keypair], mint: str,
+                                swarm_size: int, signer: str,
+                                trader_price: float) -> None:
+    """Small confirm-gated entry for tracked-wallet swarms that the 1.2s
+    market-tape window can miss. This keeps the old full-size swarm lane off."""
+    try:
+        _copy_trade_stats["swarm_scout_candidates"] = (
+            _copy_trade_stats.get("swarm_scout_candidates", 0) + 1
+        )
+        now_ms = int(time.time() * 1000)
+        if (mint in positions or mint in _positions_closing
+                or _mint_recently_closed(mint, now_ms / 1000.0)
+                or now_ms - _market_tape_entered_recent.get(mint, 0) < MARKET_TAPE_COOLDOWN_SEC * 1000
+                or _market_tape_rate_limited(now_ms)):
+            _copy_trade_stats["swarm_scout_busy"] = _copy_trade_stats.get("swarm_scout_busy", 0) + 1
+            return
+        if trader_price <= 0:
+            _copy_trade_stats["swarm_scout_no_price"] = _copy_trade_stats.get("swarm_scout_no_price", 0) + 1
+            return
+        bc_move = _bc_cache_move_for_mint(
+            mint,
+            max(int(COPY_FAST_CONFIRM_SWARM_WINDOW_SEC * 1000), 1500),
+            MARKET_TAPE_BC_CACHE_MAX_AGE_MS,
+        )
+        latest_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+        if not bc_move or not latest_price:
+            _copy_trade_stats["swarm_scout_no_price"] = _copy_trade_stats.get("swarm_scout_no_price", 0) + 1
+            return
+        move_mult, age_ms, complete = bc_move
+        if complete or move_mult < SWARM_SCOUT_MIN_BC_MOVE or move_mult > SWARM_SCOUT_MAX_BC_MOVE:
+            _copy_trade_stats["swarm_scout_range"] = _copy_trade_stats.get("swarm_scout_range", 0) + 1
+            return
+        price_ratio = latest_price[0] / trader_price
+        if price_ratio < MARKET_TAPE_MIN_PRICE_RATIO or price_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
+            _market_tape_ratio_violation_until[mint] = now_ms + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+            _copy_trade_stats["swarm_scout_ratio"] = _copy_trade_stats.get("swarm_scout_ratio", 0) + 1
+            log(f"  SWARM-SCOUT BLOCK {mint[:8]}: price_ratio={price_ratio:.3f}x "
+                f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x "
+                f"swarm={swarm_size} bc={move_mult:.3f}x")
+            return
+        trigger_price = latest_price[0]
+        if SWARM_SCOUT_CONFIRM_DELAY_SEC > 0:
+            await asyncio.sleep(SWARM_SCOUT_CONFIRM_DELAY_SEC)
+        confirm_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+        if not confirm_price or confirm_price[1]:
+            _copy_trade_stats["swarm_scout_confirm"] = _copy_trade_stats.get("swarm_scout_confirm", 0) + 1
+            return
+        confirm_mult = confirm_price[0] / trigger_price if trigger_price > 0 else 0.0
+        if confirm_mult < SWARM_SCOUT_CONFIRM_MIN_MULT:
+            _copy_trade_stats["swarm_scout_confirm"] = _copy_trade_stats.get("swarm_scout_confirm", 0) + 1
+            log(f"  SWARM-SCOUT BLOCK {mint[:8]}: confirm_mult={confirm_mult:.3f}x "
+                f"< {SWARM_SCOUT_CONFIRM_MIN_MULT:.3f}x after {SWARM_SCOUT_CONFIRM_DELAY_SEC:.2f}s")
+            return
+        confirm_ratio = confirm_price[0] / trader_price
+        if confirm_ratio < MARKET_TAPE_MIN_PRICE_RATIO or confirm_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
+            _market_tape_ratio_violation_until[mint] = int(time.time() * 1000) + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+            _copy_trade_stats["swarm_scout_ratio"] = _copy_trade_stats.get("swarm_scout_ratio", 0) + 1
+            log(f"  SWARM-SCOUT BLOCK {mint[:8]}: confirm price_ratio={confirm_ratio:.3f}x "
+                f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
+            return
+        post_ms = int(time.time() * 1000)
+        if (mint in positions or mint in _positions_closing
+                or _market_tape_rate_limited(post_ms)
+                or post_ms - _market_tape_entered_recent.get(mint, 0) < MARKET_TAPE_COOLDOWN_SEC * 1000):
+            _copy_trade_stats["swarm_scout_busy"] = _copy_trade_stats.get("swarm_scout_busy", 0) + 1
+            return
+
+        graduated_seen.add(mint)
+        if len(graduated_seen) > 500:
+            graduated_seen.clear()
+            graduated_seen.add(mint)
+        _swarm_override_entered.add(mint)
+        _market_tape_entered_recent[mint] = post_ms
+        _market_tape_entry_times.append(post_ms)
+        _copy_trade_stats["swarm_scout_triggers"] = _copy_trade_stats.get("swarm_scout_triggers", 0) + 1
+        _copy_trade_stats["market_tape_triggers"] = _copy_trade_stats.get("market_tape_triggers", 0) + 1
+        reason = (f"swarm={swarm_size} signer={signer[:8]} bc={move_mult:.3f}x "
+                  f"ratio={price_ratio:.3f}x confirm={confirm_mult:.3f}x age={age_ms}ms")
+        log(f"  *** SWARM-SCOUT TRIGGER *** {mint[:8]}: {reason}")
+        asyncio.create_task(_enter_market_tape_position(
+            client, kp, mint, post_ms, reason,
+            amount_sol=SWARM_SCOUT_AMOUNT_SOL,
+            launchpad="market_tape_scout",
+            quality_score=5,
+        ))
+    except Exception as e:
+        _copy_trade_stats["swarm_scout_busy"] = _copy_trade_stats.get("swarm_scout_busy", 0) + 1
+        log(f"  SWARM-SCOUT ERR {mint[:8]}: {type(e).__name__}: {e}")
+    finally:
+        _swarm_scout_pending.discard(mint)
+
+
 async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                                 signer: str, mint: str, trader_price: float, source: str):
     """V41.17i: shared gate cascade for both fast (shred) and slow (getTransaction) paths.
@@ -5999,13 +6106,22 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                     and mint in _rug_blocked_recent
                     and (now_ms - _rug_blocked_recent[mint]) < 30_000
                     and mint not in _swarm_override_entered):
-                _swarm_override_entered.add(mint)
-                _copy_trade_stats["swarm_override"] = _copy_trade_stats.get("swarm_override", 0) + 1
-                log(f"  *** SWARM-OVERRIDE-CANDIDATE *** {mint[:8]}: {len(recent_signers)} wallets agree, "
-                    f"rug-block override candidate; waiting for bc-cache follow-through")
-                asyncio.create_task(graduation_snipe(
-                    client, kp, mint, launchpad="copy_fast_swarm",
-                    signer=signer, trader_price=trader_price))
+                if COPY_FAST_SWARM_ENTRY_ENABLED:
+                    _swarm_override_entered.add(mint)
+                    _copy_trade_stats["swarm_override"] = _copy_trade_stats.get("swarm_override", 0) + 1
+                    log(f"  *** SWARM-OVERRIDE-CANDIDATE *** {mint[:8]}: {len(recent_signers)} wallets agree, "
+                        f"rug-block override candidate; waiting for bc-cache follow-through")
+                    asyncio.create_task(graduation_snipe(
+                        client, kp, mint, launchpad="copy_fast_swarm",
+                        signer=signer, trader_price=trader_price))
+                elif (SWARM_SCOUT_ENABLED
+                        and len(recent_signers) >= SWARM_SCOUT_MIN_SIGNERS
+                        and mint not in _swarm_scout_pending):
+                    _swarm_scout_pending.add(mint)
+                    log(f"  *** SWARM-SCOUT-CANDIDATE *** {mint[:8]}: {len(recent_signers)} wallets agree, "
+                        f"checking bc-cache/ratio/confirm for tiny scout")
+                    asyncio.create_task(_swarm_scout_position(
+                        client, kp, mint, len(recent_signers), signer, trader_price))
         return
     mint_lc = mint.lower()
     if not (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
@@ -7006,6 +7122,11 @@ async def main():
             f"buy>={MARKET_TAPE_SCOUT_MIN_BUY_SOL:.1f} SOL; "
             f"TP={MARKET_TAPE_SCOUT_TP_MULT:.3f}x fast-kill "
             f"{MARKET_TAPE_SCOUT_FAST_KILL_SEC:.1f}s/{MARKET_TAPE_SCOUT_FAST_KILL_PEAK:.3f}x.")
+    if SWARM_SCOUT_ENABLED:
+        log(f"  Swarm scout: {SWARM_SCOUT_AMOUNT_SOL:.4f} SOL on SWARM-{SWARM_SCOUT_MIN_SIGNERS}+ "
+            f"rug-block clusters if bc={SWARM_SCOUT_MIN_BC_MOVE:.3f}-{SWARM_SCOUT_MAX_BC_MOVE:.3f}x, "
+            f"price_ratio sane, and {SWARM_SCOUT_CONFIRM_MIN_MULT:.3f}x continuation after "
+            f"{SWARM_SCOUT_CONFIRM_DELAY_SEC:.2f}s.")
     log(f"  Micro-confirm: wait {MARKET_TAPE_CONFIRM_DELAY_SEC:.2f}s and require "
         f"{MARKET_TAPE_CONFIRM_MIN_MULT:.3f}x continuation before entry.")
     log(f"=== V41.17zc/V41.18 DEAD-PEAK + CONFIRM-GATED SWARM ===")
