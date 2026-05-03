@@ -1295,6 +1295,13 @@ COPY_FAST_CONFIRM_MIN_SWARM = int(os.environ.get("COPY_FAST_CONFIRM_MIN_SWARM", 
 COPY_FAST_CONFIRM_SWARM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM_WINDOW_SEC", "10.0"))
 COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC", "1.0"))
 COPY_FAST_SWARM_ENTRY_ENABLED = os.environ.get("COPY_FAST_SWARM_ENTRY_ENABLED", "0") == "1"
+COPY_FAST_SOLO_ROCKET_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_ENABLED", "1") == "1"
+COPY_FAST_SOLO_ROCKET_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_MULT", "1.35"))
+COPY_FAST_SOLO_ROCKET_AMOUNT_SOL = float(os.environ.get("COPY_FAST_SOLO_ROCKET_AMOUNT_SOL", "0.00625"))
+COPY_FAST_SOLO_ROCKET_TP_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TP_MULT", "1.055"))
+COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC", "2.0"))
+COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK", "1.012"))
+COPY_FAST_SOLO_ROCKET_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TIMEOUT_SEC", "8.0"))
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
 MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
@@ -1468,7 +1475,13 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
 
             # V41.17z9: SWARM-OVERRIDE entries use HALF size (0.025 vs 0.05) for
             # risk management since they bypass the rug check.
-            entry_amount = GRAD_AMOUNT_SOL * 0.5 if launchpad == "copy_fast_swarm" else GRAD_AMOUNT_SOL
+            solo_rocket = launchpad == "copy_fast" and mint in _copy_fast_solo_rocket_mints
+            entry_launchpad = "copy_fast_solo" if solo_rocket else launchpad
+            if solo_rocket:
+                entry_amount = COPY_FAST_SOLO_ROCKET_AMOUNT_SOL
+                _copy_fast_solo_rocket_mints.discard(mint)
+            else:
+                entry_amount = GRAD_AMOUNT_SOL * 0.5 if launchpad == "copy_fast_swarm" else GRAD_AMOUNT_SOL
             if not _claim_entry_mint(mint, launchpad):
                 return
             claimed_entry = True
@@ -1480,11 +1493,11 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             # Warm txs are built at GRAD_AMOUNT_SOL. Do not use them for capped
             # swarm overrides, or live mode can silently break the half-size cap.
             warm = (_consume_warm_swap_tx(mint)
-                    if (launchpad != "copy_fast_swarm" and not PAPER_TRADING and kp)
+                    if (entry_launchpad == "copy_fast" and not PAPER_TRADING and kp)
                     else None)
             if warm:
                 tx_b64, _lvbh = warm
-                log(f"  GRAD WARM HIT {mint[:8]} ({launchpad}): pre-built tx, shipping immediately")
+                log(f"  GRAD WARM HIT {mint[:8]} ({entry_launchpad}): pre-built tx, shipping immediately")
                 # Skip simulation on warm path — Raptor already validated the tx; latency wins
                 sig_out = execute_swap(kp, client, tx_b64, simulate_first=False)
                 if sig_out:
@@ -1509,7 +1522,7 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                     _copy_trade_stats["warm_miss"] += 1
             # Fallback to standard buy_token (does its own quote+swap+send)
             if pos is None:
-                log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): confirmed follow-through, buying {entry_amount} SOL")
+                log(f"  GRAD ENTRY {mint[:8]} ({entry_launchpad}): confirmed follow-through, buying {entry_amount} SOL")
                 pos = buy_token(kp, client, mint, entry_amount)
                 if not pos:
                     log(f"  GRAD BUY FAILED {mint[:8]}")
@@ -1520,7 +1533,7 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             pos.entry_progress = 1.0
             pos.entry_size_sol = entry_amount
             pos.quality_score = 8
-            pos.launchpad = launchpad
+            pos.launchpad = entry_launchpad
             # V41.17 Fix #9: stamp signal time so manage_graduation_position can apply
             # the 8s no-pump time-stop without affecting non-copy-fast flows.
             pos.signal_time_ms = signal_time_ms
@@ -1673,6 +1686,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
     last_quote_check = 0.0
 
     def poll_delay() -> float:
+        if pos.launchpad == "copy_fast_solo":
+            return GRAD_SWARM_POLL_SEC
         if pos.launchpad in ("market_tape", "market_tape_scout"):
             return GRAD_SWARM_POLL_SEC
         if pos.launchpad == "copy_fast_swarm":
@@ -1683,7 +1698,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
 
     async def current_price(force_quote: bool = False) -> Optional[tuple[float, str]]:
         nonlocal last_quote_check
-        if pos.launchpad in ("copy_fast", "copy_fast_swarm", "market_tape", "market_tape_scout"):
+        if pos.launchpad in ("copy_fast", "copy_fast_solo", "copy_fast_swarm",
+                             "market_tape", "market_tape_scout"):
             cached = _bc_cache_price_for_pos(pos)
             if cached:
                 price, complete, age_ms = cached
@@ -1691,7 +1707,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     return price, f"bc_cache:{age_ms}ms"
         now = time.time()
         if (not force_quote
-                and pos.launchpad in ("copy_fast", "copy_fast_swarm", "market_tape", "market_tape_scout")
+                and pos.launchpad in ("copy_fast", "copy_fast_solo", "copy_fast_swarm",
+                                      "market_tape", "market_tape_scout")
                 and now - last_quote_check < GRAD_JUPITER_FALLBACK_SEC):
             return None
         last_quote_check = now
@@ -1708,6 +1725,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # V41.13-14: ST, grad-imminent, momentum, copy_fast entries have NO timeout.
             if pos.launchpad in ("st_pump", "grad_imminent", "momentum", "copy_fast"):
                 timeout_for_pos = float("inf")
+            elif pos.launchpad == "copy_fast_solo":
+                timeout_for_pos = COPY_FAST_SOLO_ROCKET_TIMEOUT_SEC
             elif pos.launchpad == "market_tape":
                 timeout_for_pos = MARKET_TAPE_TIMEOUT_SEC
             elif pos.launchpad == "market_tape_scout":
@@ -1772,9 +1791,19 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     1.0, multiplier,
                 ):
                     break
+            if (pos.launchpad == "copy_fast_solo"
+                    and pos.signal_time_ms > 0
+                    and (now * 1000 - pos.signal_time_ms) > COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC * 1000
+                    and pos.peak_price < COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK):
+                if try_grad_sell(
+                    f"COPY_FAST_SOLO FAST-KILL {COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s "
+                    f"peak={pos.peak_price:.3f}x mult={multiplier:.3f}x",
+                    1.0, multiplier,
+                ):
+                    break
             if (pos.launchpad in ("copy_fast", "copy_fast_swarm", "pump", "bonk",
                                   "grad_imminent", "momentum", "st_pump", "market_tape",
-                                  "market_tape_scout")
+                                  "market_tape_scout", "copy_fast_solo")
                     and pos.signal_time_ms > 0
                     and pos.peak_price < DEAD_PEAK_THRESHOLD):
                 age_s = (now * 1000 - pos.signal_time_ms) / 1000
@@ -1799,6 +1828,12 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                 )
                 if multiplier >= tape_tp_mult and try_grad_sell(
                     f"{pos.launchpad.upper()} TP {tape_tp_mult:.3f}x mult={multiplier:.3f}x",
+                    1.0, multiplier,
+                ):
+                    break
+            if pos.launchpad == "copy_fast_solo" and multiplier >= COPY_FAST_SOLO_ROCKET_TP_MULT:
+                if try_grad_sell(
+                    f"COPY_FAST_SOLO TP {COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x mult={multiplier:.3f}x",
                     1.0, multiplier,
                 ):
                     break
@@ -4819,6 +4854,7 @@ _rug_blocked_recent: dict[str, int] = {}
 # V41.17z9: track which mints we've already swarm-overridden so we don't
 # re-enter the same one repeatedly.
 _swarm_override_entered: set = set()
+_copy_fast_solo_rocket_mints: set = set()
 
 # V41.17zb: track mints with a pending swarm-sustain check (3s wait).
 # Prevents re-scheduling the same delayed-entry coroutine for a mint.
@@ -5497,6 +5533,16 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                 _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
                 log(f"  GRAD CONFIRM-OK {mint[:8]} ({launchpad}): mult={last_mult:.3f}x "
                     f"peak={peak_price / baseline_price:.3f}x swarm={len(recent)} age={last_age_ms}ms")
+                return True
+            if (COPY_FAST_SOLO_ROCKET_ENABLED
+                    and launchpad == "copy_fast"
+                    and last_mult >= COPY_FAST_SOLO_ROCKET_MIN_MULT
+                    and off_peak_ok):
+                _copy_fast_solo_rocket_mints.add(mint)
+                _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
+                log(f"  GRAD CONFIRM-OK {mint[:8]} (copy_fast_solo): "
+                    f"solo rocket mult={last_mult:.3f}x peak={peak_price / baseline_price:.3f}x "
+                    f"swarm={len(recent)} age={last_age_ms}ms")
                 return True
             reason = (f"mult={last_mult:.3f}x peak={peak_price / baseline_price:.3f}x "
                       f"swarm={len(recent)} off_peak={off_peak_ok} age={last_age_ms}ms")
@@ -6788,8 +6834,9 @@ async def wallet_balance_monitor(client: Client, kp: Optional[Keypair]):
 
 def _resume_recovered_position_managers(client: Client, kp: Optional[Keypair]) -> None:
     grad_launchpads = {
-        "copy_fast", "copy_fast_swarm", "market_tape", "market_tape_scout", "pump",
-        "bonk", "bonk_pregrad", "grad_imminent", "momentum", "st_pump",
+        "copy_fast", "copy_fast_solo", "copy_fast_swarm", "market_tape",
+        "market_tape_scout", "pump", "bonk", "bonk_pregrad", "grad_imminent",
+        "momentum", "st_pump",
     }
     for pos in list(positions.values()):
         if pos.strategy == "graduation" or pos.launchpad in grad_launchpads:
@@ -6878,6 +6925,11 @@ async def main():
     log(f"  Confirm gate: fresh bc-cache <= {COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS}ms, "
         f"+{(COPY_FAST_CONFIRM_MIN_MULT-1)*100:.1f}% move, within {COPY_FAST_CONFIRM_MAX_OFF_PEAK*100:.1f}% of local peak, "
         f"SWARM-{COPY_FAST_CONFIRM_MIN_SWARM} or continued SWARM-3.")
+    if COPY_FAST_SOLO_ROCKET_ENABLED:
+        log(f"  Solo rocket scout: copy_fast may enter {COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL "
+            f"at >={COPY_FAST_SOLO_ROCKET_MIN_MULT:.2f}x without swarm; "
+            f"TP={COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x fast-kill "
+            f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s/{COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK:.3f}x.")
     log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
         f"{COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s confirm window.")
     log(f"=== V41.19 MARKET-WIDE TAPE SCALPER ===")
