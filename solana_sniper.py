@@ -1339,9 +1339,9 @@ MARKET_TAPE_SCOUT_ENABLED = os.environ.get("MARKET_TAPE_SCOUT_ENABLED", "1") == 
 MARKET_TAPE_SCOUT_AMOUNT_SOL = float(os.environ.get("MARKET_TAPE_SCOUT_AMOUNT_SOL", "0.00625"))
 MARKET_TAPE_SCOUT_MIN_BC_MOVE = float(os.environ.get("MARKET_TAPE_SCOUT_MIN_BC_MOVE", "1.015"))
 MARKET_TAPE_SCOUT_MAX_BC_MOVE = float(os.environ.get("MARKET_TAPE_SCOUT_MAX_BC_MOVE", "1.100"))
-MARKET_TAPE_SCOUT_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_SCOUT_MIN_UNIQUE", "5"))
+MARKET_TAPE_SCOUT_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_SCOUT_MIN_UNIQUE", "4"))
 MARKET_TAPE_SCOUT_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_SCOUT_MIN_TRACKED", "2"))
-MARKET_TAPE_SCOUT_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_SCOUT_MIN_BUY_SOL", "2.0"))
+MARKET_TAPE_SCOUT_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_SCOUT_MIN_BUY_SOL", "3.0"))
 MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT", "1.003"))
 MARKET_TAPE_SCOUT_TP_MULT = float(os.environ.get("MARKET_TAPE_SCOUT_TP_MULT", "1.045"))
 MARKET_TAPE_SCOUT_FAST_KILL_SEC = float(os.environ.get("MARKET_TAPE_SCOUT_FAST_KILL_SEC", "2.0"))
@@ -3311,6 +3311,8 @@ async def session_reporter():
                 f"trig={s.get('swarm_scout_triggers', 0)} "
                 f"no_px={s.get('swarm_scout_no_price', 0)} "
                 f"rng={s.get('swarm_scout_range', 0)} "
+                f"rng_lo={s.get('swarm_scout_range_low', 0)} "
+                f"rng_hi={s.get('swarm_scout_range_high', 0)} "
                 f"ratio={s.get('swarm_scout_ratio', 0)} "
                 f"confirm={s.get('swarm_scout_confirm', 0)} "
                 f"busy={s.get('swarm_scout_busy', 0)} ===")
@@ -6005,6 +6007,13 @@ async def _swarm_scout_position(client: Client, kp: Optional[Keypair], mint: str
         move_mult, age_ms, complete = bc_move
         if complete or move_mult < SWARM_SCOUT_MIN_BC_MOVE or move_mult > SWARM_SCOUT_MAX_BC_MOVE:
             _copy_trade_stats["swarm_scout_range"] = _copy_trade_stats.get("swarm_scout_range", 0) + 1
+            if move_mult < SWARM_SCOUT_MIN_BC_MOVE:
+                _copy_trade_stats["swarm_scout_range_low"] = _copy_trade_stats.get("swarm_scout_range_low", 0) + 1
+            if move_mult > SWARM_SCOUT_MAX_BC_MOVE:
+                _copy_trade_stats["swarm_scout_range_high"] = _copy_trade_stats.get("swarm_scout_range_high", 0) + 1
+            log(f"  SWARM-SCOUT BLOCK {mint[:8]}: bc={move_mult:.3f}x outside "
+                f"{SWARM_SCOUT_MIN_BC_MOVE:.3f}-{SWARM_SCOUT_MAX_BC_MOVE:.3f}x "
+                f"swarm={swarm_size} age={age_ms}ms")
             return
         price_ratio = latest_price[0] / trader_price
         if price_ratio < MARKET_TAPE_MIN_PRICE_RATIO or price_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
