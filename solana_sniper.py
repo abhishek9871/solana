@@ -1299,6 +1299,7 @@ COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS = int(os.environ.get("COPY_FAST_CONFIRM_CACHE
 COPY_FAST_CONFIRM_MIN_SWARM = int(os.environ.get("COPY_FAST_CONFIRM_MIN_SWARM", "4"))
 COPY_FAST_CONFIRM_SWARM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM_WINDOW_SEC", "10.0"))
 COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC", "1.0"))
+COPY_FAST_CONFIRMED_ENTRY_ENABLED = os.environ.get("COPY_FAST_CONFIRMED_ENTRY_ENABLED", "0") == "1"
 COPY_FAST_SWARM_ENTRY_ENABLED = os.environ.get("COPY_FAST_SWARM_ENTRY_ENABLED", "0") == "1"
 COPY_FAST_SOLO_ROCKET_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_ENABLED", "0") == "1"
 COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE = os.environ.get("COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE", "1") == "1"
@@ -1343,6 +1344,8 @@ MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SEL
 MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT", "0.998"))
+MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
+MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.000"))
 MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET", "0.020"))
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
@@ -1569,6 +1572,10 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 if launchpad == "copy_fast_swarm":
                     entry_amount = GRAD_AMOUNT_SOL * 0.5
                 elif launchpad == "copy_fast":
+                    if not COPY_FAST_CONFIRMED_ENTRY_ENABLED:
+                        log(f"  GRAD SKIP {mint[:8]} (copy_fast): raw confirmed entry disabled; "
+                            "waiting for alpha/tape edge")
+                        return
                     entry_amount = COPY_FAST_CONFIRMED_AMOUNT_SOL
                 else:
                     entry_amount = GRAD_AMOUNT_SOL
@@ -5310,7 +5317,7 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return None
     if sell_sol > MARKET_TAPE_ALPHA_MAX_SELL_SOL:
         return None
-    if tracked_count < 1 or unique_count < 3 or buy_sol < 0.50:
+    if tracked_count < MARKET_TAPE_ALPHA_MIN_TRACKED or unique_count < 3 or buy_sol < 0.50:
         return None
     context = _alpha_context_key("market_tape", mint, signer, trader_price, trigger_price)
     wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
@@ -5321,6 +5328,8 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return None
     if _alpha_promoted(pair_stat):
         n, wr, avg_best, avg_exit = _alpha_stat_view(pair_stat)
+        if avg_exit < MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:
+            return None
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
@@ -5334,8 +5343,10 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
                       f"avg_exit={avg_exit:+.1%} ctx={context}",
         }
     if _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2) and _alpha_promoted(context_stat):
-        wn, wwr, wavg, _wexit = _alpha_stat_view(wallet_stat)
+        wn, wwr, wavg, wexit = _alpha_stat_view(wallet_stat)
         cn, cwr, cavg, cexit = _alpha_stat_view(context_stat)
+        if min(wexit, cexit) < MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:
+            return None
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
@@ -5345,11 +5356,13 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
                 if cexit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
                 else MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT
             ),
-            "reason": f"alpha_wallet_context w={wn}/{wwr:.0%}/{wavg:+.1%} "
+            "reason": f"alpha_wallet_context w={wn}/{wwr:.0%}/{wavg:+.1%}/{wexit:+.1%} "
                       f"c={cn}/{cwr:.0%}/{cavg:+.1%}/{cexit:+.1%} ctx={context}",
         }
     if _alpha_context_only_promoted(context_stat):
         n, wr, avg_best, avg_exit = _alpha_stat_view(context_stat)
+        if avg_exit < MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:
+            return None
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
@@ -7915,8 +7928,11 @@ async def main():
         f"+{(COPY_FAST_CONFIRM_MIN_MULT-1)*100:.1f}% move, cap<={COPY_FAST_CONFIRM_MAX_MULT:.2f}x, "
         f"within {COPY_FAST_CONFIRM_MAX_OFF_PEAK*100:.1f}% of local peak, "
         f"SWARM-{COPY_FAST_CONFIRM_MIN_SWARM} or continued SWARM-3.")
-    log(f"  Confirmed raw copy_fast size: {COPY_FAST_CONFIRMED_AMOUNT_SOL:.4f} SOL "
-        f"(alpha core remains {COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL).")
+    if COPY_FAST_CONFIRMED_ENTRY_ENABLED:
+        log(f"  Confirmed raw copy_fast size: {COPY_FAST_CONFIRMED_AMOUNT_SOL:.4f} SOL "
+            f"(alpha core remains {COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL).")
+    else:
+        log("  Confirmed raw copy_fast entries: DISABLED; copy signals train alpha and can still enter via alpha/tape.")
     if COPY_FAST_SOLO_ROCKET_ENABLED:
         log(f"  Solo rocket scout: copy_fast may enter {COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL "
             f"at >={COPY_FAST_SOLO_ROCKET_MIN_MULT:.2f}x without swarm "
@@ -7944,7 +7960,8 @@ async def main():
             f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
         if MARKET_TAPE_ALPHA_ENABLED:
             log(f"  Market-tape alpha: context-promoted tape enters scout size before static gates "
-                f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s, sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, "
+                f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s, tracked>={MARKET_TAPE_ALPHA_MIN_TRACKED}, "
+                f"sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, avg_exit>={MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:+.1%}, "
                 f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
                 f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s; strong avg-exit buckets may retain "
                 f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x.")
