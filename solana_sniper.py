@@ -1308,6 +1308,7 @@ MARKET_TAPE_MAX_BC_MOVE = float(os.environ.get("MARKET_TAPE_MAX_BC_MOVE", "1.35"
 MARKET_TAPE_BC_CACHE_MAX_AGE_MS = int(os.environ.get("MARKET_TAPE_BC_CACHE_MAX_AGE_MS", "700"))
 MARKET_TAPE_MIN_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_MIN_PRICE_RATIO", "0.82"))
 MARKET_TAPE_MAX_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_MAX_PRICE_RATIO", "1.12"))
+MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC", "5.0"))
 MARKET_TAPE_LOW_MOVE_STRONG_BELOW = float(os.environ.get("MARKET_TAPE_LOW_MOVE_STRONG_BELOW", "1.04"))
 MARKET_TAPE_LOW_MOVE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_UNIQUE", "8"))
 MARKET_TAPE_LOW_MOVE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_TRACKED", "3"))
@@ -4795,6 +4796,7 @@ _swarm_pending: set = set()
 # clustered organic pressure before waiting for a copy-trade confirmation.
 _market_tape_per_mint: dict[str, deque] = defaultdict(lambda: deque(maxlen=80))
 _market_tape_entered_recent: dict[str, int] = {}
+_market_tape_ratio_violation_until: dict[str, int] = {}
 _market_tape_entry_times: deque = deque(maxlen=200)
 
 _copy_trade_stats = {
@@ -5962,6 +5964,9 @@ def _market_tape_cleanup(now_ms: int) -> None:
     for mint, ts in list(_market_tape_entered_recent.items()):
         if ts < stale:
             _market_tape_entered_recent.pop(mint, None)
+    for mint, until_ms in list(_market_tape_ratio_violation_until.items()):
+        if until_ms <= now_ms:
+            _market_tape_ratio_violation_until.pop(mint, None)
 
 
 async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], mint: str,
@@ -6085,6 +6090,12 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         return
     if buy_sol < MARKET_TAPE_MIN_BUY_SOL or sell_sol > MARKET_TAPE_MAX_SELL_SOL:
         return
+    ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
+    if ratio_block_until > now_ms:
+        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        log(f"  MARKET-TAPE BLOCK {mint[:8]}: recent price_ratio violation "
+            f"cooldown {(ratio_block_until - now_ms) / 1000:.1f}s")
+        return
     bc_move = _bc_cache_move_for_mint(
         mint,
         max(MARKET_TAPE_WINDOW_MS + 800, 1500),
@@ -6126,6 +6137,7 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
     if trader_price > 0:
         price_ratio = latest_price[0] / trader_price
         if price_ratio < MARKET_TAPE_MIN_PRICE_RATIO or price_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
+            _market_tape_ratio_violation_until[mint] = now_ms + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
             log(f"  MARKET-TAPE BLOCK {mint[:8]}: price_ratio={price_ratio:.3f}x "
                 f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x "
@@ -6151,6 +6163,14 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             log(f"  MARKET-TAPE BLOCK {mint[:8]}: confirm_mult={confirm_mult:.3f}x "
                 f"< {MARKET_TAPE_CONFIRM_MIN_MULT:.3f}x after {MARKET_TAPE_CONFIRM_DELAY_SEC:.2f}s")
             return
+        if trader_price > 0:
+            confirm_ratio = confirm_price[0] / trader_price
+            if confirm_ratio < MARKET_TAPE_MIN_PRICE_RATIO or confirm_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
+                _market_tape_ratio_violation_until[mint] = int(time.time() * 1000) + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+                _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                log(f"  MARKET-TAPE BLOCK {mint[:8]}: confirm price_ratio={confirm_ratio:.3f}x "
+                    f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
+                return
 
     graduated_seen.add(mint)
     if len(graduated_seen) > 500:
@@ -6799,6 +6819,8 @@ async def main():
         f"bc<{MARKET_TAPE_LOW_MOVE_STRONG_BELOW:.3f}x requires "
         f"({MARKET_TAPE_LOW_MOVE_MIN_UNIQUE}+ unique and {MARKET_TAPE_LOW_MOVE_MIN_TRACKED}+ tracked) "
         f"or {MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL:.1f}+ SOL buy pressure.")
+    log(f"  Ratio whipsaw cooldown: {MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC:.1f}s after any "
+        f"price_ratio breach.")
     log(f"  Mid-move guard: bc<{MARKET_TAPE_MID_MOVE_STRONG_BELOW:.3f}x requires "
         f"({MARKET_TAPE_MID_MOVE_MIN_UNIQUE}+ unique and {MARKET_TAPE_MID_MOVE_MIN_TRACKED}+ tracked) "
         f"or {MARKET_TAPE_MID_MOVE_MIN_BUY_SOL:.1f}+ SOL buy pressure.")
