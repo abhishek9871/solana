@@ -1305,6 +1305,8 @@ COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE = os.environ.get("COPY_FAST_SOLO_ROCKET_ALLOW
 COPY_FAST_SOLO_ROCKET_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_MULT", "1.40"))
 COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT", "1.35"))
 COPY_FAST_SOLO_ROCKET_AMOUNT_SOL = float(os.environ.get("COPY_FAST_SOLO_ROCKET_AMOUNT_SOL", "0.00625"))
+COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC", "0.12"))
+COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN = float(os.environ.get("COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN", "0.97"))
 COPY_FAST_SOLO_ROCKET_TP_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TP_MULT", "1.055"))
 COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC", "2.0"))
 COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK", "1.012"))
@@ -6018,6 +6020,29 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                     and launchpad == "copy_fast"
                     and solo_rocket_ok
                     and off_peak_ok):
+                if COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC > 0:
+                    required_mult = (
+                        COPY_FAST_SOLO_ROCKET_MIN_MULT if single_rocket_ok
+                        else COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT
+                    ) * COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN
+                    await asyncio.sleep(COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC)
+                    confirm_price_info = _bc_cache_price_for_mint(mint, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS)
+                    if not confirm_price_info or confirm_price_info[1]:
+                        reason = f"solo rocket no confirm price after {COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC:.2f}s"
+                        await asyncio.sleep(COPY_FAST_CONFIRM_POLL_SEC)
+                        continue
+                    confirm_price, _complete, last_age_ms = confirm_price_info
+                    confirm_mult = confirm_price / baseline_price if baseline_price else 1.0
+                    peak_price = max(peak_price, confirm_price)
+                    confirm_off_peak = confirm_price >= peak_price * (1.0 - COPY_FAST_CONFIRM_MAX_OFF_PEAK)
+                    if confirm_mult < required_mult or not confirm_off_peak:
+                        reason = (f"solo rocket fade confirm={confirm_mult:.3f}x "
+                                  f"need>={required_mult:.3f}x off_peak={confirm_off_peak} "
+                                  f"age={last_age_ms}ms")
+                        await asyncio.sleep(COPY_FAST_CONFIRM_POLL_SEC)
+                        continue
+                    last_mult = confirm_mult
+                    off_peak_ok = confirm_off_peak
                 _copy_fast_solo_rocket_mints.add(mint)
                 _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
                 log(f"  GRAD CONFIRM-OK {mint[:8]} (copy_fast_solo): "
@@ -7820,6 +7845,8 @@ async def main():
             f"at >={COPY_FAST_SOLO_ROCKET_MIN_MULT:.2f}x without swarm "
             f"({'on' if COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE else 'off'}); "
             f"SWARM-2 lowers trigger to {COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT:.2f}x; "
+            f"must retain {COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN:.0%} after "
+            f"{COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC:.2f}s; "
             f"TP={COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x fast-kill "
             f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s/{COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK:.3f}x.")
     if ALPHA_LEARNER_ENABLED:
