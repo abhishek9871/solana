@@ -4126,8 +4126,9 @@ def _st_fetch_top_traders(needed: int = 25):
 
 ACTIVE_SNIPER_POOL_FILE = "active_snipers.txt"
 ACTIVE_SNIPER_REFRESH_HOURS = float(os.environ.get("ACTIVE_SNIPER_REFRESH_HOURS", "1.0"))
-ACTIVE_SNIPER_MIN_GRAD_HITS = int(os.environ.get("ACTIVE_SNIPER_MIN_GRAD_HITS", "2"))
-ACTIVE_SNIPER_GRAD_SAMPLE = int(os.environ.get("ACTIVE_SNIPER_GRAD_SAMPLE", "80"))
+ACTIVE_SNIPER_MIN_GRAD_HITS = int(os.environ.get("ACTIVE_SNIPER_MIN_GRAD_HITS", "1"))
+ACTIVE_SNIPER_GRAD_SAMPLE = int(os.environ.get("ACTIVE_SNIPER_GRAD_SAMPLE", "200"))
+ACTIVE_SNIPER_TOP_N_PER_GRAD = int(os.environ.get("ACTIVE_SNIPER_TOP_N_PER_GRAD", "25"))
 ACTIVE_SNIPER_POOL_ENABLED = os.environ.get("ACTIVE_SNIPER_POOL_ENABLED", "1") == "1"
 
 
@@ -4155,19 +4156,32 @@ def _st_build_active_sniper_pool() -> list[str]:
     median trades/24h was 0 in old pool, 472 in active pool.
     """
     from collections import Counter
-    # Step 1: gather recent graduations
+    # Step 1: gather recent graduations + actively trending tokens (V41.17z7).
+    # Pull from /tokens/multi/all (graduated + graduating + latest) AND
+    # /tokens/trending/5m for currently-hot tokens. Broader sample = more
+    # diverse wallet coverage = higher swarm correlation rate.
     mints: set[str] = set()
-    try:
-        r = requests.get(f"{SOLANATRACKER_BASE}/tokens/multi/all",
-                         headers={"x-api-key": SOLANATRACKER_API_KEY}, timeout=15)
-        if r.status_code == 200:
+    for ep in ["/tokens/multi/all?limit=500", "/tokens/trending/5m"]:
+        try:
+            r = requests.get(f"{SOLANATRACKER_BASE}{ep}",
+                             headers={"x-api-key": SOLANATRACKER_API_KEY}, timeout=15)
+            if r.status_code != 200:
+                continue
             d = r.json()
-            for t in (d.get("graduated") or []) if isinstance(d, dict) else []:
-                m = (t.get("token") or {}).get("mint")
-                if m and m.lower().endswith("pump"):
-                    mints.add(m)
-    except Exception as e:
-        log(f"  active-sniper /tokens/multi/all err: {type(e).__name__}: {e}")
+            if isinstance(d, dict):
+                for cat in ("graduated", "graduating", "latest"):
+                    for t in (d.get(cat) or []):
+                        m = (t.get("token") or {}).get("mint")
+                        if m and m.lower().endswith("pump"):
+                            mints.add(m)
+            elif isinstance(d, list):
+                for t in d:
+                    m = (t.get("token") or {}).get("mint") if isinstance(t, dict) else None
+                    if m and m.lower().endswith("pump"):
+                        mints.add(m)
+            time.sleep(1.5)
+        except Exception as e:
+            log(f"  active-sniper {ep} err: {type(e).__name__}: {e}")
     grads = list(mints)[: ACTIVE_SNIPER_GRAD_SAMPLE]
     if not grads:
         log("  active-sniper build: no graduations found, returning empty")
@@ -4186,7 +4200,7 @@ def _st_build_active_sniper_pool() -> list[str]:
             d = r.json()
             traders = d if isinstance(d, list) else (d.get("traders") if isinstance(d, dict) else [])
             if not isinstance(traders, list): traders = []
-            for t in traders[:10]:
+            for t in traders[:ACTIVE_SNIPER_TOP_N_PER_GRAD]:
                 w = t.get("wallet")
                 if w:
                     counter[w] += 1
@@ -4333,6 +4347,11 @@ def _wallet_last_trade_ms(wallet: str) -> Optional[int]:
 
 
 _copy_trader_seen_sigs: set = set()
+
+# V41.17z7: per-mint signer history for swarm detection.
+# mint -> list of (signer_str, ts_ms). Pruned to last 60s on each access.
+_signer_history_per_mint: dict[str, list] = {}
+
 _copy_trade_stats = {
     "shreds": 0, "no_meta": 0, "wrong_signer": 0, "no_buy": 0,
     "non_memecoin": 0, "dedup": 0, "fired": 0, "exception": 0,
@@ -5025,9 +5044,33 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                                 signer: str, mint: str, trader_price: float, source: str):
     """V41.17i: shared gate cascade for both fast (shred) and slow (getTransaction) paths.
     Runs dedup → memecoin filter → claim → rug check → curve gate → first-buyer gate,
-    then fires graduation_snipe(launchpad="copy_fast") on success."""
+    then fires graduation_snipe(launchpad="copy_fast") on success.
+
+    V41.17z7: track per-mint signer history for swarm detection. When dedup fires
+    on a mint we already entered, log it as a SWARM-N event (N distinct wallets
+    bought this mint within 60s)."""
+    # Record this signal in the per-mint signer history BEFORE dedup check
+    now_ms = int(time.time() * 1000)
+    history = _signer_history_per_mint.setdefault(mint, [])
+    # Prune entries older than 60s
+    cutoff = now_ms - 60_000
+    history[:] = [(s, t) for s, t in history if t >= cutoff]
+    history.append((signer, now_ms))
+    # Cap dict size to prevent leak
+    if len(_signer_history_per_mint) > 1000:
+        oldest = sorted(_signer_history_per_mint.items(), key=lambda x: max((t for _, t in x[1]), default=0))
+        for k, _ in oldest[:200]:
+            _signer_history_per_mint.pop(k, None)
+
     if mint in graduated_seen:
         _copy_trade_stats["dedup"] += 1
+        # SWARM detection: how many distinct wallets bought this mint within 10s?
+        ten_s_ago = now_ms - 10_000
+        recent_signers = {s for s, t in history if t >= ten_s_ago}
+        if len(recent_signers) >= 2:
+            _copy_trade_stats["swarm_detected"] = _copy_trade_stats.get("swarm_detected", 0) + 1
+            log(f"  *** SWARM-{len(recent_signers)} *** {mint[:8]}: {len(recent_signers)} pool wallets bought within 10s "
+                f"(last: {signer[:8]}, total signers in 60s: {len({s for s, _ in history})})")
         return
     mint_lc = mint.lower()
     if not (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
@@ -5621,6 +5664,10 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17z7 EXPANDED POOL + SWARM DETECTION ===")
+    log(f"  Pool sample: {ACTIVE_SNIPER_GRAD_SAMPLE} mints x top {ACTIVE_SNIPER_TOP_N_PER_GRAD} traders, hits>={ACTIVE_SNIPER_MIN_GRAD_HITS}")
+    log(f"  Sources: /tokens/multi/all (graduated+graduating+latest) + /tokens/trending/5m")
+    log(f"  Swarm detection: log SWARM-N when N>=2 pool wallets buy same mint within 10s")
     log(f"=== V41.17z5 INSTANT GRADUATION ENTRY ===")
     log(f"  pump/bonk grads: enter immediately after Jupiter indexing (no 5s observe)")
     log(f"  Captures more upside on fast-pumping grads; dead-peak guard handles duds")
