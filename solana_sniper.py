@@ -1326,7 +1326,7 @@ MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_LOW_MOVE_MI
 MARKET_TAPE_MID_MOVE_STRONG_BELOW = float(os.environ.get("MARKET_TAPE_MID_MOVE_STRONG_BELOW", "1.10"))
 MARKET_TAPE_MID_MOVE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_MID_MOVE_MIN_UNIQUE", "6"))
 MARKET_TAPE_MID_MOVE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_MID_MOVE_MIN_TRACKED", "2"))
-MARKET_TAPE_MID_MOVE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_MID_MOVE_MIN_BUY_SOL", "10.0"))
+MARKET_TAPE_MID_MOVE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_MID_MOVE_MIN_BUY_SOL", "8.0"))
 MARKET_TAPE_HIGH_MOVE_STRONG_ABOVE = float(os.environ.get("MARKET_TAPE_HIGH_MOVE_STRONG_ABOVE", "1.10"))
 MARKET_TAPE_HIGH_MOVE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_HIGH_MOVE_MIN_UNIQUE", "8"))
 MARKET_TAPE_HIGH_MOVE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_HIGH_MOVE_MIN_TRACKED", "4"))
@@ -6509,6 +6509,11 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             entry_amount_sol = MARKET_TAPE_SCOUT_AMOUNT_SOL
             entry_quality = 5
             confirm_min_mult = MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT
+        elif strong_mid_move and len(tracked_buyers) < MARKET_TAPE_MID_MOVE_MIN_TRACKED:
+            entry_launchpad = "market_tape_scout"
+            entry_amount_sol = MARKET_TAPE_SCOUT_AMOUNT_SOL
+            entry_quality = 5
+            confirm_min_mult = MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT
         elif not strong_mid_move:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
             _mt_gate("mt_weak_mid")
@@ -6528,6 +6533,13 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
             f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
         return
+    if (move_mult >= MARKET_TAPE_HIGH_MOVE_STRONG_ABOVE
+            and len(tracked_buyers) < MARKET_TAPE_HIGH_MOVE_MIN_TRACKED
+            and buy_sol >= MARKET_TAPE_HIGH_MOVE_MIN_BUY_SOL):
+        entry_launchpad = "market_tape_scout"
+        entry_amount_sol = MARKET_TAPE_SCOUT_AMOUNT_SOL
+        entry_quality = 5
+        confirm_min_mult = MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT
     latest_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
     if not latest_price:
         _mt_gate("mt_no_price")
