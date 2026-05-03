@@ -4379,6 +4379,10 @@ _rug_blocked_recent: dict[str, int] = {}
 # re-enter the same one repeatedly.
 _swarm_override_entered: set = set()
 
+# V41.17zb: track mints with a pending swarm-sustain check (3s wait).
+# Prevents re-scheduling the same delayed-entry coroutine for a mint.
+_swarm_pending: set = set()
+
 _copy_trade_stats = {
     "shreds": 0, "no_meta": 0, "wrong_signer": 0, "no_buy": 0,
     "non_memecoin": 0, "dedup": 0, "fired": 0, "exception": 0,
@@ -5067,6 +5071,40 @@ def _parse_shred_for_pump_buy(shred_result: dict, trader_set: set) -> Optional[d
         return None
 
 
+async def _delayed_swarm_override_entry(client: Client, kp: Optional[Keypair],
+                                         mint: str, signer: str, trader_price: float,
+                                         initial_swarm_size: int):
+    """V41.17zb: wait 3s and only enter if swarm GREW.
+
+    Decoded from C25kDotw vs HCqzUnse/CVZHqoMv: winners had swarms that kept
+    growing post-trigger (C25kDotw: 3 → 4 → 5 → 6 → 8 over 10s). Losers had
+    swarms that died at the trigger size (HCqzUnse: stayed at 3, CVZHqoMv:
+    stayed at 4). 3-second sustain wait filters the dead swarms perfectly.
+    """
+    await asyncio.sleep(3.0)
+    try:
+        if mint in _swarm_override_entered or mint in positions:
+            return
+        history = _signer_history_per_mint.get(mint, [])
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - 10_000
+        current_swarm = len({s for s, t in history if t >= cutoff})
+        if current_swarm > initial_swarm_size:
+            _swarm_override_entered.add(mint)
+            _copy_trade_stats["swarm_override"] = _copy_trade_stats.get("swarm_override", 0) + 1
+            log(f"  *** SWARM-SUSTAIN OVERRIDE *** {mint[:8]}: swarm grew "
+                f"{initial_swarm_size}->{current_swarm} in 3s, entering")
+            asyncio.create_task(graduation_snipe(
+                client, kp, mint, launchpad="copy_fast_swarm",
+                signer=signer, trader_price=trader_price))
+        else:
+            _copy_trade_stats["swarm_stalled"] = _copy_trade_stats.get("swarm_stalled", 0) + 1
+            log(f"  *** SWARM-STALL SKIP *** {mint[:8]}: swarm stalled at "
+                f"{current_swarm} (initial {initial_swarm_size}), avoiding likely loss")
+    finally:
+        _swarm_pending.discard(mint)
+
+
 async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
                                    mint: str, swarm_size: int, signer: str):
     """V41.17z8: when SWARM-N detected within 30s of an open position's entry,
@@ -5133,21 +5171,21 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                 if age_s < 30 and existing.peak_price >= 0.95:
                     asyncio.create_task(_swarm_compound_position(
                         client, kp, mint, len(recent_signers), signer))
-            # V41.17z9: SWARM-OVERRIDE-RUG — if SWARM-3+ formed and the mint was
-            # rug-blocked in last 30s and we don't have a position yet, the smart
-            # wallets disagree with our rug heuristic. Enter with capped size.
+            # V41.17zb: SWARM-OVERRIDE-RUG with SUSTAIN FILTER. SWARM-3+ on a
+            # rug-blocked mint kicks off a 3-second observation. If swarm GROWS
+            # within that window (4+ wallets), enter. If it stalls, skip.
+            # Decoded from C25kDotw (sustained 3->8) won vs HCqzUnse (stalled at 3) lost.
             elif (not existing
                     and len(recent_signers) >= 3
                     and mint in _rug_blocked_recent
                     and (now_ms - _rug_blocked_recent[mint]) < 30_000
-                    and mint not in _swarm_override_entered):
-                _swarm_override_entered.add(mint)
-                _copy_trade_stats["swarm_override"] = _copy_trade_stats.get("swarm_override", 0) + 1
-                log(f"  *** SWARM-OVERRIDE-RUG *** {mint[:8]}: {len(recent_signers)} wallets agree, "
-                    f"overriding rug-block with capped 0.025 SOL")
-                asyncio.create_task(graduation_snipe(
-                    client, kp, mint, launchpad="copy_fast_swarm",
-                    signer=signer, trader_price=trader_price))
+                    and mint not in _swarm_override_entered
+                    and mint not in _swarm_pending):
+                _swarm_pending.add(mint)
+                log(f"  *** SWARM-PENDING *** {mint[:8]}: SWARM-{len(recent_signers)} detected, "
+                    f"watching 3s for sustain (skip if swarm stalls)")
+                asyncio.create_task(_delayed_swarm_override_entry(
+                    client, kp, mint, signer, trader_price, len(recent_signers)))
         return
     mint_lc = mint.lower()
     if not (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
@@ -5750,6 +5788,9 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17zb SWARM-SUSTAIN FILTER (decoded from C25kDotw) ===")
+    log(f"  SWARM-3+ on rug-blocked mint waits 3s — only enters if swarm GREW.")
+    log(f"  Backtested: catches C25kDotw (3->8) and 6iPsKe4j wins, skips HCqzUnse (3->3) and CVZHqoMv (4->4).")
     log(f"=== V41.17za bypass circuit breakers for swarm-override ===")
     log(f"  copy_fast_swarm entries skip streak-pause and consec_loss halts.")
     log(f"=== V41.17z9 SWARM-OVERRIDE-RUG ===")
