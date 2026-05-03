@@ -1296,6 +1296,7 @@ COPY_FAST_CONFIRM_SWARM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWA
 COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC", "1.0"))
 COPY_FAST_SWARM_ENTRY_ENABLED = os.environ.get("COPY_FAST_SWARM_ENTRY_ENABLED", "0") == "1"
 COPY_FAST_SOLO_ROCKET_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_ENABLED", "1") == "1"
+COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE = os.environ.get("COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE", "0") == "1"
 COPY_FAST_SOLO_ROCKET_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_MULT", "1.25"))
 COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT", "1.20"))
 COPY_FAST_SOLO_ROCKET_AMOUNT_SOL = float(os.environ.get("COPY_FAST_SOLO_ROCKET_AMOUNT_SOL", "0.00625"))
@@ -1543,8 +1544,10 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             pos.quality_score = 8
             pos.launchpad = entry_launchpad
             # V41.17 Fix #9: stamp signal time so manage_graduation_position can apply
-            # the 8s no-pump time-stop without affecting non-copy-fast flows.
-            pos.signal_time_ms = signal_time_ms
+            # the no-pump time-stops after we actually enter. Confirm-gated copy
+            # lanes can wait 2-3s before buying; using the original signal time
+            # caused immediate fast-kill exits on fresh positions.
+            pos.signal_time_ms = int(time.time() * 1000)
             _store_open_position(pos)
             _record_entry_opened()
             asyncio.create_task(manage_graduation_position(client, kp, pos))
@@ -5562,10 +5565,15 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                 log(f"  GRAD CONFIRM-OK {mint[:8]} ({launchpad}): mult={last_mult:.3f}x "
                     f"peak={peak_price / baseline_price:.3f}x swarm={len(recent)} age={last_age_ms}ms")
                 return True
-            solo_rocket_ok = (
-                last_mult >= COPY_FAST_SOLO_ROCKET_MIN_MULT
-                or (len(recent) >= 2 and last_mult >= COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT)
+            single_rocket_ok = (
+                COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE
+                and last_mult >= COPY_FAST_SOLO_ROCKET_MIN_MULT
             )
+            swarm2_rocket_ok = (
+                len(recent) >= 2
+                and last_mult >= COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT
+            )
+            solo_rocket_ok = single_rocket_ok or swarm2_rocket_ok
             if (COPY_FAST_SOLO_ROCKET_ENABLED
                     and launchpad == "copy_fast"
                     and solo_rocket_ok
@@ -7091,7 +7099,8 @@ async def main():
         f"SWARM-{COPY_FAST_CONFIRM_MIN_SWARM} or continued SWARM-3.")
     if COPY_FAST_SOLO_ROCKET_ENABLED:
         log(f"  Solo rocket scout: copy_fast may enter {COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL "
-            f"at >={COPY_FAST_SOLO_ROCKET_MIN_MULT:.2f}x without swarm; "
+            f"at >={COPY_FAST_SOLO_ROCKET_MIN_MULT:.2f}x without swarm "
+            f"({'on' if COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE else 'off'}); "
             f"SWARM-2 lowers trigger to {COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT:.2f}x; "
             f"TP={COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x fast-kill "
             f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s/{COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK:.3f}x.")
