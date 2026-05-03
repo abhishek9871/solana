@@ -1331,6 +1331,10 @@ MARKET_TAPE_HIGH_MOVE_STRONG_ABOVE = float(os.environ.get("MARKET_TAPE_HIGH_MOVE
 MARKET_TAPE_HIGH_MOVE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_HIGH_MOVE_MIN_UNIQUE", "8"))
 MARKET_TAPE_HIGH_MOVE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_HIGH_MOVE_MIN_TRACKED", "4"))
 MARKET_TAPE_HIGH_MOVE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_HIGH_MOVE_MIN_BUY_SOL", "7.5"))
+MARKET_TAPE_HIGH_SCOUT_MAX_BC_MOVE = float(os.environ.get("MARKET_TAPE_HIGH_SCOUT_MAX_BC_MOVE", "1.18"))
+MARKET_TAPE_HIGH_SCOUT_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_HIGH_SCOUT_MIN_UNIQUE", "6"))
+MARKET_TAPE_HIGH_SCOUT_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_HIGH_SCOUT_MIN_TRACKED", "3"))
+MARKET_TAPE_HIGH_SCOUT_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_HIGH_SCOUT_MIN_BUY_SOL", "2.0"))
 MARKET_TAPE_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_CONFIRM_DELAY_SEC", "0.35"))
 MARKET_TAPE_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_CONFIRM_MIN_MULT", "1.003"))
 MARKET_TAPE_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_COOLDOWN_SEC", "25"))
@@ -6521,10 +6525,17 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
                 f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
                 f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
             return
+    moderate_high_scout = (
+        move_mult < MARKET_TAPE_HIGH_SCOUT_MAX_BC_MOVE
+        and len(unique_buyers) >= MARKET_TAPE_HIGH_SCOUT_MIN_UNIQUE
+        and len(tracked_buyers) >= MARKET_TAPE_HIGH_SCOUT_MIN_TRACKED
+        and buy_sol >= MARKET_TAPE_HIGH_SCOUT_MIN_BUY_SOL
+    )
     strong_high_move = (
         (len(unique_buyers) >= MARKET_TAPE_HIGH_MOVE_MIN_UNIQUE
          and len(tracked_buyers) >= MARKET_TAPE_HIGH_MOVE_MIN_TRACKED)
         or buy_sol >= MARKET_TAPE_HIGH_MOVE_MIN_BUY_SOL
+        or moderate_high_scout
     )
     if move_mult >= MARKET_TAPE_HIGH_MOVE_STRONG_ABOVE and not strong_high_move:
         _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
@@ -6534,8 +6545,9 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
         return
     if (move_mult >= MARKET_TAPE_HIGH_MOVE_STRONG_ABOVE
-            and len(tracked_buyers) < MARKET_TAPE_HIGH_MOVE_MIN_TRACKED
-            and buy_sol >= MARKET_TAPE_HIGH_MOVE_MIN_BUY_SOL):
+            and (moderate_high_scout
+                 or (len(tracked_buyers) < MARKET_TAPE_HIGH_MOVE_MIN_TRACKED
+                     and buy_sol >= MARKET_TAPE_HIGH_MOVE_MIN_BUY_SOL))):
         entry_launchpad = "market_tape_scout"
         entry_amount_sol = MARKET_TAPE_SCOUT_AMOUNT_SOL
         entry_quality = 5
@@ -7279,6 +7291,9 @@ async def main():
     log(f"  High-move guard: bc>={MARKET_TAPE_HIGH_MOVE_STRONG_ABOVE:.3f}x requires "
         f"({MARKET_TAPE_HIGH_MOVE_MIN_UNIQUE}+ unique and {MARKET_TAPE_HIGH_MOVE_MIN_TRACKED}+ tracked) "
         f"or {MARKET_TAPE_HIGH_MOVE_MIN_BUY_SOL:.1f}+ SOL buy pressure.")
+    log(f"  High scout band: bc<{MARKET_TAPE_HIGH_SCOUT_MAX_BC_MOVE:.3f}x can scout with "
+        f"{MARKET_TAPE_HIGH_SCOUT_MIN_UNIQUE}+ unique, {MARKET_TAPE_HIGH_SCOUT_MIN_TRACKED}+ tracked, "
+        f"buy>={MARKET_TAPE_HIGH_SCOUT_MIN_BUY_SOL:.1f} SOL.")
     if MARKET_TAPE_EXIT_ENABLED:
         log(f"  Tape exits: {MARKET_TAPE_EXIT_WINDOW_MS}ms sell-pressure window, "
             f"drop<= {MARKET_TAPE_EXIT_DROP_MULT:.3f}x, sell>={MARKET_TAPE_EXIT_MIN_SELL_SOL:.3f} SOL "
