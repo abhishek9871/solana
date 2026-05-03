@@ -1330,6 +1330,9 @@ COPY_FAST_ALPHA_TP_MULT = float(os.environ.get("COPY_FAST_ALPHA_TP_MULT", "1.045
 COPY_FAST_ALPHA_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_SEC", "2.0"))
 COPY_FAST_ALPHA_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_PEAK", "1.012"))
 COPY_FAST_ALPHA_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_ALPHA_TIMEOUT_SEC", "8.0"))
+MARKET_TAPE_ALPHA_ENABLED = os.environ.get("MARKET_TAPE_ALPHA_ENABLED", "1") == "1"
+MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_SEC", "6.0"))
+MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SELL_SOL", "0.004"))
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
 MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
@@ -5258,6 +5261,48 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
     return None
 
 
+def _alpha_market_tape_entry_plan(mint: str, signer: str,
+                                  trader_price: float, trigger_price: float,
+                                  unique_count: int, tracked_count: int,
+                                  buy_sol: float, sell_sol: float,
+                                  observed_age_ms: int) -> Optional[dict]:
+    if not (ALPHA_LEARNER_ENABLED and ALPHA_ADAPTIVE_ENTRY_ENABLED and MARKET_TAPE_ALPHA_ENABLED):
+        return None
+    if observed_age_ms > MARKET_TAPE_ALPHA_MAX_AGE_SEC * 1000:
+        return None
+    if sell_sol > MARKET_TAPE_ALPHA_MAX_SELL_SOL:
+        return None
+    if tracked_count < 1 or unique_count < 3 or buy_sol < 0.50:
+        return None
+    context = _alpha_context_key("market_tape", mint, signer, trader_price, trigger_price)
+    wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
+    context_stat = _alpha_stats.get("contexts", {}).get(context)
+    pair_stat = _alpha_stats.get("pairs", {}).get(f"{signer}|{context}")
+    if _alpha_toxic(pair_stat) or _alpha_toxic(context_stat) or _alpha_toxic(wallet_stat):
+        _copy_trade_stats["alpha_toxic"] = _copy_trade_stats.get("alpha_toxic", 0) + 1
+        return None
+    if _alpha_promoted(pair_stat) or (
+        _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2)
+        and _alpha_promoted(context_stat)
+    ):
+        n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat or wallet_stat)
+        _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
+        return {
+            "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL,
+            "quality": 7,
+            "reason": f"alpha_pair n={n} wr={wr:.0%} avg_best={avg_best:+.1%} ctx={context}",
+        }
+    if _alpha_promoted(context_stat):
+        n, wr, avg_best, _avg_exit = _alpha_stat_view(context_stat)
+        _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
+        return {
+            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "quality": 6,
+            "reason": f"alpha_context n={n} wr={wr:.0%} avg_best={avg_best:+.1%} ctx={context}",
+        }
+    return None
+
+
 def _evaluate_risk(snap: dict) -> tuple[bool, str]:
     """V41.17: apply rejection rules to a risk snapshot. Used by both cached
     and live paths. Empirically-tuned thresholds (V41.16b research):
@@ -6829,6 +6874,31 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             trader_price=float(trade.get("trader_price") or 0.0),
             sig=f"{sig}:mt:{len(unique_buyers)}:{len(tracked_buyers)}",
         )
+    alpha_cached_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+    alpha_plan = _alpha_market_tape_entry_plan(
+        mint, signer,
+        float(trade.get("trader_price") or 0.0),
+        float(alpha_cached_price[0]) if alpha_cached_price and not alpha_cached_price[1] else 0.0,
+        len(unique_buyers), len(tracked_buyers), buy_sol, sell_sol, observed_age_ms,
+    )
+    if alpha_plan:
+        graduated_seen.add(mint)
+        if len(graduated_seen) > 500:
+            graduated_seen.clear()
+            graduated_seen.add(mint)
+        _market_tape_entered_recent[mint] = now_ms
+        _market_tape_entry_times.append(now_ms)
+        _copy_trade_stats["market_tape_triggers"] = _copy_trade_stats.get("market_tape_triggers", 0) + 1
+        reason = (f"{alpha_plan['reason']} unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
+                  f"buy={buy_sol:.3f} sell={sell_sol:.3f} seen={observed_age_ms/1000:.1f}s")
+        log(f"  *** MARKET-TAPE-ALPHA TRIGGER *** {mint[:8]}: {reason}")
+        asyncio.create_task(_enter_market_tape_position(
+            client, kp, mint, now_ms, reason,
+            amount_sol=float(alpha_plan.get("amount") or COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL),
+            launchpad="market_tape_scout",
+            quality_score=int(alpha_plan.get("quality") or 6),
+        ))
+        return
     if not birth_lane:
         if len(unique_buyers) < MARKET_TAPE_MIN_UNIQUE:
             _mt_gate("mt_no_unique")
@@ -7702,6 +7772,9 @@ async def main():
         log(f"  Alpha exits: TP={COPY_FAST_ALPHA_TP_MULT:.3f}x fast-kill "
             f"{COPY_FAST_ALPHA_FAST_KILL_SEC:.1f}s/{COPY_FAST_ALPHA_FAST_KILL_PEAK:.3f}x; "
             f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
+        if MARKET_TAPE_ALPHA_ENABLED:
+            log(f"  Market-tape alpha: context-promoted tape enters scout size before static gates "
+                f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s and sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL.")
     log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
         f"{COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s confirm window.")
     log(f"=== V41.19 MARKET-WIDE TAPE SCALPER ===")
