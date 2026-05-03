@@ -135,7 +135,12 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 # === CONFIG ===
-PAPER_TRADING = True  # set False for live trading
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PAPER_TRADING = os.environ.get("PAPER_TRADING", "1").strip().lower() not in {"0", "false", "no", "off"}
+POSITIONS_STATE_FILE = os.environ.get(
+    "POSITIONS_STATE_FILE",
+    os.path.join(BASE_DIR, "data", "positions_state.json"),
+)
 
 # Wallet & RPC
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=c2fa0510-cddd-4768-9424-e5db39429bbb")
@@ -291,6 +296,10 @@ CASHBACK_MOMENTUM_MIN_GROWTH_3S = 0.0015
 # V41.8: positions are 0.05 SOL = $4.20 each. SL = -7% = -$0.30/trade.
 # Halt at -$2.50 = -0.03 SOL (~14% bankroll drawdown) = ~8 SL hits in a row.
 MAX_SESSION_LOSS_SOL = float(os.environ.get("MAX_SESSION_LOSS_SOL", "0.10"))   # V41.13n: 0.03→0.10 — small positions need more sample, halt at -$8.40 instead of -$2.50
+MAX_DAILY_LOSS_SOL = float(os.environ.get("MAX_DAILY_LOSS_SOL", "0.50"))
+DAILY_LOSS_EXIT_ENABLED = os.environ.get("DAILY_LOSS_EXIT_ENABLED", "1") == "1"
+MIN_WALLET_BALANCE_SOL = float(os.environ.get("MIN_WALLET_BALANCE_SOL", "0.05"))
+WALLET_BALANCE_CHECK_SEC = int(os.environ.get("WALLET_BALANCE_CHECK_SEC", "60"))
 MAX_CONSEC_LOSSES = int(os.environ.get("MAX_CONSEC_LOSSES", "5"))               # halt at 5 straight
 MAX_CONCURRENT_POSITIONS = int(os.environ.get("MAX_CONCURRENT_POSITIONS", "10"))
 # V41.5: Daily trade cap. Past 25 trades the bot is overtrading a regime that hasn't worked.
@@ -330,6 +339,11 @@ session_pnl_sol = 0.0
 session_wins = 0
 session_losses = 0
 consec_losses = 0
+daily_pnl_sol = 0.0
+daily_loss_reset_ts = time.time()
+daily_loss_halt_reason = ""
+_positions_closing: set[str] = set()
+_swarm_compound_locks: dict[str, asyncio.Lock] = {}
 # V41.5: trade-counting and pause state
 daily_trade_count = 0                  # count of entries opened this session
 daily_count_reset_ts = time.time()     # when the daily counter last reset
@@ -356,6 +370,8 @@ def _entry_circuit_breakers_open() -> tuple[bool, str]:
         daily_count_reset_ts = now
     if session_pnl_sol <= -MAX_SESSION_LOSS_SOL:
         return True, f"session loss limit hit ({session_pnl_sol:+.4f} SOL)"
+    if _daily_loss_limit_hit():
+        return True, daily_loss_halt_reason or f"daily loss limit hit ({daily_pnl_sol:+.4f} SOL)"
     if consec_losses >= MAX_CONSEC_LOSSES:
         return True, f"consec_loss limit hit ({consec_losses})"
     if daily_trade_count >= MAX_TRADES_PER_DAY:
@@ -371,7 +387,13 @@ def _record_trade_close(pnl: float) -> None:
     - Triggers streak pause when consec_losses >= LOSS_STREAK_PAUSE_THRESHOLD
     """
     global session_pnl_sol, session_wins, session_losses, consec_losses, streak_pause_until
+    global daily_pnl_sol, daily_loss_reset_ts, daily_loss_halt_reason
+    now = time.time()
+    if now - daily_loss_reset_ts > 86400:
+        daily_pnl_sol = 0.0
+        daily_loss_reset_ts = now
     session_pnl_sol += pnl
+    daily_pnl_sol += pnl
     if pnl > MIN_REAL_WIN_SOL:
         session_wins += 1
         consec_losses = 0
@@ -381,12 +403,204 @@ def _record_trade_close(pnl: float) -> None:
         if consec_losses >= LOSS_STREAK_PAUSE_THRESHOLD and streak_pause_until < time.time():
             streak_pause_until = time.time() + LOSS_STREAK_PAUSE_SEC
             log(f"  STREAK PAUSE: {consec_losses} consec losses — pausing new entries for {LOSS_STREAK_PAUSE_SEC}s")
+    if _daily_loss_limit_hit():
+        daily_loss_halt_reason = f"daily loss limit hit ({daily_pnl_sol:+.4f} SOL / -{MAX_DAILY_LOSS_SOL:.4f} SOL)"
 
 
 def _record_entry_opened() -> None:
     """V41.5: increment daily trade counter when a position is opened."""
     global daily_trade_count
     daily_trade_count += 1
+
+
+def _position_to_state(pos: Position) -> dict:
+    data = {}
+    for name in Position.__dataclass_fields__:
+        value = getattr(pos, name)
+        data[name] = str(value) if name == "bc_pda" and value else value
+    return data
+
+
+def _position_from_state(mint: str, data: dict) -> Optional[Position]:
+    try:
+        bc_pda_raw = data.get("bc_pda")
+        bc_pda = Pubkey.from_string(bc_pda_raw) if bc_pda_raw else None
+        if bc_pda is None:
+            bc_pda = derive_bc_pda(Pubkey.from_string(mint))
+        return Position(
+            mint=str(data.get("mint") or mint),
+            entry_price=float(data.get("entry_price", 0.0)),
+            entry_amount_sol=float(data.get("entry_amount_sol", 0.0)),
+            token_amount=float(data.get("token_amount", 0.0)),
+            open_time=float(data.get("open_time", time.time())),
+            peak_price=float(data.get("peak_price", 1.0)),
+            rung_hit=int(data.get("rung_hit", 0)),
+            remaining_pct=float(data.get("remaining_pct", 1.0)),
+            realized_sol=float(data.get("realized_sol", 0.0)),
+            last_price=float(data.get("last_price", 0.0)),
+            bc_pda=bc_pda,
+            graduated=bool(data.get("graduated", False)),
+            late_scalp=bool(data.get("late_scalp", False)),
+            strategy=str(data.get("strategy", "momentum")),
+            entry_progress=float(data.get("entry_progress", 0.0)),
+            quality_score=int(data.get("quality_score", 0)),
+            entry_size_sol=float(data.get("entry_size_sol", 0.0)),
+            adds_done=int(data.get("adds_done", 0)),
+            launchpad=str(data.get("launchpad", "pump")),
+            signal_time_ms=int(data.get("signal_time_ms", 0)),
+        )
+    except Exception as e:
+        log(f"  POSITION RESTORE SKIP {mint[:8]}: {type(e).__name__}: {e}")
+        return None
+
+
+def _persist_positions() -> None:
+    try:
+        state_dir = os.path.dirname(os.path.abspath(POSITIONS_STATE_FILE))
+        os.makedirs(state_dir, exist_ok=True)
+        payload = {
+            "version": 1,
+            "updated_at": time.time(),
+            "paper_trading": PAPER_TRADING,
+            "daily": {
+                "pnl_sol": daily_pnl_sol,
+                "reset_ts": daily_loss_reset_ts,
+            },
+            "positions": {
+                mint: _position_to_state(pos)
+                for mint, pos in positions.items()
+                if pos.remaining_pct > 0.01
+            },
+        }
+        tmp_path = POSITIONS_STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+        os.replace(tmp_path, POSITIONS_STATE_FILE)
+    except Exception as e:
+        log(f"  POSITION PERSIST ERR: {type(e).__name__}: {e}")
+
+
+def _load_positions_state() -> int:
+    global daily_pnl_sol, daily_loss_reset_ts
+    if not os.path.isfile(POSITIONS_STATE_FILE):
+        return 0
+    try:
+        with open(POSITIONS_STATE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        daily = payload.get("daily") or {}
+        reset_ts = float(daily.get("reset_ts", time.time()))
+        if time.time() - reset_ts <= 86400:
+            daily_loss_reset_ts = reset_ts
+            daily_pnl_sol = float(daily.get("pnl_sol", 0.0))
+        restored = 0
+        for mint, item in (payload.get("positions") or {}).items():
+            pos = _position_from_state(mint, item or {})
+            if pos and pos.remaining_pct > 0.01:
+                positions[pos.mint] = pos
+                restored += 1
+        if restored:
+            log(f"  POSITION RESTORE: loaded {restored} open position(s) from {POSITIONS_STATE_FILE}")
+        return restored
+    except Exception as e:
+        log(f"  POSITION RESTORE ERR: {type(e).__name__}: {e}")
+        return 0
+
+
+def _wallet_token_raw_balance(owner: str, mint: str) -> Optional[int]:
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                owner,
+                {"mint": mint},
+                {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ],
+        }
+        r = requests.post(SOLANA_RPC_URL, json=payload, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        total = 0
+        for acc in ((data.get("result") or {}).get("value") or []):
+            amount = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("tokenAmount", {}).get("amount", "0")
+            total += int(amount or 0)
+        return total
+    except Exception as e:
+        log(f"  POSITION RECONCILE ERR {mint[:8]}: {type(e).__name__}: {e}")
+        return None
+
+
+def _reconcile_recovered_positions(client: Client, kp: Optional[Keypair]) -> None:
+    if PAPER_TRADING or not kp or not positions:
+        return
+    owner = str(kp.pubkey())
+    changed = False
+    for mint, pos in list(positions.items()):
+        bal = _wallet_token_raw_balance(owner, mint)
+        if bal is None:
+            continue
+        if bal <= 0:
+            log(f"  POSITION RECONCILE DROP {mint[:8]}: wallet has zero tokens")
+            positions.pop(mint, None)
+            changed = True
+            continue
+        expected = pos.token_amount * max(pos.remaining_pct, 0.0)
+        if expected <= 0 or abs(bal - expected) / max(expected, 1.0) > 0.05:
+            log(f"  POSITION RECONCILE {mint[:8]}: state_qty={expected:.0f}, wallet_qty={bal}")
+            pos.token_amount = float(bal)
+            pos.remaining_pct = 1.0
+            changed = True
+    if changed:
+        _persist_positions()
+
+
+def _store_open_position(pos: Position) -> None:
+    positions[pos.mint] = pos
+    _positions_closing.discard(pos.mint)
+    _persist_positions()
+
+
+def _remove_open_position(pos: Position) -> None:
+    if positions.get(pos.mint) is pos:
+        positions.pop(pos.mint, None)
+    elif pos.mint in positions and positions[pos.mint].open_time == pos.open_time:
+        positions.pop(pos.mint, None)
+    _positions_closing.discard(pos.mint)
+    _swarm_compound_locks.pop(pos.mint, None)
+    _persist_positions()
+
+
+def _daily_loss_limit_hit() -> bool:
+    if MAX_DAILY_LOSS_SOL <= 0:
+        return False
+    return daily_pnl_sol <= -MAX_DAILY_LOSS_SOL
+
+
+def _maybe_stop_for_daily_loss() -> None:
+    if not _daily_loss_limit_hit():
+        return
+    reason = daily_loss_halt_reason or f"daily loss limit hit ({daily_pnl_sol:+.4f} SOL)"
+    log(f"FATAL: {reason}; stopping bot")
+    _persist_positions()
+    if DAILY_LOSS_EXIT_ENABLED:
+        os._exit(0)
+
+
+def _position_open_for_compound(pos: Position) -> bool:
+    return (
+        positions.get(pos.mint) is pos
+        and pos.mint not in _positions_closing
+        and pos.remaining_pct > 0.01
+    )
+
+
+def _get_swarm_compound_lock(mint: str) -> asyncio.Lock:
+    lock = _swarm_compound_locks.get(mint)
+    if lock is None:
+        lock = asyncio.Lock()
+        _swarm_compound_locks[mint] = lock
+    return lock
 
 # V26: 38 ALL-VALIDATED smart wallets restored — every one has proven PnL > 0,
 # win rate >= 50%, hold >= 30s. Volume matters; the 50% curve cap (V24) handles
@@ -1031,6 +1245,11 @@ GRAD_TRAILING_ACTIVATION = float(os.environ.get("GRAD_TRAILING_ACTIVATION", "1.0
 GRAD_TRAILING_DISTANCE = float(os.environ.get("GRAD_TRAILING_DISTANCE", "0.96"))       # V41.13p: 0.92→0.96 — tighter trail captures more
 GRAD_SL_PCT = float(os.environ.get("GRAD_SL_PCT", "-0.07"))             # -7% — gap-cap (loss caps at $0.30/trade)
 GRAD_TIMEOUT_SEC = int(os.environ.get("GRAD_TIMEOUT_SEC", "90"))        # 90s — graduation FOMO is short
+GRAD_MANAGER_POLL_SEC = float(os.environ.get("GRAD_MANAGER_POLL_SEC", "2.0"))
+GRAD_COPY_FAST_POLL_SEC = float(os.environ.get("GRAD_COPY_FAST_POLL_SEC", "0.50"))
+GRAD_SWARM_POLL_SEC = float(os.environ.get("GRAD_SWARM_POLL_SEC", "0.25"))
+GRAD_JUPITER_FALLBACK_SEC = float(os.environ.get("GRAD_JUPITER_FALLBACK_SEC", "2.0"))
+GRAD_BC_CACHE_MAX_AGE_MS = int(os.environ.get("GRAD_BC_CACHE_MAX_AGE_MS", "1500"))
 # V41.12c: ST clean mid-curve tokens grow over minutes/hours, not seconds. Extended timeout.
 GRAD_TIMEOUT_ST_SEC = int(os.environ.get("GRAD_TIMEOUT_ST_SEC", "1800")) # 30 min hold for ST clean mints
 
@@ -1188,7 +1407,7 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             # V41.17 Fix #9: stamp signal time so manage_graduation_position can apply
             # the 8s no-pump time-stop without affecting non-copy-fast flows.
             pos.signal_time_ms = signal_time_ms
-            positions[mint] = pos
+            _store_open_position(pos)
             _record_entry_opened()
             asyncio.create_task(manage_graduation_position(client, kp, pos))
             return
@@ -1285,7 +1504,7 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
         pos.launchpad = launchpad
         # V41.17z4: stamp signal time so dead-peak guard works for grad lane too
         pos.signal_time_ms = int(time.time() * 1000)
-        positions[mint] = pos
+        _store_open_position(pos)
         _record_entry_opened()
         asyncio.create_task(manage_graduation_position(client, kp, pos))
     except Exception as e:
@@ -1303,7 +1522,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
     closed = False
     close_reason = ""
     open_time = pos.open_time
-    rung_hit = 0
+    rung_hit = pos.rung_hit
 
     def try_grad_sell(reason: str, fraction: float, multiplier: float) -> bool:
         nonlocal close_reason, closed
@@ -1311,49 +1530,75 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             close_reason = reason
             closed = True
             return True
+        will_close = fraction >= 0.999 or pos.remaining_pct * (1 - fraction) <= 0.01
+        if will_close:
+            _positions_closing.add(pos.mint)
         sol_recv = sell_token(kp, client, pos, fraction, current_multiplier=multiplier)
         if sol_recv is None:
+            if will_close:
+                _positions_closing.discard(pos.mint)
             log(f"  GRAD SELL FAILED ({reason}) {pos.mint[:8]} — keeping position")
             return False
         pos.realized_sol += sol_recv
         pos.remaining_pct *= (1 - fraction)
         close_reason = reason
-        if fraction >= 0.999 or pos.remaining_pct <= 0.01:
+        _persist_positions()
+        if will_close:
             closed = True
         return True
 
+    last_quote_check = 0.0
+
+    def poll_delay() -> float:
+        if pos.launchpad == "copy_fast_swarm":
+            return GRAD_SWARM_POLL_SEC
+        if pos.launchpad == "copy_fast":
+            return GRAD_COPY_FAST_POLL_SEC
+        return GRAD_MANAGER_POLL_SEC
+
+    async def current_price(force_quote: bool = False) -> Optional[tuple[float, str]]:
+        nonlocal last_quote_check
+        if pos.launchpad in ("copy_fast", "copy_fast_swarm"):
+            cached = _bc_cache_price_for_pos(pos)
+            if cached:
+                price, complete, age_ms = cached
+                if not complete:
+                    return price, f"bc_cache:{age_ms}ms"
+        now = time.time()
+        if (not force_quote
+                and pos.launchpad in ("copy_fast", "copy_fast_swarm")
+                and now - last_quote_check < GRAD_JUPITER_FALLBACK_SEC):
+            return None
+        last_quote_check = now
+        probe_qty = max(int(pos.token_amount * max(pos.remaining_pct, 0.01) * 0.01), 1)
+        quote = await asyncio.to_thread(jupiter_quote, pos.mint, SOL_MINT, probe_qty)
+        if not quote or float(quote.get("outAmount", 0)) == 0:
+            return None
+        return float(quote["outAmount"]) / probe_qty, "jupiter"
+
     while not closed:
         try:
-            elapsed = time.time() - open_time
+            now = time.time()
+            elapsed = now - open_time
             # V41.13-14: ST, grad-imminent, momentum, copy_fast entries have NO timeout.
             if pos.launchpad in ("st_pump", "grad_imminent", "momentum", "copy_fast"):
                 timeout_for_pos = float("inf")
             else:
                 timeout_for_pos = GRAD_TIMEOUT_SEC
-            if elapsed > timeout_for_pos:
-                # Get current price for accurate close
-                probe_qty = max(int(pos.token_amount * 0.01), 1)
-                quote = jupiter_quote(pos.mint, SOL_MINT, probe_qty)
-                if quote and float(quote.get("outAmount", 0)) > 0:
-                    cur_price = float(quote["outAmount"]) / probe_qty
-                    mult = cur_price / pos.entry_price if pos.entry_price else 1.0
-                else:
-                    mult = pos.last_price / pos.entry_price if pos.last_price > 0 else 1.0
-                if try_grad_sell(f"GRAD TIMEOUT {timeout_for_pos}s mult={mult:.2f}x", 1.0, mult):
-                    break
 
-            # Get current price via Jupiter probe (1% of position)
-            probe_qty = max(int(pos.token_amount * 0.01), 1)
-            quote = jupiter_quote(pos.mint, SOL_MINT, probe_qty)
-            if not quote or float(quote.get("outAmount", 0)) == 0:
-                # Jupiter route lost — wait and retry
-                await asyncio.sleep(3)
+            price_info = await current_price(force_quote=elapsed > timeout_for_pos)
+            if not price_info:
+                await asyncio.sleep(poll_delay())
                 continue
-            sol_per_unit = float(quote["outAmount"]) / probe_qty
+            sol_per_unit, price_source = price_info
             pos.last_price = sol_per_unit
             multiplier = sol_per_unit / pos.entry_price if pos.entry_price else 1.0
             if multiplier > pos.peak_price:
                 pos.peak_price = multiplier
+
+            if elapsed > timeout_for_pos:
+                if try_grad_sell(f"GRAD TIMEOUT {timeout_for_pos}s mult={multiplier:.2f}x src={price_source}", 1.0, multiplier):
+                    break
 
             # V41.17z2 DEAD-PEAK GUARD: 5s time-stop with peak<1.005x threshold.
             # Empirical pattern across 6 live trades (2W/4L):
@@ -1372,7 +1617,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # are typically over within 30-60s; cap exposure)
             if (pos.launchpad == "copy_fast_swarm"
                     and pos.signal_time_ms > 0
-                    and (time.time() * 1000 - pos.signal_time_ms) > 30_000):
+                    and (now * 1000 - pos.signal_time_ms) > 30_000):
                 if try_grad_sell(
                     f"GRAD SWARM-TIMEOUT 30s exit (peak={pos.peak_price:.3f}x mult={multiplier:.3f}x)",
                     1.0, multiplier,
@@ -1382,13 +1627,15 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                                   "grad_imminent", "momentum", "st_pump")
                     and pos.signal_time_ms > 0
                     and pos.peak_price < DEAD_PEAK_THRESHOLD):
-                age_s = (time.time() * 1000 - pos.signal_time_ms) / 1000
+                age_s = (now * 1000 - pos.signal_time_ms) / 1000
                 if age_s > DEAD_PEAK_TIME_SEC:
                     if try_grad_sell(
                         f"GRAD DEAD-PEAK exit (age={age_s:.1f}s peak={pos.peak_price:.3f}x mult={multiplier:.3f}x)",
                         1.0, multiplier,
                     ):
                         break
+                    await asyncio.sleep(poll_delay())
+                    continue
 
             # V41.13o + V41.14d: TRAILING STOP with slippage protection.
             # Empirical: full-position sell into $5-15k pool slips 2-5%. If trail floor is
@@ -1421,10 +1668,12 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     log(f"  GRAD TP RUNG {rung_hit+1} ({pos.launchpad}) mult={multiplier:.2f}x trigger={effective_trigger:.2f}x: selling {sell_frac*100:.0f}% of remaining")
                     if try_grad_sell(f"GRAD TP RUNG {rung_hit+1} mult={multiplier:.2f}x", sell_frac, multiplier):
                         rung_hit += 1
+                        pos.rung_hit = rung_hit
+                        _persist_positions()
                         if pos.remaining_pct <= 0.01:
                             break
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(poll_delay())
         except Exception as e:
             log(f"  manage_graduation_position err: {e}")
             await asyncio.sleep(5)
@@ -1433,8 +1682,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
     _record_trade_close(pnl)
     log(f"  CLOSED GRAD {pos.mint[:8]} peak={pos.peak_price:.2f}x recv={pos.realized_sol:.4f} cost={pos.entry_amount_sol:.4f} "
         f"pnl={pnl:+.4f} SOL | session={session_pnl_sol:+.4f} W={session_wins} L={session_losses} reason={close_reason}")
-    if pos.mint in positions:
-        del positions[pos.mint]
+    _remove_open_position(pos)
+    _maybe_stop_for_daily_loss()
 
 
 async def handle_smart_wallet_sell(client: Client, kp: Optional[Keypair], wallet: str, sig: str):
@@ -1593,7 +1842,8 @@ async def cobuy_snipe(client: Client, kp: Optional[Keypair], mint: str, smart_na
             pos.entry_progress = progress
             pos.quality_score = quality_score
             pos.entry_size_sol = amount_sol
-            positions[mint] = pos
+            _store_open_position(pos)
+            _record_entry_opened()
             asyncio.create_task(manage_position(client, kp, pos))
     except Exception as e:
         log(f"  cobuy_snipe err for {mint[:8]}: {e}")
@@ -2574,7 +2824,8 @@ async def evaluate_and_snipe(client: Client, kp: Optional[Keypair], mint: str):
             pos.entry_progress = curve_progress
             pos.quality_score = quality_score
             pos.entry_size_sol = amount_sol
-            positions[mint] = pos
+            _store_open_position(pos)
+            _record_entry_opened()
             asyncio.create_task(manage_position(client, kp, pos))
     except Exception as e:
         log(f"  eval err for {mint[:8]}: {e}")
@@ -2699,6 +2950,7 @@ async def manage_position(client: Client, kp: Optional[Keypair], pos: Position):
                     if add_pos:
                         merge_position_add(pos, add_pos)
                         pos.adds_done += 1
+                        _persist_positions()
                         multiplier = current_price / pos.entry_price if pos.entry_price else multiplier
                         log(f"  SCALE-IN DONE {pos.mint[:8]} total_cost={pos.entry_amount_sol:.4f} avg_entry={pos.entry_price:.6e}")
 
@@ -2816,8 +3068,8 @@ async def manage_position(client: Client, kp: Optional[Keypair], pos: Position):
     log(f"  CLOSED {pos.mint[:8]} strategy={pos.strategy} peak={pos.peak_price:.2f}x recv={pos.realized_sol:.4f} cost={pos.entry_amount_sol:.4f} "
         f"pnl={pnl:+.4f} SOL | session={session_pnl_sol:+.4f} W={session_wins} L={session_losses} "
         f"reason={close_reason}")
-    if pos.mint in positions:
-        del positions[pos.mint]
+    _remove_open_position(pos)
+    _maybe_stop_for_daily_loss()
 
 
 async def session_reporter():
@@ -2825,7 +3077,8 @@ async def session_reporter():
     while True:
         await asyncio.sleep(60)
         log(f"=== SESSION: pnl={session_pnl_sol:+.4f} SOL | W={session_wins} L={session_losses} | "
-            f"open={len(positions)} | dump_watch={len(dump_bounce_active)} | consec_loss={consec_losses} ===")
+            f"daily={daily_pnl_sol:+.4f}/{-MAX_DAILY_LOSS_SOL:.4f} SOL | open={len(positions)} | "
+            f"dump_watch={len(dump_bounce_active)} | consec_loss={consec_losses} ===")
         # V41.15c: copy-trade pipeline diagnostics — see where shreds are dropped
         s = _copy_trade_stats
         if s["shreds"] > 0:
@@ -3443,7 +3696,7 @@ async def cobuy_snipe(client: Client, kp: Optional[Keypair], mint: str, smart_na
             pos.entry_progress = progress
             pos.quality_score = quality_score
             pos.entry_size_sol = amount_sol
-            positions[mint] = pos
+            _store_open_position(pos)
             _record_entry_opened()
             asyncio.create_task(manage_position(client, kp, pos))
     except Exception as e:
@@ -3597,7 +3850,7 @@ async def evaluate_and_snipe(client: Client, kp: Optional[Keypair], mint: str):
             pos.entry_progress = progress
             pos.quality_score = quality_score
             pos.entry_size_sol = amount_sol
-            positions[mint] = pos
+            _store_open_position(pos)
             _record_entry_opened()
             asyncio.create_task(manage_position(client, kp, pos))
     except Exception as e:
@@ -3624,15 +3877,21 @@ async def manage_position(client: Client, kp: Optional[Keypair], pos: Position):
             close_reason = reason
             closed = True
             return True
+        will_close = fraction >= 0.999 or pos.remaining_pct * (1 - fraction) <= 0.01
+        if will_close:
+            _positions_closing.add(pos.mint)
         sol_recv = sell_token(kp, client, pos, fraction, current_multiplier=multiplier)
         if not safe_record_sell(pos, sol_recv):
+            if will_close:
+                _positions_closing.discard(pos.mint)
             sell_failures += 1
             log(f"  SELL FAILED but V40 keeps position open ({reason}); failures={sell_failures}")
             return False
         pos.remaining_pct *= (1 - fraction)
         sell_failures = 0
         close_reason = reason
-        if fraction >= 0.999 or pos.remaining_pct <= 0.01:
+        _persist_positions()
+        if will_close:
             closed = True
         return True
 
@@ -3732,6 +3991,7 @@ async def manage_position(client: Client, kp: Optional[Keypair], pos: Position):
                         if add_pos:
                             merge_position_add(pos, add_pos)
                             pos.adds_done += 1
+                            _persist_positions()
                             multiplier = current_price / pos.entry_price if pos.entry_price else multiplier
 
             # V41.17j: Fix #9 ported into V40. 8s no-pump time-stop catches the dead-peak
@@ -3809,7 +4069,8 @@ async def manage_position(client: Client, kp: Optional[Keypair], pos: Position):
     pnl = pos.realized_sol - pos.entry_amount_sol
     _record_trade_close(pnl)
     log(f"  CLOSED V40 {pos.mint[:8]} strategy={pos.strategy} peak={pos.peak_price:.2f}x recv={pos.realized_sol:.4f} cost={pos.entry_amount_sol:.4f} pnl={pnl:+.4f} SOL | session={session_pnl_sol:+.4f} W={session_wins} L={session_losses} reason={close_reason}")
-    positions.pop(pos.mint, None)
+    _remove_open_position(pos)
+    _maybe_stop_for_daily_loss()
 
 
 # V41.6: PumpPortal parallel migration detector.
@@ -4878,6 +5139,25 @@ def _compute_trend_5s_for_mint(mint: str) -> Optional[float]:
     return (last - first) / first
 
 
+def _bc_cache_price_for_pos(pos: Position) -> Optional[tuple[float, bool, int]]:
+    """Return (price, complete, age_ms) from the multiplexed ST BondingCurve cache."""
+    try:
+        if not pos.bc_pda:
+            return None
+        items = list(_bc_state_cache.get(str(pos.bc_pda), ()))
+        if not items:
+            return None
+        latest = items[-1]
+        ts_ms, vsol, vtoken = latest[0], latest[1], latest[2]
+        complete = bool(latest[3]) if len(latest) > 3 else False
+        age_ms = int(time.time() * 1000) - int(ts_ms)
+        if age_ms > GRAD_BC_CACHE_MAX_AGE_MS or not vtoken:
+            return None
+        return (float(vsol) / float(vtoken), complete, age_ms)
+    except Exception:
+        return None
+
+
 async def pump_program_bc_listener():
     """V41.17z: programSubscribe to pump.fun BondingCurve accounts (memcmp filter).
     Populates _bc_state_cache so copy_fast can read pre-entry trend in <1ms.
@@ -4928,7 +5208,8 @@ async def pump_program_bc_listener():
                             continue
                         vtoken = struct.unpack_from("<Q", raw_bytes, 0x08)[0]
                         vsol = struct.unpack_from("<Q", raw_bytes, 0x10)[0]
-                        _bc_state_cache[pubkey].append((int(time.time() * 1000), vsol, vtoken))
+                        complete = raw_bytes[48] != 0 if len(raw_bytes) > 48 else False
+                        _bc_state_cache[pubkey].append((int(time.time() * 1000), vsol, vtoken, complete))
                     except Exception:
                         continue
         except Exception as e:
@@ -5113,25 +5394,61 @@ async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
     """V41.17z8: when SWARM-N detected within 30s of an open position's entry,
     add to it. Half-size for SWARM-2 (0.025 SOL), full-size for SWARM-3+ (0.05).
     Uses merge_position_add — token-weighted average entry, never averages down."""
-    pos = positions.get(mint)
-    if not pos:
-        return
-    if (pos.adds_done or 0) >= 2:
-        return  # already compounded twice — cap
+    lock = _get_swarm_compound_lock(mint)
+    reserved = False
+    pos = None
+    async with lock:
+        pos = positions.get(mint)
+        if not pos or not _position_open_for_compound(pos):
+            return
+        if (pos.adds_done or 0) >= 2:
+            return  # already compounded twice — cap
+        age_s = time.time() - pos.open_time
+        if age_s >= 30 or pos.peak_price < 0.95:
+            return
+        pos.adds_done = (pos.adds_done or 0) + 1
+        reserved = True
+        _persist_positions()
     add_amount = GRAD_AMOUNT_SOL * 0.5 if swarm_size == 2 else GRAD_AMOUNT_SOL
-    log(f"  SWARM-COMPOUND {mint[:8]} (SWARM-{swarm_size}): adding {add_amount:.4f} SOL on {signer[:8]}")
+    log(f"  SWARM-COMPOUND {mint[:8]} (SWARM-{swarm_size}): reserved add #{pos.adds_done}, "
+        f"adding {add_amount:.4f} SOL on {signer[:8]}")
+
+    async def rollback_reservation() -> None:
+        nonlocal reserved
+        if not reserved:
+            return
+        async with lock:
+            current = positions.get(mint)
+            if current is pos and (current.adds_done or 0) > 0:
+                current.adds_done = max(0, (current.adds_done or 0) - 1)
+                _persist_positions()
+        reserved = False
+
     try:
         add_pos = await asyncio.to_thread(buy_token, kp, client, mint, add_amount)
     except Exception as e:
         log(f"  SWARM-COMPOUND BUY FAILED {mint[:8]}: {type(e).__name__}: {e}")
+        await rollback_reservation()
         return
     if not add_pos:
         log(f"  SWARM-COMPOUND BUY FAILED {mint[:8]} (no pos returned)")
+        await rollback_reservation()
         return
-    merge_position_add(pos, add_pos)
-    pos.adds_done = (pos.adds_done or 0) + 1
-    log(f"  SWARM-COMPOUND DONE {mint[:8]}: total exposure now {pos.entry_amount_sol:.4f} SOL "
-        f"(adds={pos.adds_done})")
+    async with lock:
+        current = positions.get(mint)
+        if current is not pos or not _position_open_for_compound(current):
+            log(f"  SWARM-COMPOUND POST-CLOSE {mint[:8]}: add filled after close; not merging")
+            current = None
+        else:
+            merge_position_add(current, add_pos)
+            _persist_positions()
+            reserved = False
+            log(f"  SWARM-COMPOUND DONE {mint[:8]}: total exposure now {current.entry_amount_sol:.4f} SOL "
+                f"(adds={current.adds_done})")
+    if current is None:
+        if not PAPER_TRADING:
+            await asyncio.to_thread(sell_token, kp, client, add_pos, 1.0, 1.0)
+        await rollback_reservation()
 
 
 async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
@@ -5169,7 +5486,7 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
             # mint that's young and not crashed, add to it. Caps at 2 compounds
             # per position to prevent runaway size on extended pumps.
             existing = positions.get(mint)
-            if (existing and (existing.adds_done or 0) < 2):
+            if (existing and _position_open_for_compound(existing) and (existing.adds_done or 0) < 2):
                 age_s = time.time() - existing.open_time
                 if age_s < 30 and existing.peak_price >= 0.95:
                     asyncio.create_task(_swarm_compound_position(
@@ -5691,7 +6008,8 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                                         continue
                                     vtoken = struct.unpack_from("<Q", raw_bytes, 0x08)[0]
                                     vsol = struct.unpack_from("<Q", raw_bytes, 0x10)[0]
-                                    _bc_state_cache[pubkey].append((int(time.time() * 1000), vsol, vtoken))
+                                    complete = raw_bytes[48] != 0 if len(raw_bytes) > 48 else False
+                                    _bc_state_cache[pubkey].append((int(time.time() * 1000), vsol, vtoken, complete))
                                 except Exception:
                                     continue
                 else:
@@ -5726,9 +6044,38 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
             await asyncio.sleep(15)
 
 
+async def wallet_balance_monitor(client: Client, kp: Optional[Keypair]):
+    if PAPER_TRADING or not kp:
+        return
+    while True:
+        try:
+            balance = await asyncio.to_thread(lambda: client.get_balance(kp.pubkey()).value / 10**9)
+            if balance < MIN_WALLET_BALANCE_SOL:
+                log(f"FATAL: wallet balance {balance:.4f} SOL < {MIN_WALLET_BALANCE_SOL:.4f} SOL; stopping bot")
+                _persist_positions()
+                os._exit(0)
+        except Exception as e:
+            log(f"wallet balance monitor err: {type(e).__name__}: {e}")
+        await asyncio.sleep(WALLET_BALANCE_CHECK_SEC)
+
+
+def _resume_recovered_position_managers(client: Client, kp: Optional[Keypair]) -> None:
+    grad_launchpads = {
+        "copy_fast", "copy_fast_swarm", "pump", "bonk", "bonk_pregrad",
+        "grad_imminent", "momentum", "st_pump",
+    }
+    for pos in list(positions.values()):
+        if pos.strategy == "graduation" or pos.launchpad in grad_launchpads:
+            asyncio.create_task(manage_graduation_position(client, kp, pos))
+        else:
+            asyncio.create_task(manage_position(client, kp, pos))
+
+
 async def main():
     if PAPER_TRADING:
         log("PAPER MODE ON — no real trades will be executed")
+    else:
+        log("LIVE MODE ON — real swaps enabled")
     kp = load_keypair()
     if not PAPER_TRADING and not kp:
         log("FATAL: live mode requires SOLANA_PRIVATE_KEY env var")
@@ -5752,9 +6099,14 @@ async def main():
                 log("WARNING: low balance, tiny-cap mode enabled")
         except Exception:
             pass
+    restored = _load_positions_state()
+    _reconcile_recovered_positions(client, kp)
+    if _daily_loss_limit_hit():
+        log(f"FATAL: daily loss limit already hit ({daily_pnl_sol:+.4f} SOL / -{MAX_DAILY_LOSS_SOL:.4f} SOL); not starting")
+        return
     log(f"Mode: V40 impulse-tape sniper | core={CORE_AMOUNT_SOL:.4f} scout={SCOUT_AMOUNT_SOL:.4f} scale={SCALE_IN_AMOUNT_SOL:.4f} paper_drag={PAPER_ROUND_TRIP_DRAG_BPS}bps")
     log(f"V40 rules: no micro-noise | TP on current price | scale-in after TP only | account_stream={USE_POSITION_ACCOUNT_STREAM}")
-    log(f"Max concurrent: {MAX_CONCURRENT_POSITIONS} | Session loss limit: {MAX_SESSION_LOSS_SOL} SOL")
+    log(f"Max concurrent: {MAX_CONCURRENT_POSITIONS} | Session loss limit: {MAX_SESSION_LOSS_SOL} SOL | Daily loss limit: {MAX_DAILY_LOSS_SOL} SOL")
     log(f"=== V41.5 ARCHITECTURAL TIGHTENING ===")
     log(f"  Grad gate: +40% to +50% momentum (was +5% to +50%)")
     log(f"  Grad SL: {GRAD_SL_PCT*100:.0f}% (was -12%)")
@@ -5765,6 +6117,7 @@ async def main():
     log(f"  Daily trade cap: {MAX_TRADES_PER_DAY}")
     log(f"  Streak pause: {LOSS_STREAK_PAUSE_SEC}s after {LOSS_STREAK_PAUSE_THRESHOLD} consec losses")
     log(f"  Hard halts: -{MAX_SESSION_LOSS_SOL*1e3:.1f} mSOL session OR {MAX_CONSEC_LOSSES} consec losses")
+    log(f"  Daily loss halt: -{MAX_DAILY_LOSS_SOL:.4f} SOL/24h | live min wallet balance: {MIN_WALLET_BALANCE_SOL:.4f} SOL")
     log(f"  Win classifier: pnl > {MIN_REAL_WIN_SOL:.4f} SOL (paper break-even = LOSS)")
     log(f"=========================================")
     log(f"=== V41.7-13 ADDITIONS ===")
@@ -5854,6 +6207,10 @@ async def main():
     asyncio.create_task(solanatracker_poll_latest(client, kp))
     # V41.17 Fix #1: pre-cache risk for hot-path lookup
     asyncio.create_task(refresh_risk_cache())
+    if restored:
+        _resume_recovered_position_managers(client, kp)
+    if not PAPER_TRADING and kp:
+        asyncio.create_task(wallet_balance_monitor(client, kp))
     # V41.17x: rebuild active sniper pool every hour
     asyncio.create_task(active_sniper_refresh_loop())
     # V41.17z: BondingCurve programSubscribe is now MULTIPLEXED on the same WS as
