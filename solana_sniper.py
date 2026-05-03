@@ -1336,12 +1336,12 @@ MARKET_TAPE_FAST_KILL_PEAK = float(os.environ.get("MARKET_TAPE_FAST_KILL_PEAK", 
 MARKET_TAPE_TIMEOUT_SEC = float(os.environ.get("MARKET_TAPE_TIMEOUT_SEC", "25"))
 MARKET_TAPE_SCOUT_ENABLED = os.environ.get("MARKET_TAPE_SCOUT_ENABLED", "1") == "1"
 MARKET_TAPE_SCOUT_AMOUNT_SOL = float(os.environ.get("MARKET_TAPE_SCOUT_AMOUNT_SOL", "0.00625"))
-MARKET_TAPE_SCOUT_MIN_BC_MOVE = float(os.environ.get("MARKET_TAPE_SCOUT_MIN_BC_MOVE", "1.055"))
+MARKET_TAPE_SCOUT_MIN_BC_MOVE = float(os.environ.get("MARKET_TAPE_SCOUT_MIN_BC_MOVE", "1.015"))
 MARKET_TAPE_SCOUT_MAX_BC_MOVE = float(os.environ.get("MARKET_TAPE_SCOUT_MAX_BC_MOVE", "1.100"))
 MARKET_TAPE_SCOUT_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_SCOUT_MIN_UNIQUE", "5"))
-MARKET_TAPE_SCOUT_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_SCOUT_MIN_TRACKED", "1"))
+MARKET_TAPE_SCOUT_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_SCOUT_MIN_TRACKED", "2"))
 MARKET_TAPE_SCOUT_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_SCOUT_MIN_BUY_SOL", "2.0"))
-MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT", "1.006"))
+MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT", "1.003"))
 MARKET_TAPE_SCOUT_TP_MULT = float(os.environ.get("MARKET_TAPE_SCOUT_TP_MULT", "1.045"))
 MARKET_TAPE_SCOUT_FAST_KILL_SEC = float(os.environ.get("MARKET_TAPE_SCOUT_FAST_KILL_SEC", "2.0"))
 MARKET_TAPE_SCOUT_FAST_KILL_PEAK = float(os.environ.get("MARKET_TAPE_SCOUT_FAST_KILL_PEAK", "1.012"))
@@ -3289,6 +3289,14 @@ async def session_reporter():
                 f"confirm_dump={s.get('confirm_dump_blocked', 0)} "
                 f"mt_seen={s.get('market_tape_seen', 0)} mt_trig={s.get('market_tape_triggers', 0)} "
                 f"mt_ent={s.get('market_tape_entered', 0)} mt_blk={s.get('market_tape_blocked', 0)} ===")
+            log(f"=== MARKET-TAPE-GATES: pos={s.get('mt_pos', 0)} cd={s.get('mt_cooldown', 0)} "
+                f"rate={s.get('mt_rate', 0)} uniq={s.get('mt_no_unique', 0)} "
+                f"tracked={s.get('mt_no_tracked', 0)} flow={s.get('mt_flow', 0)} "
+                f"no_bc={s.get('mt_no_bc', 0)} complete={s.get('mt_complete', 0)} "
+                f"bc_rng={s.get('mt_bc_range', 0)} low={s.get('mt_weak_low', 0)} "
+                f"mid={s.get('mt_weak_mid', 0)} no_px={s.get('mt_no_price', 0)} "
+                f"ratio={s.get('mt_ratio', 0)} close={s.get('mt_recent_close', 0)} "
+                f"confirm={s.get('mt_confirm', 0)} trig={s.get('market_tape_triggers', 0)} ===")
 
 
 # === MAIN ===
@@ -4886,6 +4894,10 @@ _copy_trade_stats = {
 }
 
 
+def _mt_gate(name: str) -> None:
+    _copy_trade_stats[name] = _copy_trade_stats.get(name, 0) + 1
+
+
 def _evaluate_risk(snap: dict) -> tuple[bool, str]:
     """V41.17: apply rejection rules to a risk snapshot. Used by both cached
     and live paths. Empirically-tuned thresholds (V41.16b research):
@@ -6064,14 +6076,17 @@ async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], min
         blocked, why = _entry_circuit_breakers_open()
         if blocked:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_entry_halt")
             graduated_seen.discard(mint)
             log(f"  {label} HALT {mint[:8]}: {why}")
             return
         if mint in positions:
+            _mt_gate("mt_pos")
             graduated_seen.discard(mint)
             return
         if not _claim_entry_mint(mint, launchpad):
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_entry_claim")
             graduated_seen.discard(mint)
             return
         claimed_entry = True
@@ -6101,6 +6116,7 @@ async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], min
             pos = await asyncio.to_thread(buy_token, kp, client, mint, amount_sol)
         if not pos:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_entry_buy_fail")
             graduated_seen.discard(mint)
             _release_entry_mint(mint)
             log(f"  {label} BUY FAILED {mint[:8]}")
@@ -6120,6 +6136,7 @@ async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], min
         if claimed_entry:
             _release_entry_mint(mint)
         _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        _mt_gate("mt_entry_err")
         graduated_seen.discard(mint)
         log(f"  MARKET-TAPE ENTRY ERR {mint[:8]}: {type(e).__name__}: {e}")
 
@@ -6155,11 +6172,14 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
     # awaits slow checks; market_tape must still be allowed to fire if clustered
     # flow proves up before the copy confirm gate does.
     if mint in positions or mint in _positions_closing:
+        _mt_gate("mt_pos")
         return
     _market_tape_cleanup(now_ms)
     if now_ms - _market_tape_entered_recent.get(mint, 0) < MARKET_TAPE_COOLDOWN_SEC * 1000:
+        _mt_gate("mt_cooldown")
         return
     if _market_tape_rate_limited(now_ms):
+        _mt_gate("mt_rate")
         return
 
     cutoff = now_ms - MARKET_TAPE_WINDOW_MS
@@ -6173,14 +6193,18 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
     buy_sol = sum(e["sol"] for e in buys)
     sell_sol = sum(e["sol"] for e in sells)
     if len(unique_buyers) < MARKET_TAPE_MIN_UNIQUE:
+        _mt_gate("mt_no_unique")
         return
     if len(tracked_buyers) < MARKET_TAPE_MIN_TRACKED:
+        _mt_gate("mt_no_tracked")
         return
     if buy_sol < MARKET_TAPE_MIN_BUY_SOL or sell_sol > MARKET_TAPE_MAX_SELL_SOL:
+        _mt_gate("mt_flow")
         return
     ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
     if ratio_block_until > now_ms:
         _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        _mt_gate("mt_ratio")
         log(f"  MARKET-TAPE BLOCK {mint[:8]}: recent price_ratio violation "
             f"cooldown {(ratio_block_until - now_ms) / 1000:.1f}s")
         return
@@ -6190,11 +6214,14 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         MARKET_TAPE_BC_CACHE_MAX_AGE_MS,
     )
     if not bc_move:
+        _mt_gate("mt_no_bc")
         return
     move_mult, age_ms, complete = bc_move
     if complete:
+        _mt_gate("mt_complete")
         return
     if move_mult < MARKET_TAPE_MIN_BC_MOVE or move_mult > MARKET_TAPE_MAX_BC_MOVE:
+        _mt_gate("mt_bc_range")
         return
     entry_launchpad = "market_tape"
     entry_amount_sol = MARKET_TAPE_AMOUNT_SOL
@@ -6212,8 +6239,9 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
          and len(tracked_buyers) >= MARKET_TAPE_LOW_MOVE_MIN_TRACKED)
         or buy_sol >= MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL
     )
-    if move_mult < MARKET_TAPE_LOW_MOVE_STRONG_BELOW and not strong_low_move:
+    if move_mult < MARKET_TAPE_LOW_MOVE_STRONG_BELOW and not (scout_ok or strong_low_move):
         _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        _mt_gate("mt_weak_low")
         log(f"  MARKET-TAPE BLOCK {mint[:8]}: weak low-move setup "
             f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
             f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
@@ -6231,12 +6259,14 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             confirm_min_mult = MARKET_TAPE_SCOUT_CONFIRM_MIN_MULT
         elif not strong_mid_move:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_weak_mid")
             log(f"  MARKET-TAPE BLOCK {mint[:8]}: weak mid-move setup "
                 f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
                 f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
             return
     latest_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
     if not latest_price:
+        _mt_gate("mt_no_price")
         return
     trader_price = float(trade.get("trader_price") or 0)
     if trader_price > 0:
@@ -6244,12 +6274,14 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         if price_ratio < MARKET_TAPE_MIN_PRICE_RATIO or price_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
             _market_tape_ratio_violation_until[mint] = now_ms + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_ratio")
             log(f"  MARKET-TAPE BLOCK {mint[:8]}: price_ratio={price_ratio:.3f}x "
                 f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x "
                 f"bc={move_mult:.3f}x")
             return
     if _mint_recently_closed(mint, now_ms / 1000.0):
         _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        _mt_gate("mt_recent_close")
         log(f"  MARKET-TAPE BLOCK {mint[:8]}: closed within "
             f"{RECENT_CLOSE_REENTRY_COOLDOWN_SEC:.0f}s cooldown")
         return
@@ -6259,12 +6291,14 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         confirm_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
         if not confirm_price or confirm_price[1]:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_confirm")
             log(f"  MARKET-TAPE BLOCK {mint[:8]}: no fresh confirm price after "
                 f"{MARKET_TAPE_CONFIRM_DELAY_SEC:.2f}s")
             return
         confirm_mult = confirm_price[0] / trigger_price if trigger_price > 0 else 0.0
         if confirm_mult < confirm_min_mult:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_confirm")
             log(f"  MARKET-TAPE BLOCK {mint[:8]}: confirm_mult={confirm_mult:.3f}x "
                 f"< {confirm_min_mult:.3f}x after {MARKET_TAPE_CONFIRM_DELAY_SEC:.2f}s")
             return
@@ -6273,6 +6307,7 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             if confirm_ratio < MARKET_TAPE_MIN_PRICE_RATIO or confirm_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
                 _market_tape_ratio_violation_until[mint] = int(time.time() * 1000) + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
                 _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                _mt_gate("mt_ratio")
                 log(f"  MARKET-TAPE BLOCK {mint[:8]}: confirm price_ratio={confirm_ratio:.3f}x "
                     f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
                 return
@@ -6280,6 +6315,7 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
         if ratio_block_until > post_confirm_ms:
             _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_ratio")
             log(f"  MARKET-TAPE BLOCK {mint[:8]}: concurrent price_ratio violation "
                 f"cooldown {(ratio_block_until - post_confirm_ms) / 1000:.1f}s")
             return
