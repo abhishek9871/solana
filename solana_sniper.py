@@ -1314,7 +1314,7 @@ COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_SOLO_ROCK
 COPY_FAST_SOLO_ROCKET_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TIMEOUT_SEC", "8.0"))
 ALPHA_LEARNER_ENABLED = os.environ.get("ALPHA_LEARNER_ENABLED", "1") == "1"
 ALPHA_ADAPTIVE_ENTRY_ENABLED = os.environ.get("ALPHA_ADAPTIVE_ENTRY_ENABLED", "1") == "1"
-ALPHA_EXPLORATION_ENABLED = os.environ.get("ALPHA_EXPLORATION_ENABLED", "1") == "1"
+ALPHA_EXPLORATION_ENABLED = os.environ.get("ALPHA_EXPLORATION_ENABLED", "0") == "1"
 ALPHA_SHADOW_MARKET_TAPE = os.environ.get("ALPHA_SHADOW_MARKET_TAPE", "1") == "1"
 ALPHA_MAX_PENDING_SHADOWS = int(os.environ.get("ALPHA_MAX_PENDING_SHADOWS", "120"))
 ALPHA_SIGNAL_COOLDOWN_MS = int(os.environ.get("ALPHA_SIGNAL_COOLDOWN_MS", "2500"))
@@ -7948,8 +7948,8 @@ async def main():
         log(f"=== V41.20 EXECUTABLE-ALPHA LEARNER ===")
         log(f"  Shadows copy/tape signals for 1/2/5/10s outcomes, persists to {ALPHA_STATE_FILE}.")
         log(f"  Adaptive copy_fast_alpha: scout={COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL:.4f} SOL "
-            f"explore {COPY_FAST_ALPHA_EXPLORATION_MIN_MULT:.2f}-{COPY_FAST_ALPHA_EXPLORATION_MAX_MULT:.2f}x "
-            f"on SWARM-2; core={COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL after "
+            f"{'spends on exploration' if ALPHA_EXPLORATION_ENABLED else 'exploration is shadow-only'}; "
+            f"core={COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL after "
             f"{ALPHA_MIN_SAMPLES}+ samples, WR>={ALPHA_PROMOTE_MIN_WR:.0%}, "
             f"avg_best>={ALPHA_PROMOTE_MIN_AVG_BEST_NET:+.1%}; live mult must be "
             f">={COPY_FAST_ALPHA_MIN_ENTRY_MULT:.3f}x and near peak.")
