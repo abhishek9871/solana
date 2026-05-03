@@ -5040,6 +5040,32 @@ def _parse_shred_for_pump_buy(shred_result: dict, trader_set: set) -> Optional[d
         return None
 
 
+async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
+                                   mint: str, swarm_size: int, signer: str):
+    """V41.17z8: when SWARM-N detected within 30s of an open position's entry,
+    add to it. Half-size for SWARM-2 (0.025 SOL), full-size for SWARM-3+ (0.05).
+    Uses merge_position_add — token-weighted average entry, never averages down."""
+    pos = positions.get(mint)
+    if not pos:
+        return
+    if (pos.adds_done or 0) >= 2:
+        return  # already compounded twice — cap
+    add_amount = GRAD_AMOUNT_SOL * 0.5 if swarm_size == 2 else GRAD_AMOUNT_SOL
+    log(f"  SWARM-COMPOUND {mint[:8]} (SWARM-{swarm_size}): adding {add_amount:.4f} SOL on {signer[:8]}")
+    try:
+        add_pos = await asyncio.to_thread(buy_token, kp, client, mint, add_amount)
+    except Exception as e:
+        log(f"  SWARM-COMPOUND BUY FAILED {mint[:8]}: {type(e).__name__}: {e}")
+        return
+    if not add_pos:
+        log(f"  SWARM-COMPOUND BUY FAILED {mint[:8]} (no pos returned)")
+        return
+    merge_position_add(pos, add_pos)
+    pos.adds_done = (pos.adds_done or 0) + 1
+    log(f"  SWARM-COMPOUND DONE {mint[:8]}: total exposure now {pos.entry_amount_sol:.4f} SOL "
+        f"(adds={pos.adds_done})")
+
+
 async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                                 signer: str, mint: str, trader_price: float, source: str):
     """V41.17i: shared gate cascade for both fast (shred) and slow (getTransaction) paths.
@@ -5071,6 +5097,15 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
             _copy_trade_stats["swarm_detected"] = _copy_trade_stats.get("swarm_detected", 0) + 1
             log(f"  *** SWARM-{len(recent_signers)} *** {mint[:8]}: {len(recent_signers)} pool wallets bought within 10s "
                 f"(last: {signer[:8]}, total signers in 60s: {len({s for s, _ in history})})")
+            # V41.17z8: COMPOUND on swarm — if we have an open position on this
+            # mint that's young and not crashed, add to it. Caps at 2 compounds
+            # per position to prevent runaway size on extended pumps.
+            existing = positions.get(mint)
+            if (existing and (existing.adds_done or 0) < 2):
+                age_s = time.time() - existing.open_time
+                if age_s < 30 and existing.peak_price >= 0.95:
+                    asyncio.create_task(_swarm_compound_position(
+                        client, kp, mint, len(recent_signers), signer))
         return
     mint_lc = mint.lower()
     if not (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
@@ -5664,6 +5699,10 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17z8 SWARM COMPOUND ===")
+    log(f"  When SWARM-N (>=2 pool wallets) on a mint we have an open position on,")
+    log(f"  ADD to position: 0.5x size for SWARM-2, 1x size for SWARM-3+. Cap 2 adds.")
+    log(f"  Token-weighted-avg entry (never averages down). 30s age window only.")
     log(f"=== V41.17z7 EXPANDED POOL + SWARM DETECTION ===")
     log(f"  Pool sample: {ACTIVE_SNIPER_GRAD_SAMPLE} mints x top {ACTIVE_SNIPER_TOP_N_PER_GRAD} traders, hits>={ACTIVE_SNIPER_MIN_GRAD_HITS}")
     log(f"  Sources: /tokens/multi/all (graduated+graduating+latest) + /tokens/trending/5m")
