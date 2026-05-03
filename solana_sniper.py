@@ -1271,6 +1271,12 @@ MARKET_TAPE_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_MAX_SELL_SOL", "0.0
 MARKET_TAPE_MIN_BC_MOVE = float(os.environ.get("MARKET_TAPE_MIN_BC_MOVE", "1.015"))
 MARKET_TAPE_MAX_BC_MOVE = float(os.environ.get("MARKET_TAPE_MAX_BC_MOVE", "1.35"))
 MARKET_TAPE_BC_CACHE_MAX_AGE_MS = int(os.environ.get("MARKET_TAPE_BC_CACHE_MAX_AGE_MS", "700"))
+MARKET_TAPE_MIN_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_MIN_PRICE_RATIO", "0.82"))
+MARKET_TAPE_MAX_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_MAX_PRICE_RATIO", "1.12"))
+MARKET_TAPE_LOW_MOVE_STRONG_BELOW = float(os.environ.get("MARKET_TAPE_LOW_MOVE_STRONG_BELOW", "1.04"))
+MARKET_TAPE_LOW_MOVE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_UNIQUE", "8"))
+MARKET_TAPE_LOW_MOVE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_TRACKED", "3"))
+MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL", "5.0"))
 MARKET_TAPE_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_COOLDOWN_SEC", "25"))
 MARKET_TAPE_MAX_ENTRIES_PER_MIN = int(os.environ.get("MARKET_TAPE_MAX_ENTRIES_PER_MIN", "18"))
 MARKET_TAPE_TP_MULT = float(os.environ.get("MARKET_TAPE_TP_MULT", "1.08"))
@@ -6008,6 +6014,27 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         return
     if move_mult < MARKET_TAPE_MIN_BC_MOVE or move_mult > MARKET_TAPE_MAX_BC_MOVE:
         return
+    strong_low_move = (
+        len(unique_buyers) >= MARKET_TAPE_LOW_MOVE_MIN_UNIQUE
+        or len(tracked_buyers) >= MARKET_TAPE_LOW_MOVE_MIN_TRACKED
+        or buy_sol >= MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL
+    )
+    if move_mult < MARKET_TAPE_LOW_MOVE_STRONG_BELOW and not strong_low_move:
+        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        log(f"  MARKET-TAPE BLOCK {mint[:8]}: weak low-move setup "
+            f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
+            f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
+        return
+    latest_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+    trader_price = float(trade.get("trader_price") or 0)
+    if latest_price and trader_price > 0:
+        price_ratio = latest_price[0] / trader_price
+        if price_ratio < MARKET_TAPE_MIN_PRICE_RATIO or price_ratio > MARKET_TAPE_MAX_PRICE_RATIO:
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            log(f"  MARKET-TAPE BLOCK {mint[:8]}: price_ratio={price_ratio:.3f}x "
+                f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x "
+                f"bc={move_mult:.3f}x")
+            return
 
     graduated_seen.add(mint)
     if len(graduated_seen) > 500:
@@ -6652,6 +6679,10 @@ async def main():
     log(f"  Curve gate: bc-cache move {MARKET_TAPE_MIN_BC_MOVE:.3f}x-{MARKET_TAPE_MAX_BC_MOVE:.3f}x, "
         f"cache <= {MARKET_TAPE_BC_CACHE_MAX_AGE_MS}ms. TP={MARKET_TAPE_TP_MULT:.3f}x, "
         f"fast-kill {MARKET_TAPE_FAST_KILL_SEC:.1f}s if peak<{MARKET_TAPE_FAST_KILL_PEAK:.3f}x.")
+    log(f"  Dump guard: price_ratio {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x; "
+        f"bc<{MARKET_TAPE_LOW_MOVE_STRONG_BELOW:.3f}x requires "
+        f"{MARKET_TAPE_LOW_MOVE_MIN_UNIQUE}+ unique or {MARKET_TAPE_LOW_MOVE_MIN_TRACKED}+ tracked "
+        f"or {MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL:.1f}+ SOL buy pressure.")
     log(f"=== V41.17zc/V41.18 DEAD-PEAK + CONFIRM-GATED SWARM ===")
     log(f"  Reverted fixed 3s sustain-wait; V41.18 uses price-confirm polling instead.")
     log(f"  SWARM-3+ rug overrides are candidates only until the confirm gate passes.")
