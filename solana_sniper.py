@@ -1300,7 +1300,7 @@ COPY_FAST_CONFIRM_MIN_SWARM = int(os.environ.get("COPY_FAST_CONFIRM_MIN_SWARM", 
 COPY_FAST_CONFIRM_SWARM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM_WINDOW_SEC", "10.0"))
 COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC", "1.0"))
 COPY_FAST_SWARM_ENTRY_ENABLED = os.environ.get("COPY_FAST_SWARM_ENTRY_ENABLED", "0") == "1"
-COPY_FAST_SOLO_ROCKET_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_ENABLED", "1") == "1"
+COPY_FAST_SOLO_ROCKET_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_ENABLED", "0") == "1"
 COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE = os.environ.get("COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE", "1") == "1"
 COPY_FAST_SOLO_ROCKET_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_MULT", "1.40"))
 COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT", "1.35"))
@@ -1341,6 +1341,8 @@ MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_
 MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SELL_SOL", "0.004"))
 MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
+MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT", "0.998"))
+MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET", "0.020"))
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
 MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
@@ -5310,30 +5312,47 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         _copy_trade_stats["alpha_toxic"] = _copy_trade_stats.get("alpha_toxic", 0) + 1
         return None
     if _alpha_promoted(pair_stat):
-        n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat)
+        n, wr, avg_best, avg_exit = _alpha_stat_view(pair_stat)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "quality": 6,
-            "reason": f"alpha_pair_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} ctx={context}",
+            "min_confirm_mult": (
+                MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
+                if avg_exit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
+                else MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT
+            ),
+            "reason": f"alpha_pair_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
+                      f"avg_exit={avg_exit:+.1%} ctx={context}",
         }
     if _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2) and _alpha_promoted(context_stat):
         wn, wwr, wavg, _wexit = _alpha_stat_view(wallet_stat)
-        cn, cwr, cavg, _cexit = _alpha_stat_view(context_stat)
+        cn, cwr, cavg, cexit = _alpha_stat_view(context_stat)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "quality": 6,
+            "min_confirm_mult": (
+                MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
+                if cexit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
+                else MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT
+            ),
             "reason": f"alpha_wallet_context w={wn}/{wwr:.0%}/{wavg:+.1%} "
-                      f"c={cn}/{cwr:.0%}/{cavg:+.1%} ctx={context}",
+                      f"c={cn}/{cwr:.0%}/{cavg:+.1%}/{cexit:+.1%} ctx={context}",
         }
     if _alpha_context_only_promoted(context_stat):
-        n, wr, avg_best, _avg_exit = _alpha_stat_view(context_stat)
+        n, wr, avg_best, avg_exit = _alpha_stat_view(context_stat)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "quality": 6,
-            "reason": f"alpha_context n={n} wr={wr:.0%} avg_best={avg_best:+.1%} ctx={context}",
+            "min_confirm_mult": (
+                MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
+                if avg_exit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
+                else MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT
+            ),
+            "reason": f"alpha_context n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
+                      f"avg_exit={avg_exit:+.1%} ctx={context}",
         }
     return None
 
@@ -6961,11 +6980,12 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
                     f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s")
                 return
             confirm_mult = float(confirm_price[0]) / trigger_price
-            if confirm_mult < MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:
+            min_confirm_mult = float(alpha_plan.get("min_confirm_mult") or MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT)
+            if confirm_mult < min_confirm_mult:
                 _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
                 _mt_gate("mt_alpha_confirm")
                 log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: confirm_mult={confirm_mult:.3f}x "
-                    f"< {MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x after "
+                    f"< {min_confirm_mult:.3f}x after "
                     f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s")
                 return
         graduated_seen.add(mint)
@@ -7029,14 +7049,61 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
     min_move = MARKET_TAPE_BIRTH_MIN_BC_MOVE if birth_lane else MARKET_TAPE_MIN_BC_MOVE
     max_move = MARKET_TAPE_BIRTH_MAX_BC_MOVE if birth_lane else MARKET_TAPE_MAX_BC_MOVE
     if move_mult < min_move or move_mult > max_move:
-        _mt_gate("mt_bc_range")
-        if birth_lane:
-            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
-            log(f"  MARKET-TAPE-BIRTH BLOCK {mint[:8]}: bc={move_mult:.3f}x outside "
-                f"{MARKET_TAPE_BIRTH_MIN_BC_MOVE:.3f}-{MARKET_TAPE_BIRTH_MAX_BC_MOVE:.3f}x "
-                f"seen_age={observed_age_ms/1000:.1f}s unique={len(unique_buyers)} "
-                f"tracked={len(tracked_buyers)} buy={buy_sol:.3f}")
-        return
+        if birth_lane and move_mult > MARKET_TAPE_BIRTH_MAX_BC_MOVE and move_mult <= MARKET_TAPE_MAX_BC_MOVE:
+            log(f"  MARKET-TAPE-BIRTH FALLBACK {mint[:8]}: bc={move_mult:.3f}x above birth band; "
+                f"evaluating normal scout wave unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
+                f"buy={buy_sol:.3f}")
+            birth_lane = False
+            cutoff = now_ms - MARKET_TAPE_WINDOW_MS
+            recent = [e for e in tape if e["ts"] >= cutoff]
+            buys = [e for e in recent if e["is_buy"]]
+            sells = [e for e in recent if not e["is_buy"]]
+            unique_buyers = {e["signer"] for e in buys if e["signer"]}
+            tracked_buyers = {e["signer"] for e in buys if e.get("tracked")}
+            buy_sol = sum(e["sol"] for e in buys)
+            sell_sol = sum(e["sol"] for e in sells)
+            if len(unique_buyers) < MARKET_TAPE_MIN_UNIQUE:
+                _mt_gate("mt_no_unique")
+                return
+            if len(tracked_buyers) < MARKET_TAPE_MIN_TRACKED:
+                _mt_gate("mt_no_tracked")
+                return
+            if buy_sol < MARKET_TAPE_MIN_BUY_SOL or sell_sol > MARKET_TAPE_MAX_SELL_SOL:
+                _mt_gate("mt_flow")
+                return
+            if (MARKET_TAPE_MAX_OBSERVED_AGE_SEC > 0
+                    and observed_age_ms > MARKET_TAPE_MAX_OBSERVED_AGE_SEC * 1000):
+                _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                _mt_gate("mt_stale")
+                log(f"  MARKET-TAPE BLOCK {mint[:8]}: stale fallback wave "
+                    f"seen_age={observed_age_ms/1000:.1f}s > {MARKET_TAPE_MAX_OBSERVED_AGE_SEC:.1f}s "
+                    f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} buy={buy_sol:.3f}")
+                return
+            bc_move = _bc_cache_move_for_mint(
+                mint,
+                max(MARKET_TAPE_WINDOW_MS + 800, 1500),
+                MARKET_TAPE_BC_CACHE_MAX_AGE_MS,
+            )
+            if not bc_move:
+                _mt_gate("mt_no_bc")
+                return
+            move_mult, age_ms, complete = bc_move
+            if complete:
+                _mt_gate("mt_complete")
+                return
+            min_move = MARKET_TAPE_MIN_BC_MOVE
+            max_move = MARKET_TAPE_MAX_BC_MOVE
+        if move_mult >= min_move and move_mult <= max_move:
+            pass
+        else:
+            _mt_gate("mt_bc_range")
+            if birth_lane:
+                _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                log(f"  MARKET-TAPE-BIRTH BLOCK {mint[:8]}: bc={move_mult:.3f}x outside "
+                    f"{MARKET_TAPE_BIRTH_MIN_BC_MOVE:.3f}-{MARKET_TAPE_BIRTH_MAX_BC_MOVE:.3f}x "
+                    f"seen_age={observed_age_ms/1000:.1f}s unique={len(unique_buyers)} "
+                    f"tracked={len(tracked_buyers)} buy={buy_sol:.3f}")
+            return
     entry_launchpad = "market_tape"
     entry_amount_sol = MARKET_TAPE_AMOUNT_SOL
     entry_quality = 7
@@ -7849,6 +7916,8 @@ async def main():
             f"{COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC:.2f}s; "
             f"TP={COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x fast-kill "
             f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s/{COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK:.3f}x.")
+    else:
+        log("  Solo rocket scout: DISABLED; copy_fast entries must pass swarm confirm or alpha promotion.")
     if ALPHA_LEARNER_ENABLED:
         log(f"=== V41.20 EXECUTABLE-ALPHA LEARNER ===")
         log(f"  Shadows copy/tape signals for 1/2/5/10s outcomes, persists to {ALPHA_STATE_FILE}.")
@@ -7867,7 +7936,8 @@ async def main():
             log(f"  Market-tape alpha: context-promoted tape enters scout size before static gates "
                 f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s, sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, "
                 f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
-                f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s.")
+                f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s; strong avg-exit buckets may retain "
+                f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x.")
     log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
         f"{COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s confirm window.")
     log(f"=== V41.19 MARKET-WIDE TAPE SCALPER ===")
