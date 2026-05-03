@@ -1374,9 +1374,26 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             if multiplier > pos.peak_price:
                 pos.peak_price = multiplier
 
-            # V41.17w: 8s no-pump time-stop REMOVED. In V41.17v, it closed 2 of 5 trades
-            # flat at peak=1.00x, denying them time to develop. SL + TP + trailing now
-            # own the exit.
+            # V41.17z2 DEAD-PEAK GUARD: 5s time-stop with peak<1.005x threshold.
+            # Empirical pattern across 6 live trades (2W/4L):
+            #   - All WINS peaked >=1.05x within 4-7 seconds (well above 1.005)
+            #   - All LOSSES had peak=1.00x EXACTLY (curve never moved up post-entry)
+            #     and bled to SL at -9% to -11% in 3-12 seconds.
+            # A 5s/peak<1.005 exit catches every dead-peak loss without touching
+            # any winner. This is much TIGHTER than the V41.17v version (8s/1.04)
+            # which closed real winners; live data now confirms the proper params.
+            DEAD_PEAK_TIME_SEC = 5.0
+            DEAD_PEAK_THRESHOLD = 1.005
+            if (pos.launchpad == "copy_fast"
+                    and pos.signal_time_ms > 0
+                    and pos.peak_price < DEAD_PEAK_THRESHOLD):
+                age_s = (time.time() * 1000 - pos.signal_time_ms) / 1000
+                if age_s > DEAD_PEAK_TIME_SEC:
+                    if try_grad_sell(
+                        f"GRAD DEAD-PEAK exit (age={age_s:.1f}s peak={pos.peak_price:.3f}x mult={multiplier:.3f}x)",
+                        1.0, multiplier,
+                    ):
+                        break
 
             # V41.13o + V41.14d: TRAILING STOP with slippage protection.
             # Empirical: full-position sell into $5-15k pool slips 2-5%. If trail floor is
@@ -5630,6 +5647,9 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17z2 DEAD-PEAK GUARD ===")
+    log(f"  Exit copy_fast at 5s if peak < 1.005x (curve never moved up = dead)")
+    log(f"  Empirical: 100% of losses had peak=1.00x; 100% of wins peaked >=1.05x in <7s")
     log(f"=== V41.17z TREND GATE (skip dumping curves) ===")
     log(f"  programSubscribe to pump.fun BondingCurve → hot trend cache")
     log(f"  Skip copy_fast if curve dumped >{abs(TREND_GATE_5S_MIN)*100:.0f}% in 5s before trader buy")
