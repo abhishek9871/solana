@@ -1250,6 +1250,16 @@ GRAD_COPY_FAST_POLL_SEC = float(os.environ.get("GRAD_COPY_FAST_POLL_SEC", "0.50"
 GRAD_SWARM_POLL_SEC = float(os.environ.get("GRAD_SWARM_POLL_SEC", "0.25"))
 GRAD_JUPITER_FALLBACK_SEC = float(os.environ.get("GRAD_JUPITER_FALLBACK_SEC", "2.0"))
 GRAD_BC_CACHE_MAX_AGE_MS = int(os.environ.get("GRAD_BC_CACHE_MAX_AGE_MS", "1500"))
+COPY_FAST_CONFIRM_ENABLED = os.environ.get("COPY_FAST_CONFIRM_ENABLED", "1") == "1"
+COPY_FAST_CONFIRM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_WINDOW_SEC", "3.0"))
+COPY_FAST_CONFIRM_POLL_SEC = float(os.environ.get("COPY_FAST_CONFIRM_POLL_SEC", "0.10"))
+COPY_FAST_CONFIRM_MIN_MULT = float(os.environ.get("COPY_FAST_CONFIRM_MIN_MULT", "1.08"))
+COPY_FAST_CONFIRM_MAX_OFF_PEAK = float(os.environ.get("COPY_FAST_CONFIRM_MAX_OFF_PEAK", "0.02"))
+COPY_FAST_CONFIRM_MAX_DUMP = float(os.environ.get("COPY_FAST_CONFIRM_MAX_DUMP", "-0.04"))
+COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS = int(os.environ.get("COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS", "600"))
+COPY_FAST_CONFIRM_MIN_SWARM = int(os.environ.get("COPY_FAST_CONFIRM_MIN_SWARM", "4"))
+COPY_FAST_CONFIRM_SWARM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM_WINDOW_SEC", "10.0"))
+COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC", "1.0"))
 # V41.12c: ST clean mid-curve tokens grow over minutes/hours, not seconds. Extended timeout.
 GRAD_TIMEOUT_ST_SEC = int(os.environ.get("GRAD_TIMEOUT_ST_SEC", "1800")) # 30 min hold for ST clean mints
 
@@ -1302,9 +1312,10 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             log(f"  GRAD SKIP {mint[:8]}: already in positions (dedup)")
             return
 
-        # V41.14: copy_fast — when shredSubscribe fires for a top trader's buy, we
-        # have ~200ms latency advantage. Burning it on observation wait kills the edge.
-        # Skip observation entirely and buy on the same block the trader bought.
+        # V41.18: copy_fast is no longer allowed to be a blind entry. The last
+        # paper run showed raw copy_fast was 0/3 and -0.0174 SOL, while confirmed
+        # swarm follow-through produced the only positive lane. Treat every copy
+        # signal as a candidate and require bc-cache proof before buying.
         if launchpad in ("copy_fast", "copy_fast_swarm"):
             signal_time_ms = int(time.time() * 1000)
             probe_sol_lamports = int(0.001 * 1e9)
@@ -1359,25 +1370,40 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                         log(f"  GRAD PRICE-OK {mint[:8]}: our/trader ratio={ratio:.3f}x")
                 except Exception:
                     pass
+
+            if not await _confirm_copy_fast_entry(mint, launchpad, signal_time_ms):
+                if launchpad == "copy_fast_swarm":
+                    _swarm_override_entered.discard(mint)
+                return
+
+            # V41.17z9: SWARM-OVERRIDE entries use HALF size (0.025 vs 0.05) for
+            # risk management since they bypass the rug check.
+            entry_amount = GRAD_AMOUNT_SOL * 0.5 if launchpad == "copy_fast_swarm" else GRAD_AMOUNT_SOL
+
             # V41.17 Fix #2: warm pool fast-path. If pre-built tx is fresh, ship it.
             # CRITICAL: the warm path submits the tx itself (no second swap via buy_token).
             # Bookkeeping quote runs AFTER send so its latency doesn't delay entry.
             pos = None
-            warm = _consume_warm_swap_tx(mint) if (not PAPER_TRADING and kp) else None
+            # Warm txs are built at GRAD_AMOUNT_SOL. Do not use them for capped
+            # swarm overrides, or live mode can silently break the half-size cap.
+            warm = (_consume_warm_swap_tx(mint)
+                    if (launchpad != "copy_fast_swarm" and not PAPER_TRADING and kp)
+                    else None)
             if warm:
                 tx_b64, _lvbh = warm
-                log(f"  GRAD WARM HIT {mint[:8]} (copy_fast): pre-built tx, shipping immediately")
+                log(f"  GRAD WARM HIT {mint[:8]} ({launchpad}): pre-built tx, shipping immediately")
                 # Skip simulation on warm path — Raptor already validated the tx; latency wins
                 sig_out = execute_swap(kp, client, tx_b64, simulate_first=False)
                 if sig_out:
                     # Post-send bookkeeping — quote latency now irrelevant for entry timing
-                    bookkeep = jupiter_quote(SOL_MINT, mint, int(GRAD_AMOUNT_SOL * 10**WSOL_DECIMALS))
+                    entry_lamports = int(entry_amount * 10**WSOL_DECIMALS)
+                    bookkeep = jupiter_quote(SOL_MINT, mint, entry_lamports)
                     out_amt = float(bookkeep.get("outAmount", 0)) if bookkeep else 0.0
                     if out_amt > 0:
-                        entry_price = int(GRAD_AMOUNT_SOL * 10**WSOL_DECIMALS) / out_amt
+                        entry_price = entry_lamports / out_amt
                         pos = Position(
                             mint=mint, entry_price=entry_price,
-                            entry_amount_sol=GRAD_AMOUNT_SOL, token_amount=out_amt,
+                            entry_amount_sol=entry_amount, token_amount=out_amt,
                             open_time=time.time(),
                             bc_pda=derive_bc_pda(Pubkey.from_string(mint)),
                         )
@@ -1388,12 +1414,9 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 else:
                     log(f"  GRAD WARM tx send failed {mint[:8]} — falling back to standard buy")
                     _copy_trade_stats["warm_miss"] += 1
-            # V41.17z9: SWARM-OVERRIDE entries use HALF size (0.025 vs 0.05) for
-            # risk management since they bypass the rug check.
-            entry_amount = GRAD_AMOUNT_SOL * 0.5 if launchpad == "copy_fast_swarm" else GRAD_AMOUNT_SOL
             # Fallback to standard buy_token (does its own quote+swap+send)
             if pos is None:
-                log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): trader signal, entering immediately, buying {entry_amount} SOL")
+                log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): confirmed follow-through, buying {entry_amount} SOL")
                 pos = buy_token(kp, client, mint, entry_amount)
                 if not pos:
                     log(f"  GRAD BUY FAILED {mint[:8]}")
@@ -3084,7 +3107,9 @@ async def session_reporter():
         if s["shreds"] > 0:
             log(f"=== COPY-PIPELINE: shreds={s['shreds']} sig_dedup={s['sig_dedup']} excpt={s['exception']} "
                 f"no_meta={s['no_meta']} wrong_signer={s['wrong_signer']} no_buy={s['no_buy']} "
-                f"non_memecoin={s['non_memecoin']} dedup={s['dedup']} rug_blocked={s['rug_blocked']} fired={s['fired']} ===")
+                f"non_memecoin={s['non_memecoin']} dedup={s['dedup']} rug_blocked={s['rug_blocked']} fired={s['fired']} "
+                f"confirm_ok={s.get('confirm_ok', 0)} confirm_blocked={s.get('confirm_blocked', 0)} "
+                f"confirm_dump={s.get('confirm_dump_blocked', 0)} ===")
 
 
 # === MAIN ===
@@ -4656,6 +4681,8 @@ _copy_trade_stats = {
     "bundle_fresh_blocked": 0, "warm_hit": 0, "warm_miss": 0,
     # V41.17d Fix #11: price-ratio (slippage-vs-trader) blocks
     "price_blocked": 0, "trader_price_unparseable": 0,
+    # V41.18 confirm-then-enter gate
+    "confirm_ok": 0, "confirm_blocked": 0, "confirm_dump_blocked": 0,
 }
 
 
@@ -5139,6 +5166,27 @@ def _compute_trend_5s_for_mint(mint: str) -> Optional[float]:
     return (last - first) / first
 
 
+def _bc_cache_price_for_mint(mint: str, max_age_ms: int) -> Optional[tuple[float, bool, int]]:
+    """Return (curve_price, complete, age_ms) from the multiplexed BondingCurve cache."""
+    try:
+        bc_pda, _ = Pubkey.find_program_address(
+            [b"bonding-curve", bytes(Pubkey.from_string(mint))],
+            Pubkey.from_string(_PUMP_PROGRAM_STR),
+        )
+        items = list(_bc_state_cache.get(str(bc_pda), ()))
+        if not items:
+            return None
+        latest = items[-1]
+        ts_ms, vsol, vtoken = latest[0], latest[1], latest[2]
+        complete = bool(latest[3]) if len(latest) > 3 else False
+        age_ms = int(time.time() * 1000) - int(ts_ms)
+        if age_ms > max_age_ms or not vtoken:
+            return None
+        return (float(vsol) / float(vtoken), complete, age_ms)
+    except Exception:
+        return None
+
+
 def _bc_cache_price_for_pos(pos: Position) -> Optional[tuple[float, bool, int]]:
     """Return (price, complete, age_ms) from the multiplexed ST BondingCurve cache."""
     try:
@@ -5156,6 +5204,96 @@ def _bc_cache_price_for_pos(pos: Position) -> Optional[tuple[float, bool, int]]:
         return (float(vsol) / float(vtoken), complete, age_ms)
     except Exception:
         return None
+
+
+def _recent_swarm_events(mint: str, window_sec: float = 10.0,
+                         now_ms: Optional[int] = None) -> list[tuple[str, int]]:
+    now_ms = now_ms or int(time.time() * 1000)
+    cutoff = now_ms - int(window_sec * 1000)
+    history = _signer_history_per_mint.get(mint, [])
+    return [(s, t) for s, t in history if t >= cutoff]
+
+
+def _recent_swarm_signers(mint: str, window_sec: float = 10.0,
+                          now_ms: Optional[int] = None) -> set[str]:
+    return {s for s, _t in _recent_swarm_events(mint, window_sec, now_ms)}
+
+
+async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: int) -> bool:
+    """Turn raw copy signals into confirmed momentum entries.
+
+    The last paper run showed raw `copy_fast` was the loss engine: it bought
+    before the copied buy proved follow-through. This gate requires a fresh
+    BondingCurve cache baseline, a +8% move, no >4% dump during the observation,
+    and either SWARM-4 or SWARM-3 that keeps attracting buyers.
+    """
+    if not COPY_FAST_CONFIRM_ENABLED:
+        return True
+
+    start = time.time()
+    initial_events = _recent_swarm_events(mint, COPY_FAST_CONFIRM_SWARM_WINDOW_SEC)
+    initial_signers = {s for s, _t in initial_events}
+    initial_event_count = len(initial_events)
+    initial_swarm = len(initial_signers)
+    baseline = _bc_cache_price_for_mint(mint, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS)
+    if not baseline:
+        _copy_trade_stats["confirm_blocked"] = _copy_trade_stats.get("confirm_blocked", 0) + 1
+        log(f"  GRAD CONFIRM-SKIP {mint[:8]} ({launchpad}): no fresh bc-cache baseline "
+            f"(<={COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS}ms required)")
+        return False
+    baseline_price, complete, age_ms = baseline
+    if complete or baseline_price <= 0:
+        _copy_trade_stats["confirm_blocked"] = _copy_trade_stats.get("confirm_blocked", 0) + 1
+        log(f"  GRAD CONFIRM-SKIP {mint[:8]} ({launchpad}): curve complete/stale before entry")
+        return False
+
+    peak_price = baseline_price
+    last_mult = 1.0
+    last_age_ms = age_ms
+    swarm_ok = initial_swarm >= COPY_FAST_CONFIRM_MIN_SWARM
+    reason = "no confirming tick"
+    deadline = start + COPY_FAST_CONFIRM_WINDOW_SEC
+
+    log(f"  GRAD CONFIRM-WAIT {mint[:8]} ({launchpad}): baseline={baseline_price:.4e} "
+        f"age={age_ms}ms swarm={initial_swarm}, need +{(COPY_FAST_CONFIRM_MIN_MULT-1)*100:.1f}% "
+        f"and SWARM-{COPY_FAST_CONFIRM_MIN_SWARM}")
+
+    while time.time() < deadline:
+        price_info = _bc_cache_price_for_mint(mint, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS)
+        if price_info:
+            price, complete, last_age_ms = price_info
+            if complete:
+                reason = "curve completed during confirm"
+                break
+            peak_price = max(peak_price, price)
+            last_mult = price / baseline_price if baseline_price else 1.0
+            if last_mult <= 1.0 + COPY_FAST_CONFIRM_MAX_DUMP:
+                _copy_trade_stats["confirm_dump_blocked"] = _copy_trade_stats.get("confirm_dump_blocked", 0) + 1
+                log(f"  GRAD CONFIRM-DUMP {mint[:8]} ({launchpad}): mult={last_mult:.3f}x <= "
+                    f"{1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during confirm")
+                return False
+
+            recent_events = _recent_swarm_events(mint, COPY_FAST_CONFIRM_SWARM_WINDOW_SEC)
+            recent = {s for s, _t in recent_events}
+            if len(recent) >= COPY_FAST_CONFIRM_MIN_SWARM:
+                swarm_ok = True
+            elif initial_swarm >= 3 and time.time() - start <= COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC:
+                swarm_ok = len(recent_events) > initial_event_count
+
+            off_peak_ok = price >= peak_price * (1.0 - COPY_FAST_CONFIRM_MAX_OFF_PEAK)
+            if last_mult >= COPY_FAST_CONFIRM_MIN_MULT and off_peak_ok and swarm_ok:
+                _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
+                log(f"  GRAD CONFIRM-OK {mint[:8]} ({launchpad}): mult={last_mult:.3f}x "
+                    f"peak={peak_price / baseline_price:.3f}x swarm={len(recent)} age={last_age_ms}ms")
+                return True
+            reason = (f"mult={last_mult:.3f}x peak={peak_price / baseline_price:.3f}x "
+                      f"swarm={len(recent)} off_peak={off_peak_ok} age={last_age_ms}ms")
+        await asyncio.sleep(COPY_FAST_CONFIRM_POLL_SEC)
+
+    _copy_trade_stats["confirm_blocked"] = _copy_trade_stats.get("confirm_blocked", 0) + 1
+    log(f"  GRAD CONFIRM-SKIP {mint[:8]} ({launchpad}): {reason}; "
+        f"window={COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s")
+    return False
 
 
 async def pump_program_bc_listener():
@@ -5491,11 +5629,9 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                 if age_s < 30 and existing.peak_price >= 0.95:
                     asyncio.create_task(_swarm_compound_position(
                         client, kp, mint, len(recent_signers), signer))
-            # V41.17zc: REVERTED the 3s sustain-wait — too much latency on
-            # ultra-fast bundle pumps. By T+3s curves often crashed past Fix #11.
-            # Restored immediate SWARM-3+ entry. Tighter dead-peak threshold
-            # (1.020 vs 1.005) below catches the false-pump-then-crash pattern
-            # that the wait was trying to filter.
+            # V41.18: SWARM-3+ on a rug-blocked mint is only a candidate now.
+            # graduation_snipe runs the bc-cache confirm gate before any buy, so
+            # dead swarms and instant dumps don't get capital.
             elif (not existing
                     and len(recent_signers) >= 3
                     and mint in _rug_blocked_recent
@@ -5503,8 +5639,8 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                     and mint not in _swarm_override_entered):
                 _swarm_override_entered.add(mint)
                 _copy_trade_stats["swarm_override"] = _copy_trade_stats.get("swarm_override", 0) + 1
-                log(f"  *** SWARM-OVERRIDE-RUG *** {mint[:8]}: {len(recent_signers)} wallets agree, "
-                    f"overriding rug-block with capped 0.025 SOL")
+                log(f"  *** SWARM-OVERRIDE-CANDIDATE *** {mint[:8]}: {len(recent_signers)} wallets agree, "
+                    f"rug-block override candidate; waiting for bc-cache follow-through")
                 asyncio.create_task(graduation_snipe(
                     client, kp, mint, launchpad="copy_fast_swarm",
                     signer=signer, trader_price=trader_price))
@@ -6146,15 +6282,22 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
-    log(f"=== V41.17zc REVERT WAIT + TIGHTER DEAD-PEAK ===")
-    log(f"  Reverted V41.17zb 3s sustain-wait — too much latency, killed winners.")
-    log(f"  Restored immediate SWARM-OVERRIDE-RUG entry on SWARM-3+.")
+    log(f"=== V41.18 CONFIRM-THEN-ENTER ===")
+    log(f"  Raw copy_fast is DISABLED as a blind entry; every copy signal must prove follow-through.")
+    log(f"  Confirm gate: fresh bc-cache <= {COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS}ms, "
+        f"+{(COPY_FAST_CONFIRM_MIN_MULT-1)*100:.1f}% move, within {COPY_FAST_CONFIRM_MAX_OFF_PEAK*100:.1f}% of local peak, "
+        f"SWARM-{COPY_FAST_CONFIRM_MIN_SWARM} or continued SWARM-3.")
+    log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
+        f"{COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s confirm window.")
+    log(f"=== V41.17zc/V41.18 DEAD-PEAK + CONFIRM-GATED SWARM ===")
+    log(f"  Reverted fixed 3s sustain-wait; V41.18 uses price-confirm polling instead.")
+    log(f"  SWARM-3+ rug overrides are candidates only until the confirm gate passes.")
     log(f"  Dead-peak threshold tightened: 1.005 -> 1.020 (catches false-pump-then-crash).")
     log(f"=== V41.17za bypass circuit breakers for swarm-override ===")
     log(f"  copy_fast_swarm entries skip streak-pause and consec_loss halts.")
-    log(f"=== V41.17z9 SWARM-OVERRIDE-RUG ===")
-    log(f"  When SWARM-3+ forms within 30s on a rug-blocked mint, OVERRIDE the rug check")
-    log(f"  Capped: 0.025 SOL position (half), 30s hard timeout, dead-peak guard active")
+    log(f"=== V41.17z9/V41.18 SWARM-OVERRIDE CANDIDATE ===")
+    log(f"  When SWARM-3+ forms within 30s on a rug-blocked mint, allow confirm-gated override")
+    log(f"  If confirmed: 0.025 SOL position (half), 30s hard timeout, dead-peak guard active")
     log(f"=== V41.17z8 SWARM COMPOUND ===")
     log(f"  When SWARM-N (>=2 pool wallets) on a mint we have an open position on,")
     log(f"  ADD to position: 0.5x size for SWARM-2, 1x size for SWARM-3+. Cap 2 adds.")
