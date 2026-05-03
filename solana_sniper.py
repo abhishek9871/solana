@@ -141,6 +141,10 @@ POSITIONS_STATE_FILE = os.environ.get(
     "POSITIONS_STATE_FILE",
     os.path.join(BASE_DIR, "data", "positions_state.json"),
 )
+ALPHA_STATE_FILE = os.environ.get(
+    "ALPHA_STATE_FILE",
+    os.path.join(BASE_DIR, "data", "executable_alpha.json"),
+)
 
 # Wallet & RPC
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=c2fa0510-cddd-4768-9424-e5db39429bbb")
@@ -1305,6 +1309,27 @@ COPY_FAST_SOLO_ROCKET_TP_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TP_M
 COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC", "2.0"))
 COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK", "1.012"))
 COPY_FAST_SOLO_ROCKET_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TIMEOUT_SEC", "8.0"))
+ALPHA_LEARNER_ENABLED = os.environ.get("ALPHA_LEARNER_ENABLED", "1") == "1"
+ALPHA_ADAPTIVE_ENTRY_ENABLED = os.environ.get("ALPHA_ADAPTIVE_ENTRY_ENABLED", "1") == "1"
+ALPHA_EXPLORATION_ENABLED = os.environ.get("ALPHA_EXPLORATION_ENABLED", "1") == "1"
+ALPHA_SHADOW_MARKET_TAPE = os.environ.get("ALPHA_SHADOW_MARKET_TAPE", "1") == "1"
+ALPHA_MAX_PENDING_SHADOWS = int(os.environ.get("ALPHA_MAX_PENDING_SHADOWS", "120"))
+ALPHA_SIGNAL_COOLDOWN_MS = int(os.environ.get("ALPHA_SIGNAL_COOLDOWN_MS", "2500"))
+ALPHA_SAVE_EVERY_OUTCOMES = int(os.environ.get("ALPHA_SAVE_EVERY_OUTCOMES", "5"))
+ALPHA_MIN_SAMPLES = int(os.environ.get("ALPHA_MIN_SAMPLES", "4"))
+ALPHA_PROMOTE_MIN_WR = float(os.environ.get("ALPHA_PROMOTE_MIN_WR", "0.60"))
+ALPHA_PROMOTE_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_PROMOTE_MIN_AVG_BEST_NET", "0.020"))
+ALPHA_BLOCK_MIN_SAMPLES = int(os.environ.get("ALPHA_BLOCK_MIN_SAMPLES", "4"))
+ALPHA_BLOCK_MAX_WR = float(os.environ.get("ALPHA_BLOCK_MAX_WR", "0.25"))
+ALPHA_BLOCK_MAX_AVG_BEST_NET = float(os.environ.get("ALPHA_BLOCK_MAX_AVG_BEST_NET", "0.000"))
+COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL", "0.003125"))
+COPY_FAST_ALPHA_CORE_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_CORE_AMOUNT_SOL", "0.0125"))
+COPY_FAST_ALPHA_EXPLORATION_MIN_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MIN_MULT", "1.22"))
+COPY_FAST_ALPHA_EXPLORATION_MAX_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MAX_MULT", "1.55"))
+COPY_FAST_ALPHA_TP_MULT = float(os.environ.get("COPY_FAST_ALPHA_TP_MULT", "1.045"))
+COPY_FAST_ALPHA_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_SEC", "2.0"))
+COPY_FAST_ALPHA_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_PEAK", "1.012"))
+COPY_FAST_ALPHA_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_ALPHA_TIMEOUT_SEC", "8.0"))
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
 MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
@@ -1503,19 +1528,27 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 except Exception:
                     pass
 
-            if not await _confirm_copy_fast_entry(mint, launchpad, signal_time_ms):
+            if not await _confirm_copy_fast_entry(
+                    mint, launchpad, signal_time_ms,
+                    signer=signer or "", trader_price=trader_price):
                 if launchpad == "copy_fast_swarm":
                     _swarm_override_entered.discard(mint)
                 return
 
             # V41.17z9: SWARM-OVERRIDE entries use HALF size (0.025 vs 0.05) for
             # risk management since they bypass the rug check.
+            entry_override = _copy_fast_entry_overrides.pop(mint, None)
             solo_rocket = launchpad == "copy_fast" and mint in _copy_fast_solo_rocket_mints
-            entry_launchpad = "copy_fast_solo" if solo_rocket else launchpad
-            if solo_rocket:
-                entry_amount = COPY_FAST_SOLO_ROCKET_AMOUNT_SOL
+            if entry_override:
+                entry_launchpad = str(entry_override.get("launchpad") or "copy_fast_alpha")
+                entry_amount = float(entry_override.get("amount") or COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)
                 _copy_fast_solo_rocket_mints.discard(mint)
             else:
+                entry_launchpad = "copy_fast_solo" if solo_rocket else launchpad
+            if solo_rocket and not entry_override:
+                entry_amount = COPY_FAST_SOLO_ROCKET_AMOUNT_SOL
+                _copy_fast_solo_rocket_mints.discard(mint)
+            elif not entry_override:
                 entry_amount = GRAD_AMOUNT_SOL * 0.5 if launchpad == "copy_fast_swarm" else GRAD_AMOUNT_SOL
             if not _claim_entry_mint(mint, launchpad):
                 return
@@ -1725,7 +1758,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
     last_quote_check = 0.0
 
     def poll_delay() -> float:
-        if pos.launchpad == "copy_fast_solo":
+        if pos.launchpad in ("copy_fast_solo", "copy_fast_alpha"):
             return GRAD_SWARM_POLL_SEC
         if pos.launchpad in ("market_tape", "market_tape_scout"):
             return GRAD_SWARM_POLL_SEC
@@ -1737,7 +1770,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
 
     async def current_price(force_quote: bool = False) -> Optional[tuple[float, str]]:
         nonlocal last_quote_check
-        if pos.launchpad in ("copy_fast", "copy_fast_solo", "copy_fast_swarm",
+        if pos.launchpad in ("copy_fast", "copy_fast_solo", "copy_fast_alpha", "copy_fast_swarm",
                              "market_tape", "market_tape_scout"):
             cached = _bc_cache_price_for_pos(pos)
             if cached:
@@ -1746,7 +1779,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     return price, f"bc_cache:{age_ms}ms"
         now = time.time()
         if (not force_quote
-                and pos.launchpad in ("copy_fast", "copy_fast_solo", "copy_fast_swarm",
+                and pos.launchpad in ("copy_fast", "copy_fast_solo", "copy_fast_alpha", "copy_fast_swarm",
                                       "market_tape", "market_tape_scout")
                 and now - last_quote_check < GRAD_JUPITER_FALLBACK_SEC):
             return None
@@ -1771,6 +1804,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                 timeout_for_pos = float("inf")
             elif pos.launchpad == "copy_fast_solo":
                 timeout_for_pos = COPY_FAST_SOLO_ROCKET_TIMEOUT_SEC
+            elif pos.launchpad == "copy_fast_alpha":
+                timeout_for_pos = COPY_FAST_ALPHA_TIMEOUT_SEC
             elif pos.launchpad == "market_tape":
                 timeout_for_pos = MARKET_TAPE_TIMEOUT_SEC
             elif pos.launchpad == "market_tape_scout":
@@ -1845,9 +1880,19 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     1.0, multiplier,
                 ):
                     break
+            if (pos.launchpad == "copy_fast_alpha"
+                    and pos.signal_time_ms > 0
+                    and (now * 1000 - pos.signal_time_ms) > COPY_FAST_ALPHA_FAST_KILL_SEC * 1000
+                    and pos.peak_price < COPY_FAST_ALPHA_FAST_KILL_PEAK):
+                if try_grad_sell(
+                    f"COPY_FAST_ALPHA FAST-KILL {COPY_FAST_ALPHA_FAST_KILL_SEC:.1f}s "
+                    f"peak={pos.peak_price:.3f}x mult={multiplier:.3f}x",
+                    1.0, multiplier,
+                ):
+                    break
             if (pos.launchpad in ("copy_fast", "copy_fast_swarm", "pump", "bonk",
                                   "grad_imminent", "momentum", "st_pump", "market_tape",
-                                  "market_tape_scout", "copy_fast_solo")
+                                  "market_tape_scout", "copy_fast_solo", "copy_fast_alpha")
                     and pos.signal_time_ms > 0
                     and pos.peak_price < DEAD_PEAK_THRESHOLD):
                 age_s = (now * 1000 - pos.signal_time_ms) / 1000
@@ -1878,6 +1923,12 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             if pos.launchpad == "copy_fast_solo" and multiplier >= COPY_FAST_SOLO_ROCKET_TP_MULT:
                 if try_grad_sell(
                     f"COPY_FAST_SOLO TP {COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x mult={multiplier:.3f}x",
+                    1.0, multiplier,
+                ):
+                    break
+            if pos.launchpad == "copy_fast_alpha" and multiplier >= COPY_FAST_ALPHA_TP_MULT:
+                if try_grad_sell(
+                    f"COPY_FAST_ALPHA TP {COPY_FAST_ALPHA_TP_MULT:.3f}x mult={multiplier:.3f}x",
                     1.0, multiplier,
                 ):
                     break
@@ -3353,6 +3404,10 @@ async def session_reporter():
                 f"ratio={s.get('swarm_scout_ratio', 0)} "
                 f"confirm={s.get('swarm_scout_confirm', 0)} "
                 f"busy={s.get('swarm_scout_busy', 0)} ===")
+            log(f"=== ALPHA: shadow={s.get('alpha_shadow', 0)} outcomes={s.get('alpha_outcomes', 0)} "
+                f"no_px={s.get('alpha_no_price', 0)} promoted={s.get('alpha_promoted', 0)} "
+                f"toxic={s.get('alpha_toxic', 0)} scouts={s.get('alpha_scouts', 0)} "
+                f"pending={len(_alpha_pending_keys)} ===")
 
 
 # === MAIN ===
@@ -4935,6 +4990,12 @@ _market_tape_last_seen_ms: dict[str, int] = {}
 _market_tape_entered_recent: dict[str, int] = {}
 _market_tape_ratio_violation_until: dict[str, int] = {}
 _market_tape_entry_times: deque = deque(maxlen=200)
+_copy_fast_entry_overrides: dict[str, dict] = {}
+
+_alpha_stats: dict[str, dict[str, dict]] = {"wallets": {}, "contexts": {}, "pairs": {}}
+_alpha_pending_keys: set[str] = set()
+_alpha_recent_signal_ms: dict[str, int] = {}
+_alpha_outcomes_since_save = 0
 
 _copy_trade_stats = {
     "shreds": 0, "no_meta": 0, "wrong_signer": 0, "no_buy": 0,
@@ -4950,11 +5011,251 @@ _copy_trade_stats = {
     # V41.19 market-wide tape
     "market_tape_seen": 0, "market_tape_triggers": 0, "market_tape_entered": 0,
     "market_tape_blocked": 0, "market_tape_birth_triggers": 0,
+    # V41.20 executable-alpha learner
+    "alpha_shadow": 0, "alpha_outcomes": 0, "alpha_no_price": 0,
+    "alpha_promoted": 0, "alpha_toxic": 0, "alpha_scouts": 0,
 }
 
 
 def _mt_gate(name: str) -> None:
     _copy_trade_stats[name] = _copy_trade_stats.get(name, 0) + 1
+
+
+def _alpha_empty_stat() -> dict:
+    return {
+        "n": 0,
+        "wins": 0,
+        "best_net_sum": 0.0,
+        "exit_net_sum": 0.0,
+        "worst_net_sum": 0.0,
+        "last_best_net": 0.0,
+        "last_exit_net": 0.0,
+        "last_ts": 0.0,
+    }
+
+
+def _alpha_load_state() -> None:
+    if not ALPHA_LEARNER_ENABLED or not os.path.isfile(ALPHA_STATE_FILE):
+        return
+    try:
+        with open(ALPHA_STATE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        stats = payload.get("stats") or {}
+        for bucket in ("wallets", "contexts", "pairs"):
+            if isinstance(stats.get(bucket), dict):
+                _alpha_stats[bucket] = stats[bucket]
+        total = sum(int(v.get("n", 0) or 0) for v in _alpha_stats.get("pairs", {}).values())
+        log(f"  ALPHA RESTORE: loaded executable-edge stats ({total} pair outcomes)")
+    except Exception as e:
+        log(f"  ALPHA RESTORE ERR: {type(e).__name__}: {e}")
+
+
+def _alpha_persist_state(force: bool = False) -> None:
+    global _alpha_outcomes_since_save
+    if not ALPHA_LEARNER_ENABLED:
+        return
+    if not force and _alpha_outcomes_since_save < ALPHA_SAVE_EVERY_OUTCOMES:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(ALPHA_STATE_FILE)), exist_ok=True)
+        payload = {
+            "version": 1,
+            "updated_at": time.time(),
+            "stats": _alpha_stats,
+        }
+        tmp_path = ALPHA_STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+        os.replace(tmp_path, ALPHA_STATE_FILE)
+        _alpha_outcomes_since_save = 0
+    except Exception as e:
+        log(f"  ALPHA PERSIST ERR: {type(e).__name__}: {e}")
+
+
+def _alpha_bucket(value: Optional[float], cuts: tuple[float, ...], labels: tuple[str, ...]) -> str:
+    if value is None:
+        return "na"
+    for cut, label in zip(cuts, labels):
+        if value < cut:
+            return label
+    return labels[-1]
+
+
+def _alpha_context_key(lane: str, mint: str, signer: str,
+                       trader_price: float = 0.0,
+                       trigger_price: float = 0.0) -> str:
+    now_ms = int(time.time() * 1000)
+    first_seen = _market_tape_first_seen_ms.get(mint)
+    age_s = ((now_ms - first_seen) / 1000.0) if first_seen else None
+    age_b = _alpha_bucket(age_s, (3.0, 6.0, 12.0, 30.0), ("a0_3", "a3_6", "a6_12", "a12_30", "a30p"))
+    swarm_n = len(_recent_swarm_events(mint, 10.0, now_ms)) if "_recent_swarm_events" in globals() else 0
+    swarm_b = "sw0" if swarm_n <= 0 else ("sw1" if swarm_n == 1 else ("sw2" if swarm_n == 2 else ("sw3" if swarm_n == 3 else "sw4p")))
+    move_mult = None
+    bc_move = _bc_cache_move_for_mint(mint, 1800, max(MARKET_TAPE_BC_CACHE_MAX_AGE_MS, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS))
+    if bc_move:
+        move_mult = float(bc_move[0])
+    move_b = _alpha_bucket(move_mult, (0.98, 1.02, 1.08, 1.20), ("dump", "flat", "rise", "run", "chase"))
+    ratio = (trigger_price / trader_price) if trader_price and trigger_price else None
+    ratio_b = _alpha_bucket(ratio, (0.82, 0.95, 1.08, 1.20), ("dumped", "cheap", "fair", "high", "chase"))
+    return f"{lane}|{age_b}|{swarm_b}|{move_b}|{ratio_b}"
+
+
+def _alpha_stat_view(stat: Optional[dict]) -> tuple[int, float, float, float]:
+    if not stat:
+        return 0, 0.0, 0.0, 0.0
+    n = int(stat.get("n", 0) or 0)
+    wins = int(stat.get("wins", 0) or 0)
+    wr = wins / n if n else 0.0
+    avg_best = float(stat.get("best_net_sum", 0.0) or 0.0) / n if n else 0.0
+    avg_exit = float(stat.get("exit_net_sum", 0.0) or 0.0) / n if n else 0.0
+    return n, wr, avg_best, avg_exit
+
+
+def _alpha_promoted(stat: Optional[dict], min_samples: int = ALPHA_MIN_SAMPLES) -> bool:
+    n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
+    return n >= min_samples and wr >= ALPHA_PROMOTE_MIN_WR and avg_best >= ALPHA_PROMOTE_MIN_AVG_BEST_NET
+
+
+def _alpha_toxic(stat: Optional[dict]) -> bool:
+    n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
+    return n >= ALPHA_BLOCK_MIN_SAMPLES and wr <= ALPHA_BLOCK_MAX_WR and avg_best <= ALPHA_BLOCK_MAX_AVG_BEST_NET
+
+
+def _alpha_update_one(bucket: str, key: str, best_net: float,
+                      exit_net: float, worst_net: float) -> None:
+    stat = _alpha_stats.setdefault(bucket, {}).setdefault(key, _alpha_empty_stat())
+    stat["n"] = int(stat.get("n", 0) or 0) + 1
+    if best_net >= 0.02:
+        stat["wins"] = int(stat.get("wins", 0) or 0) + 1
+    stat["best_net_sum"] = float(stat.get("best_net_sum", 0.0) or 0.0) + best_net
+    stat["exit_net_sum"] = float(stat.get("exit_net_sum", 0.0) or 0.0) + exit_net
+    stat["worst_net_sum"] = float(stat.get("worst_net_sum", 0.0) or 0.0) + worst_net
+    stat["last_best_net"] = best_net
+    stat["last_exit_net"] = exit_net
+    stat["last_ts"] = time.time()
+
+
+def _alpha_update_stats(signer: str, context: str,
+                        best_net: float, exit_net: float, worst_net: float) -> None:
+    global _alpha_outcomes_since_save
+    if not signer:
+        signer = "unknown"
+    _alpha_update_one("wallets", signer, best_net, exit_net, worst_net)
+    _alpha_update_one("contexts", context, best_net, exit_net, worst_net)
+    _alpha_update_one("pairs", f"{signer}|{context}", best_net, exit_net, worst_net)
+    _alpha_outcomes_since_save += 1
+    _copy_trade_stats["alpha_outcomes"] = _copy_trade_stats.get("alpha_outcomes", 0) + 1
+    _alpha_persist_state()
+
+
+async def _alpha_shadow_track(mint: str, signer: str, lane: str,
+                              trader_price: float = 0.0,
+                              trigger_price: float = 0.0,
+                              sig: str = "") -> None:
+    if not ALPHA_LEARNER_ENABLED:
+        return
+    key = sig or f"{lane}:{signer}:{mint}:{int(time.time() * 2)}"
+    if key in _alpha_pending_keys:
+        return
+    if len(_alpha_pending_keys) >= ALPHA_MAX_PENDING_SHADOWS:
+        return
+    _alpha_pending_keys.add(key)
+    _copy_trade_stats["alpha_shadow"] = _copy_trade_stats.get("alpha_shadow", 0) + 1
+    try:
+        start_price = trigger_price
+        if start_price <= 0:
+            cached = _bc_cache_price_for_mint(mint, max(MARKET_TAPE_BC_CACHE_MAX_AGE_MS, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS))
+            if cached and not cached[1]:
+                start_price = float(cached[0])
+        if start_price <= 0:
+            await asyncio.sleep(0.20)
+            cached = _bc_cache_price_for_mint(mint, max(MARKET_TAPE_BC_CACHE_MAX_AGE_MS, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS))
+            if cached and not cached[1]:
+                start_price = float(cached[0])
+        if start_price <= 0:
+            _copy_trade_stats["alpha_no_price"] = _copy_trade_stats.get("alpha_no_price", 0) + 1
+            return
+        context = _alpha_context_key(lane, mint, signer, trader_price, start_price)
+        start_ts = time.time()
+        samples: list[float] = []
+        for horizon in (1.0, 2.0, 5.0, 10.0):
+            await asyncio.sleep(max(0.0, start_ts + horizon - time.time()))
+            cached = _bc_cache_price_for_mint(mint, 1600)
+            if cached and not cached[1] and cached[0] > 0:
+                samples.append(float(cached[0]) / start_price)
+        if not samples:
+            _copy_trade_stats["alpha_no_price"] = _copy_trade_stats.get("alpha_no_price", 0) + 1
+            return
+        drag = max(0.0, PAPER_ROUND_TRIP_DRAG_BPS / 10000.0)
+        best_net = max(samples) * (1.0 - drag) - 1.0
+        exit_net = samples[-1] * (1.0 - drag) - 1.0
+        worst_net = min(samples) * (1.0 - drag) - 1.0
+        _alpha_update_stats(signer, context, best_net, exit_net, worst_net)
+    except Exception as e:
+        log(f"  ALPHA SHADOW ERR {mint[:8]}: {type(e).__name__}: {e}")
+    finally:
+        _alpha_pending_keys.discard(key)
+
+
+def _alpha_schedule_shadow(mint: str, signer: str, lane: str,
+                           trader_price: float = 0.0,
+                           trigger_price: float = 0.0,
+                           sig: str = "") -> None:
+    if not ALPHA_LEARNER_ENABLED:
+        return
+    now_ms = int(time.time() * 1000)
+    cooldown_key = f"{lane}:{signer}:{mint}"
+    if now_ms - _alpha_recent_signal_ms.get(cooldown_key, 0) < ALPHA_SIGNAL_COOLDOWN_MS:
+        return
+    _alpha_recent_signal_ms[cooldown_key] = now_ms
+    if len(_alpha_recent_signal_ms) > 5000:
+        cutoff = now_ms - 10 * 60_000
+        for k, ts in list(_alpha_recent_signal_ms.items()):
+            if ts < cutoff:
+                _alpha_recent_signal_ms.pop(k, None)
+    asyncio.create_task(_alpha_shadow_track(
+        mint, signer, lane, trader_price=trader_price,
+        trigger_price=trigger_price, sig=sig,
+    ))
+
+
+def _alpha_entry_plan(mint: str, signer: str, lane: str,
+                      trader_price: float, trigger_price: float,
+                      last_mult: float, swarm_count: int,
+                      off_peak_ok: bool) -> Optional[dict]:
+    if not (ALPHA_LEARNER_ENABLED and ALPHA_ADAPTIVE_ENTRY_ENABLED):
+        return None
+    context = _alpha_context_key(lane, mint, signer, trader_price, trigger_price)
+    wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
+    context_stat = _alpha_stats.get("contexts", {}).get(context)
+    pair_stat = _alpha_stats.get("pairs", {}).get(f"{signer}|{context}")
+    if _alpha_toxic(pair_stat) or _alpha_toxic(wallet_stat):
+        _copy_trade_stats["alpha_toxic"] = _copy_trade_stats.get("alpha_toxic", 0) + 1
+        return None
+
+    if _alpha_promoted(pair_stat) or (
+        _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2)
+        and _alpha_promoted(context_stat)
+    ):
+        _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
+        n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat or wallet_stat)
+        return {
+            "launchpad": "copy_fast_alpha",
+            "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL,
+            "reason": f"promoted n={n} wr={wr:.0%} avg_best={avg_best:+.1%}",
+        }
+
+    if (ALPHA_EXPLORATION_ENABLED
+            and off_peak_ok
+            and swarm_count >= 2
+            and COPY_FAST_ALPHA_EXPLORATION_MIN_MULT <= last_mult <= COPY_FAST_ALPHA_EXPLORATION_MAX_MULT):
+        _copy_trade_stats["alpha_scouts"] = _copy_trade_stats.get("alpha_scouts", 0) + 1
+        return {
+            "launchpad": "copy_fast_alpha",
+            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "reason": f"explore sw={swarm_count} mult={last_mult:.3f}x ctx={context}",
+        }
+    return None
 
 
 def _evaluate_risk(snap: dict) -> tuple[bool, str]:
@@ -5539,7 +5840,8 @@ def _recent_swarm_signers(mint: str, window_sec: float = 10.0,
     return {s for s, _t in _recent_swarm_events(mint, window_sec, now_ms)}
 
 
-async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: int) -> bool:
+async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: int,
+                                   signer: str = "", trader_price: float = 0.0) -> bool:
     """Turn raw copy signals into confirmed momentum entries.
 
     The last paper run showed raw `copy_fast` was the loss engine: it bought
@@ -5620,6 +5922,20 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                 and last_mult >= COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT
             )
             solo_rocket_ok = single_rocket_ok or swarm2_rocket_ok
+            alpha_plan = _alpha_entry_plan(
+                mint, signer, "copy_fast", trader_price, price,
+                last_mult, len(recent), off_peak_ok,
+            )
+            if (alpha_plan
+                    and launchpad == "copy_fast"
+                    and (float(alpha_plan.get("amount", 0.0)) >= COPY_FAST_SOLO_ROCKET_AMOUNT_SOL
+                         or not solo_rocket_ok)):
+                _copy_fast_entry_overrides[mint] = alpha_plan
+                _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
+                log(f"  GRAD CONFIRM-OK {mint[:8]} (copy_fast_alpha): "
+                    f"{alpha_plan.get('reason', 'alpha')} mult={last_mult:.3f}x "
+                    f"peak={peak_price / baseline_price:.3f}x swarm={len(recent)} age={last_age_ms}ms")
+                return True
             if (COPY_FAST_SOLO_ROCKET_ENABLED
                     and launchpad == "copy_fast"
                     and solo_rocket_ok
@@ -6141,6 +6457,15 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
         for k, _ in oldest[:200]:
             _signer_history_per_mint.pop(k, None)
 
+    if mint.lower().endswith(("pump", "bonk")):
+        cached = _bc_cache_price_for_mint(mint, max(MARKET_TAPE_BC_CACHE_MAX_AGE_MS, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS))
+        _alpha_schedule_shadow(
+            mint, signer, "copy_fast",
+            trader_price=trader_price,
+            trigger_price=float(cached[0]) if cached and not cached[1] else 0.0,
+            sig=sig,
+        )
+
     if mint in graduated_seen:
         _copy_trade_stats["dedup"] += 1
         # SWARM detection: how many distinct wallets bought this mint within 10s?
@@ -6289,7 +6614,7 @@ async def _maybe_market_tape_exit(client: Client, kp: Optional[Keypair],
     if not pos or pos.mint in _positions_closing:
         return False
     if pos.launchpad not in ("market_tape", "market_tape_scout", "copy_fast",
-                             "copy_fast_swarm", "copy_fast_solo"):
+                             "copy_fast_swarm", "copy_fast_solo", "copy_fast_alpha"):
         return False
 
     tape = list(_market_tape_per_mint.get(mint, ()))
@@ -6497,6 +6822,13 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         _mark_warm_priority_mint(mint)
     buy_sol = birth_buy_sol if birth_lane else sum(e["sol"] for e in buys)
     sell_sol = birth_sell_sol if birth_lane else sum(e["sol"] for e in sells)
+    if (ALPHA_SHADOW_MARKET_TAPE
+            and (event["tracked"] or len(unique_buyers) >= 3 or len(tracked_buyers) >= 2)):
+        _alpha_schedule_shadow(
+            mint, signer, "market_tape",
+            trader_price=float(trade.get("trader_price") or 0.0),
+            sig=f"{sig}:mt:{len(unique_buyers)}:{len(tracked_buyers)}",
+        )
     if not birth_lane:
         if len(unique_buyers) < MARKET_TAPE_MIN_UNIQUE:
             _mt_gate("mt_no_unique")
@@ -6853,6 +7185,13 @@ async def _handle_copy_trader_tx(client: Client, kp: Optional[Keypair], sig: str
                     trader_price = sol_spent_lamports / trader_raw_diff
                 else:
                     _copy_trade_stats["trader_price_unparseable"] += 1
+                cached = _bc_cache_price_for_mint(mint, max(MARKET_TAPE_BC_CACHE_MAX_AGE_MS, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS))
+                _alpha_schedule_shadow(
+                    mint, signer, "copy_fast",
+                    trader_price=trader_price,
+                    trigger_price=float(cached[0]) if cached and not cached[1] else 0.0,
+                    sig=sig,
+                )
                 _copy_trade_stats["fired"] += 1
                 log(f"*** COPY TRADE *** {signer[:8]} bought {mint} (sig={sig[:16]})"
                     + (f" trader_px={trader_price:.4e}" if trader_price > 0 else " trader_px=unknown"))
@@ -7252,7 +7591,7 @@ async def wallet_balance_monitor(client: Client, kp: Optional[Keypair]):
 
 def _resume_recovered_position_managers(client: Client, kp: Optional[Keypair]) -> None:
     grad_launchpads = {
-        "copy_fast", "copy_fast_solo", "copy_fast_swarm", "market_tape",
+        "copy_fast", "copy_fast_solo", "copy_fast_alpha", "copy_fast_swarm", "market_tape",
         "market_tape_scout", "pump", "bonk", "bonk_pregrad", "grad_imminent",
         "momentum", "st_pump",
     }
@@ -7292,6 +7631,7 @@ async def main():
         except Exception:
             pass
     restored = _load_positions_state()
+    _alpha_load_state()
     _reconcile_recovered_positions(client, kp)
     if _daily_loss_limit_hit():
         log(f"FATAL: daily loss limit already hit ({daily_pnl_sol:+.4f} SOL / -{MAX_DAILY_LOSS_SOL:.4f} SOL); not starting")
@@ -7351,6 +7691,17 @@ async def main():
             f"SWARM-2 lowers trigger to {COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT:.2f}x; "
             f"TP={COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x fast-kill "
             f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s/{COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK:.3f}x.")
+    if ALPHA_LEARNER_ENABLED:
+        log(f"=== V41.20 EXECUTABLE-ALPHA LEARNER ===")
+        log(f"  Shadows copy/tape signals for 1/2/5/10s outcomes, persists to {ALPHA_STATE_FILE}.")
+        log(f"  Adaptive copy_fast_alpha: scout={COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL:.4f} SOL "
+            f"explore {COPY_FAST_ALPHA_EXPLORATION_MIN_MULT:.2f}-{COPY_FAST_ALPHA_EXPLORATION_MAX_MULT:.2f}x "
+            f"on SWARM-2; core={COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL after "
+            f"{ALPHA_MIN_SAMPLES}+ samples, WR>={ALPHA_PROMOTE_MIN_WR:.0%}, "
+            f"avg_best>={ALPHA_PROMOTE_MIN_AVG_BEST_NET:+.1%}.")
+        log(f"  Alpha exits: TP={COPY_FAST_ALPHA_TP_MULT:.3f}x fast-kill "
+            f"{COPY_FAST_ALPHA_FAST_KILL_SEC:.1f}s/{COPY_FAST_ALPHA_FAST_KILL_PEAK:.3f}x; "
+            f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
     log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
         f"{COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s confirm window.")
     log(f"=== V41.19 MARKET-WIDE TAPE SCALPER ===")
