@@ -1352,6 +1352,12 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
         if mint in positions:
             log(f"  GRAD SKIP {mint[:8]}: already in positions (dedup)")
             return
+        if _mint_recently_closed(mint):
+            if launchpad == "copy_fast_swarm":
+                _swarm_override_entered.discard(mint)
+            log(f"  GRAD SKIP {mint[:8]} ({launchpad}): closed within "
+                f"{RECENT_CLOSE_REENTRY_COOLDOWN_SEC:.0f}s cooldown")
+            return
 
         # V41.18: copy_fast is no longer allowed to be a blind entry. The last
         # paper run showed raw copy_fast was 0/3 and -0.0174 SOL, while confirmed
@@ -6044,8 +6050,8 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
     if move_mult < MARKET_TAPE_MIN_BC_MOVE or move_mult > MARKET_TAPE_MAX_BC_MOVE:
         return
     strong_low_move = (
-        len(unique_buyers) >= MARKET_TAPE_LOW_MOVE_MIN_UNIQUE
-        or len(tracked_buyers) >= MARKET_TAPE_LOW_MOVE_MIN_TRACKED
+        (len(unique_buyers) >= MARKET_TAPE_LOW_MOVE_MIN_UNIQUE
+         and len(tracked_buyers) >= MARKET_TAPE_LOW_MOVE_MIN_TRACKED)
         or buy_sol >= MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL
     )
     if move_mult < MARKET_TAPE_LOW_MOVE_STRONG_BELOW and not strong_low_move:
@@ -6715,7 +6721,7 @@ async def main():
         f"fast-kill {MARKET_TAPE_FAST_KILL_SEC:.1f}s if peak<{MARKET_TAPE_FAST_KILL_PEAK:.3f}x.")
     log(f"  Dump guard: price_ratio {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x; "
         f"bc<{MARKET_TAPE_LOW_MOVE_STRONG_BELOW:.3f}x requires "
-        f"{MARKET_TAPE_LOW_MOVE_MIN_UNIQUE}+ unique or {MARKET_TAPE_LOW_MOVE_MIN_TRACKED}+ tracked "
+        f"({MARKET_TAPE_LOW_MOVE_MIN_UNIQUE}+ unique and {MARKET_TAPE_LOW_MOVE_MIN_TRACKED}+ tracked) "
         f"or {MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL:.1f}+ SOL buy pressure.")
     log(f"=== V41.17zc/V41.18 DEAD-PEAK + CONFIRM-GATED SWARM ===")
     log(f"  Reverted fixed 3s sustain-wait; V41.18 uses price-confirm polling instead.")
