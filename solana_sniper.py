@@ -96,7 +96,9 @@ import asyncio
 import base64
 import json
 import os
+import struct
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -4791,6 +4793,104 @@ _PUMP_PROGRAM_STR = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 _DISC_BUY_BYTES = bytes([102, 6, 61, 18, 1, 218, 235, 234])
 _BONK_PROGRAM_STR = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
 
+# V41.17z: BondingCurve account discriminator (per pump.fun IDL).
+# Used for programSubscribe memcmp filter to build a hot trend cache.
+_BC_DISC_BYTES = bytes([0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xac, 0x60])
+_BC_DISC_B58 = base58.b58encode(_BC_DISC_BYTES).decode()
+
+# Hot cache: bc_pda (str) -> deque of (ts_ms, vSol, vTokens). Populated by
+# pump_program_bc_listener via programSubscribe. Read by _compute_trend_5s.
+_bc_state_cache: dict = defaultdict(lambda: deque(maxlen=20))
+
+# V41.17z trend gate config (env-tunable). Skip copy_fast entries when the
+# bonding curve was strongly dumping in the 5 seconds before the trader bought
+# — that pattern produced our worst losses (e.g., 8xV18bZ3 -10.5%).
+TREND_GATE_ENABLED = os.environ.get("TREND_GATE_ENABLED", "1") == "1"
+TREND_GATE_5S_MIN = float(os.environ.get("TREND_GATE_5S_MIN", "-0.02"))
+
+
+def _compute_trend_5s_for_mint(mint: str) -> Optional[float]:
+    """Compute 5-second vSol trend on a bonding curve from the hot cache.
+    Returns fractional change (e.g. +0.05 = +5%) or None if insufficient data.
+    Uses fail-OPEN semantics in the gate — if no cache, no skip."""
+    try:
+        bc_pda, _ = Pubkey.find_program_address(
+            [b"bonding-curve", bytes(Pubkey.from_string(mint))],
+            Pubkey.from_string(_PUMP_PROGRAM_STR),
+        )
+        items = list(_bc_state_cache.get(str(bc_pda), ()))
+    except Exception:
+        return None
+    if len(items) < 2:
+        return None
+    now_ms = int(time.time() * 1000)
+    cutoff = now_ms - 5_000
+    recent = [it for it in items if it[0] >= cutoff]
+    if len(recent) < 2:
+        return None
+    first = recent[0][1]; last = recent[-1][1]
+    if first == 0:
+        return None
+    return (last - first) / first
+
+
+async def pump_program_bc_listener():
+    """V41.17z: programSubscribe to pump.fun BondingCurve accounts (memcmp filter).
+    Populates _bc_state_cache so copy_fast can read pre-entry trend in <1ms.
+
+    Uses a SECOND WS connection (we have a 2-conn cap on RPC plan; copy_trader
+    uses 1 conn for shredSubscribe, this uses the 2nd). If the conn is rejected
+    (cap reached), we keep retrying on backoff — gate fails-OPEN meanwhile."""
+    if not COPY_TRADE_ENABLED or not ST_RPC_ENABLED:
+        return
+    log("PUMP-BC-CACHE: starting programSubscribe for trend gate (V41.17z)")
+    while True:
+        try:
+            sub_msg = {
+                "jsonrpc": "2.0", "id": 9001,
+                "method": "programSubscribe",
+                "params": [
+                    _PUMP_PROGRAM_STR,
+                    {"encoding": "base64", "commitment": "processed",
+                     "filters": [{"memcmp": {"offset": 0, "bytes": _BC_DISC_B58}}]},
+                ],
+            }
+            async with websockets.connect(
+                ST_RPC_WS,
+                ping_interval=20, ping_timeout=60,
+                max_queue=2048, max_size=8 * 1024 * 1024,
+            ) as ws:
+                await ws.send(json.dumps(sub_msg))
+                ack_raw = await ws.recv()
+                ack = json.loads(ack_raw)
+                log(f"PUMP-BC-CACHE: subscribed (sub_id={ack.get('result')})")
+                async for raw in ws:
+                    d = json.loads(raw)
+                    if "method" not in d:
+                        continue
+                    val = (d.get("params") or {}).get("result", {}).get("value", {})
+                    pubkey = val.get("pubkey")
+                    if not pubkey:
+                        continue
+                    acc = val.get("account") or {}
+                    data = acc.get("data")
+                    if isinstance(data, list):
+                        data = data[0]
+                    if not isinstance(data, str):
+                        continue
+                    try:
+                        raw_bytes = base64.b64decode(data)
+                        if len(raw_bytes) < 0x18 or raw_bytes[:8] != _BC_DISC_BYTES:
+                            continue
+                        vtoken = struct.unpack_from("<Q", raw_bytes, 0x08)[0]
+                        vsol = struct.unpack_from("<Q", raw_bytes, 0x10)[0]
+                        _bc_state_cache[pubkey].append((int(time.time() * 1000), vsol, vtoken))
+                    except Exception:
+                        continue
+        except Exception as e:
+            log(f"PUMP-BC-CACHE WS err, reconnect 5s: {type(e).__name__}: {e}")
+            await asyncio.sleep(5)
+
 
 def _parse_base64_shred_for_pump_buy(shred_result: dict, trader_set: set) -> Optional[dict]:
     """V41.17y: parse a BASE64-encoded shredSubscribe message locally with `solders`,
@@ -4954,6 +5054,16 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
             _copy_trade_stats["bundle_fresh_blocked"] += 1
         log(f"  COPY TRADE RUG-BLOCKED {signer[:8]} -> {mint[:8]}: {reason}")
         return
+    # V41.17z trend gate: skip if bonding curve was DUMPING in the 5s before
+    # this trader's buy. Empirical pattern from feature test: trader buys into
+    # a -3.3% recent dump → token kept dumping → -7% SL. Fail-OPEN if cache miss.
+    if TREND_GATE_ENABLED:
+        trend_5s = _compute_trend_5s_for_mint(mint)
+        if trend_5s is not None and trend_5s < TREND_GATE_5S_MIN:
+            _copy_trade_stats["trend_blocked"] = _copy_trade_stats.get("trend_blocked", 0) + 1
+            log(f"  COPY TRADE TREND-BLOCKED {signer[:8]} -> {mint[:8]}: "
+                f"trend_5s={trend_5s*100:+.1f}% < {TREND_GATE_5S_MIN*100:+.1f}% (curve dumping)")
+            return
     _copy_trade_stats["fired"] += 1
     log(f"*** COPY TRADE *** {signer[:8]} bought {mint} (sig={sig[:16]}) trader_px={trader_price:.4e} [{source}]")
     asyncio.create_task(graduation_snipe(client, kp, mint, launchpad="copy_fast",
@@ -5485,6 +5595,10 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17z TREND GATE (skip dumping curves) ===")
+    log(f"  programSubscribe to pump.fun BondingCurve → hot trend cache")
+    log(f"  Skip copy_fast if curve dumped >{abs(TREND_GATE_5S_MIN)*100:.0f}% in 5s before trader buy")
+    log(f"  Fail-OPEN on cache miss (don't reduce frequency on no-data signals)")
     log(f"=== V41.17y YELLOWSTONE-EQUIVALENT (latency parity at $0/mo) ===")
     log(f"  shredSubscribe: accountInclude + accountRequired=[pump_program]")
     log(f"    -> server-side filter drops 27% non-pump.fun txs (test-confirmed)")
@@ -5514,6 +5628,8 @@ async def main():
     asyncio.create_task(refresh_risk_cache())
     # V41.17x: rebuild active sniper pool every hour
     asyncio.create_task(active_sniper_refresh_loop())
+    # V41.17z: BondingCurve programSubscribe → trend cache for the dump-gate
+    asyncio.create_task(pump_program_bc_listener())
     # V41.17 Fix #2: warm /stream/swap pool (live mode + keypair)
     if not PAPER_TRADING and kp:
         asyncio.create_task(warm_raptor_swap_pool(kp))
