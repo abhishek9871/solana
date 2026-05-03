@@ -1327,6 +1327,7 @@ ALPHA_CONTEXT_ONLY_MIN_WR = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_WR", "0
 ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET", "0.050"))
 COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL", "0.003125"))
 COPY_FAST_ALPHA_CORE_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_CORE_AMOUNT_SOL", "0.0125"))
+COPY_FAST_ALPHA_MIN_ENTRY_MULT = float(os.environ.get("COPY_FAST_ALPHA_MIN_ENTRY_MULT", "1.006"))
 COPY_FAST_ALPHA_EXPLORATION_MIN_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MIN_MULT", "1.22"))
 COPY_FAST_ALPHA_EXPLORATION_MAX_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MAX_MULT", "1.55"))
 COPY_FAST_ALPHA_TP_MULT = float(os.environ.get("COPY_FAST_ALPHA_TP_MULT", "1.045"))
@@ -5242,6 +5243,8 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
                       off_peak_ok: bool) -> Optional[dict]:
     if not (ALPHA_LEARNER_ENABLED and ALPHA_ADAPTIVE_ENTRY_ENABLED):
         return None
+    if not off_peak_ok or last_mult < COPY_FAST_ALPHA_MIN_ENTRY_MULT:
+        return None
     context = _alpha_context_key(lane, mint, signer, trader_price, trigger_price)
     wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
     context_stat = _alpha_stats.get("contexts", {}).get(context)
@@ -7816,7 +7819,8 @@ async def main():
             f"explore {COPY_FAST_ALPHA_EXPLORATION_MIN_MULT:.2f}-{COPY_FAST_ALPHA_EXPLORATION_MAX_MULT:.2f}x "
             f"on SWARM-2; core={COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL after "
             f"{ALPHA_MIN_SAMPLES}+ samples, WR>={ALPHA_PROMOTE_MIN_WR:.0%}, "
-            f"avg_best>={ALPHA_PROMOTE_MIN_AVG_BEST_NET:+.1%}.")
+            f"avg_best>={ALPHA_PROMOTE_MIN_AVG_BEST_NET:+.1%}; live mult must be "
+            f">={COPY_FAST_ALPHA_MIN_ENTRY_MULT:.3f}x and near peak.")
         log(f"  Context-only market alpha requires {ALPHA_CONTEXT_ONLY_MIN_SAMPLES}+ samples, "
             f"WR>={ALPHA_CONTEXT_ONLY_MIN_WR:.0%}, avg_best>={ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET:+.1%}.")
         log(f"  Alpha exits: TP={COPY_FAST_ALPHA_TP_MULT:.3f}x fast-kill "
