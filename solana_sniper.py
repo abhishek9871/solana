@@ -1081,7 +1081,7 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
         # V41.14: copy_fast — when shredSubscribe fires for a top trader's buy, we
         # have ~200ms latency advantage. Burning it on observation wait kills the edge.
         # Skip observation entirely and buy on the same block the trader bought.
-        if launchpad == "copy_fast":
+        if launchpad in ("copy_fast", "copy_fast_swarm"):
             signal_time_ms = int(time.time() * 1000)
             probe_sol_lamports = int(0.001 * 1e9)
             # V41.17 Fix #3: race the probe quote with a smart-wallet exit check.
@@ -1164,17 +1164,20 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 else:
                     log(f"  GRAD WARM tx send failed {mint[:8]} — falling back to standard buy")
                     _copy_trade_stats["warm_miss"] += 1
+            # V41.17z9: SWARM-OVERRIDE entries use HALF size (0.025 vs 0.05) for
+            # risk management since they bypass the rug check.
+            entry_amount = GRAD_AMOUNT_SOL * 0.5 if launchpad == "copy_fast_swarm" else GRAD_AMOUNT_SOL
             # Fallback to standard buy_token (does its own quote+swap+send)
             if pos is None:
-                log(f"  GRAD ENTRY {mint[:8]} (copy_fast): trader signal, entering immediately, buying {GRAD_AMOUNT_SOL} SOL")
-                pos = buy_token(kp, client, mint, GRAD_AMOUNT_SOL)
+                log(f"  GRAD ENTRY {mint[:8]} ({launchpad}): trader signal, entering immediately, buying {entry_amount} SOL")
+                pos = buy_token(kp, client, mint, entry_amount)
                 if not pos:
                     log(f"  GRAD BUY FAILED {mint[:8]}")
                     return
             pos.strategy = "graduation"
             pos.late_scalp = True
             pos.entry_progress = 1.0
-            pos.entry_size_sol = GRAD_AMOUNT_SOL
+            pos.entry_size_sol = entry_amount
             pos.quality_score = 8
             pos.launchpad = launchpad
             # V41.17 Fix #9: stamp signal time so manage_graduation_position can apply
@@ -1357,8 +1360,18 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # which closed real winners; live data now confirms the proper params.
             DEAD_PEAK_TIME_SEC = 5.0
             DEAD_PEAK_THRESHOLD = 1.005
-            if (pos.launchpad in ("copy_fast", "pump", "bonk", "grad_imminent",
-                                  "momentum", "st_pump")
+            # V41.17z9: hard 30s timeout for swarm-override entries (bundle pumps
+            # are typically over within 30-60s; cap exposure)
+            if (pos.launchpad == "copy_fast_swarm"
+                    and pos.signal_time_ms > 0
+                    and (time.time() * 1000 - pos.signal_time_ms) > 30_000):
+                if try_grad_sell(
+                    f"GRAD SWARM-TIMEOUT 30s exit (peak={pos.peak_price:.3f}x mult={multiplier:.3f}x)",
+                    1.0, multiplier,
+                ):
+                    break
+            if (pos.launchpad in ("copy_fast", "copy_fast_swarm", "pump", "bonk",
+                                  "grad_imminent", "momentum", "st_pump")
                     and pos.signal_time_ms > 0
                     and pos.peak_price < DEAD_PEAK_THRESHOLD):
                 age_s = (time.time() * 1000 - pos.signal_time_ms) / 1000
@@ -4352,6 +4365,15 @@ _copy_trader_seen_sigs: set = set()
 # mint -> list of (signer_str, ts_ms). Pruned to last 60s on each access.
 _signer_history_per_mint: dict[str, list] = {}
 
+# V41.17z9: track recently rug-blocked mints — if SWARM-3+ forms within 30s,
+# we override the rug-block and enter with risk-capped sizing.
+# mint -> ts_ms when first rug-blocked
+_rug_blocked_recent: dict[str, int] = {}
+
+# V41.17z9: track which mints we've already swarm-overridden so we don't
+# re-enter the same one repeatedly.
+_swarm_override_entered: set = set()
+
 _copy_trade_stats = {
     "shreds": 0, "no_meta": 0, "wrong_signer": 0, "no_buy": 0,
     "non_memecoin": 0, "dedup": 0, "fired": 0, "exception": 0,
@@ -5106,6 +5128,21 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
                 if age_s < 30 and existing.peak_price >= 0.95:
                     asyncio.create_task(_swarm_compound_position(
                         client, kp, mint, len(recent_signers), signer))
+            # V41.17z9: SWARM-OVERRIDE-RUG — if SWARM-3+ formed and the mint was
+            # rug-blocked in last 30s and we don't have a position yet, the smart
+            # wallets disagree with our rug heuristic. Enter with capped size.
+            elif (not existing
+                    and len(recent_signers) >= 3
+                    and mint in _rug_blocked_recent
+                    and (now_ms - _rug_blocked_recent[mint]) < 30_000
+                    and mint not in _swarm_override_entered):
+                _swarm_override_entered.add(mint)
+                _copy_trade_stats["swarm_override"] = _copy_trade_stats.get("swarm_override", 0) + 1
+                log(f"  *** SWARM-OVERRIDE-RUG *** {mint[:8]}: {len(recent_signers)} wallets agree, "
+                    f"overriding rug-block with capped 0.025 SOL")
+                asyncio.create_task(graduation_snipe(
+                    client, kp, mint, launchpad="copy_fast_swarm",
+                    signer=signer, trader_price=trader_price))
         return
     mint_lc = mint.lower()
     if not (mint_lc.endswith("pump") or mint_lc.endswith("bonk")):
@@ -5121,6 +5158,15 @@ async def _dispatch_copy_signal(client: Client, kp: Optional[Keypair], sig: str,
         _copy_trade_stats["rug_blocked"] += 1
         if "fresh bundle" in (reason or ""):
             _copy_trade_stats["bundle_fresh_blocked"] += 1
+        # V41.17z9: remember this mint was rug-blocked. If SWARM-3+ forms on it
+        # within 30s, the swarm overrides our rug heuristic.
+        _rug_blocked_recent[mint] = int(time.time() * 1000)
+        # Bound dict size
+        if len(_rug_blocked_recent) > 500:
+            cutoff = int(time.time() * 1000) - 60_000
+            for m in list(_rug_blocked_recent.keys()):
+                if _rug_blocked_recent[m] < cutoff:
+                    _rug_blocked_recent.pop(m, None)
         log(f"  COPY TRADE RUG-BLOCKED {signer[:8]} -> {mint[:8]}: {reason}")
         return
     # V41.17z trend gate: skip if bonding curve was DUMPING in the 5s before
@@ -5699,6 +5745,9 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17z9 SWARM-OVERRIDE-RUG ===")
+    log(f"  When SWARM-3+ forms within 30s on a rug-blocked mint, OVERRIDE the rug check")
+    log(f"  Capped: 0.025 SOL position (half), 30s hard timeout, dead-peak guard active")
     log(f"=== V41.17z8 SWARM COMPOUND ===")
     log(f"  When SWARM-N (>=2 pool wallets) on a mint we have an open position on,")
     log(f"  ADD to position: 0.5x size for SWARM-2, 1x size for SWARM-3+. Cap 2 adds.")
