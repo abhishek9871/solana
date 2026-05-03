@@ -1322,6 +1322,9 @@ ALPHA_PROMOTE_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_PROMOTE_MIN_AVG_BES
 ALPHA_BLOCK_MIN_SAMPLES = int(os.environ.get("ALPHA_BLOCK_MIN_SAMPLES", "4"))
 ALPHA_BLOCK_MAX_WR = float(os.environ.get("ALPHA_BLOCK_MAX_WR", "0.25"))
 ALPHA_BLOCK_MAX_AVG_BEST_NET = float(os.environ.get("ALPHA_BLOCK_MAX_AVG_BEST_NET", "0.000"))
+ALPHA_CONTEXT_ONLY_MIN_SAMPLES = int(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_SAMPLES", "8"))
+ALPHA_CONTEXT_ONLY_MIN_WR = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_WR", "0.65"))
+ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET", "0.050"))
 COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL", "0.003125"))
 COPY_FAST_ALPHA_CORE_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_CORE_AMOUNT_SOL", "0.0125"))
 COPY_FAST_ALPHA_EXPLORATION_MIN_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MIN_MULT", "1.22"))
@@ -1403,9 +1406,9 @@ MARKET_TAPE_BIRTH_MIN_BC_MOVE = float(os.environ.get("MARKET_TAPE_BIRTH_MIN_BC_M
 MARKET_TAPE_BIRTH_MAX_BC_MOVE = float(os.environ.get("MARKET_TAPE_BIRTH_MAX_BC_MOVE", "1.080"))
 MARKET_TAPE_BIRTH_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_BIRTH_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_BIRTH_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_BIRTH_CONFIRM_MIN_MULT", "1.001"))
-SWARM_SCOUT_ENABLED = os.environ.get("SWARM_SCOUT_ENABLED", "0") == "1"
+SWARM_SCOUT_ENABLED = os.environ.get("SWARM_SCOUT_ENABLED", "1") == "1"
 SWARM_SCOUT_MIN_SIGNERS = int(os.environ.get("SWARM_SCOUT_MIN_SIGNERS", "3"))
-SWARM_SCOUT_AMOUNT_SOL = float(os.environ.get("SWARM_SCOUT_AMOUNT_SOL", str(MARKET_TAPE_SCOUT_AMOUNT_SOL)))
+SWARM_SCOUT_AMOUNT_SOL = float(os.environ.get("SWARM_SCOUT_AMOUNT_SOL", str(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)))
 SWARM_SCOUT_MIN_BC_MOVE = float(os.environ.get("SWARM_SCOUT_MIN_BC_MOVE", "1.015"))
 SWARM_SCOUT_MAX_BC_MOVE = float(os.environ.get("SWARM_SCOUT_MAX_BC_MOVE", "1.120"))
 SWARM_SCOUT_CONFIRM_DELAY_SEC = float(os.environ.get("SWARM_SCOUT_CONFIRM_DELAY_SEC", "0.35"))
@@ -5121,6 +5124,15 @@ def _alpha_promoted(stat: Optional[dict], min_samples: int = ALPHA_MIN_SAMPLES) 
     return n >= min_samples and wr >= ALPHA_PROMOTE_MIN_WR and avg_best >= ALPHA_PROMOTE_MIN_AVG_BEST_NET
 
 
+def _alpha_context_only_promoted(stat: Optional[dict]) -> bool:
+    n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
+    return (
+        n >= ALPHA_CONTEXT_ONLY_MIN_SAMPLES
+        and wr >= ALPHA_CONTEXT_ONLY_MIN_WR
+        and avg_best >= ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET
+    )
+
+
 def _alpha_toxic(stat: Optional[dict]) -> bool:
     n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
     return n >= ALPHA_BLOCK_MIN_SAMPLES and wr <= ALPHA_BLOCK_MAX_WR and avg_best <= ALPHA_BLOCK_MAX_AVG_BEST_NET
@@ -5307,7 +5319,7 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
             "reason": f"alpha_wallet_context w={wn}/{wwr:.0%}/{wavg:+.1%} "
                       f"c={cn}/{cwr:.0%}/{cavg:+.1%} ctx={context}",
         }
-    if _alpha_promoted(context_stat):
+    if _alpha_context_only_promoted(context_stat):
         n, wr, avg_best, _avg_exit = _alpha_stat_view(context_stat)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
@@ -7805,6 +7817,8 @@ async def main():
             f"on SWARM-2; core={COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL after "
             f"{ALPHA_MIN_SAMPLES}+ samples, WR>={ALPHA_PROMOTE_MIN_WR:.0%}, "
             f"avg_best>={ALPHA_PROMOTE_MIN_AVG_BEST_NET:+.1%}.")
+        log(f"  Context-only market alpha requires {ALPHA_CONTEXT_ONLY_MIN_SAMPLES}+ samples, "
+            f"WR>={ALPHA_CONTEXT_ONLY_MIN_WR:.0%}, avg_best>={ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET:+.1%}.")
         log(f"  Alpha exits: TP={COPY_FAST_ALPHA_TP_MULT:.3f}x fast-kill "
             f"{COPY_FAST_ALPHA_FAST_KILL_SEC:.1f}s/{COPY_FAST_ALPHA_FAST_KILL_PEAK:.3f}x; "
             f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
