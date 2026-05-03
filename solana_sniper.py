@@ -6276,6 +6276,13 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
                 log(f"  MARKET-TAPE BLOCK {mint[:8]}: confirm price_ratio={confirm_ratio:.3f}x "
                     f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
                 return
+        post_confirm_ms = int(time.time() * 1000)
+        ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
+        if ratio_block_until > post_confirm_ms:
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            log(f"  MARKET-TAPE BLOCK {mint[:8]}: concurrent price_ratio violation "
+                f"cooldown {(ratio_block_until - post_confirm_ms) / 1000:.1f}s")
+            return
 
     graduated_seen.add(mint)
     if len(graduated_seen) > 500:
