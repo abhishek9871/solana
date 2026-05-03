@@ -1311,6 +1311,10 @@ MARKET_TAPE_LOW_MOVE_STRONG_BELOW = float(os.environ.get("MARKET_TAPE_LOW_MOVE_S
 MARKET_TAPE_LOW_MOVE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_UNIQUE", "8"))
 MARKET_TAPE_LOW_MOVE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_TRACKED", "3"))
 MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL", "5.0"))
+MARKET_TAPE_MID_MOVE_STRONG_BELOW = float(os.environ.get("MARKET_TAPE_MID_MOVE_STRONG_BELOW", "1.12"))
+MARKET_TAPE_MID_MOVE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_MID_MOVE_MIN_UNIQUE", "6"))
+MARKET_TAPE_MID_MOVE_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_MID_MOVE_MIN_TRACKED", "2"))
+MARKET_TAPE_MID_MOVE_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_MID_MOVE_MIN_BUY_SOL", "10.0"))
 MARKET_TAPE_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_CONFIRM_DELAY_SEC", "0.35"))
 MARKET_TAPE_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_CONFIRM_MIN_MULT", "1.003"))
 MARKET_TAPE_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_COOLDOWN_SEC", "25"))
@@ -6099,6 +6103,17 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
             f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
         return
+    strong_mid_move = (
+        (len(unique_buyers) >= MARKET_TAPE_MID_MOVE_MIN_UNIQUE
+         and len(tracked_buyers) >= MARKET_TAPE_MID_MOVE_MIN_TRACKED)
+        or buy_sol >= MARKET_TAPE_MID_MOVE_MIN_BUY_SOL
+    )
+    if move_mult < MARKET_TAPE_MID_MOVE_STRONG_BELOW and not strong_mid_move:
+        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        log(f"  MARKET-TAPE BLOCK {mint[:8]}: weak mid-move setup "
+            f"unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
+            f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
+        return
     latest_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
     if not latest_price:
         return
@@ -6779,6 +6794,9 @@ async def main():
         f"bc<{MARKET_TAPE_LOW_MOVE_STRONG_BELOW:.3f}x requires "
         f"({MARKET_TAPE_LOW_MOVE_MIN_UNIQUE}+ unique and {MARKET_TAPE_LOW_MOVE_MIN_TRACKED}+ tracked) "
         f"or {MARKET_TAPE_LOW_MOVE_MIN_BUY_SOL:.1f}+ SOL buy pressure.")
+    log(f"  Mid-move guard: bc<{MARKET_TAPE_MID_MOVE_STRONG_BELOW:.3f}x requires "
+        f"({MARKET_TAPE_MID_MOVE_MIN_UNIQUE}+ unique and {MARKET_TAPE_MID_MOVE_MIN_TRACKED}+ tracked) "
+        f"or {MARKET_TAPE_MID_MOVE_MIN_BUY_SOL:.1f}+ SOL buy pressure.")
     log(f"  Micro-confirm: wait {MARKET_TAPE_CONFIRM_DELAY_SEC:.2f}s and require "
         f"{MARKET_TAPE_CONFIRM_MIN_MULT:.3f}x continuation before entry.")
     log(f"=== V41.17zc/V41.18 DEAD-PEAK + CONFIRM-GATED SWARM ===")
