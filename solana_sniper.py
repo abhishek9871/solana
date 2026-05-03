@@ -5470,7 +5470,10 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                         # jsonParsed encoding is server-throttled by 99% (test-confirmed
                         # 7.6/s base64 vs 0.1/s jsonParsed) — base64 is the only viable
                         # encoding for high-volume copy-trade.
-                        sub_msg = {
+                        # V41.17z: MULTIPLEX both subscriptions on the SAME WS conn
+                        # to stay under ST RPC's 2-conn cap. shredSubscribe = trader
+                        # buys; programSubscribe = bonding-curve cache for trend gate.
+                        shred_sub = {
                             "jsonrpc": "2.0", "id": 9000,
                             "method": "shredSubscribe",
                             "params": [
@@ -5481,21 +5484,53 @@ async def copy_trader_listener(client: Client, kp: Optional[Keypair]):
                                  "maxSupportedTransactionVersion": 0},
                             ],
                         }
-                        await ws.send(json.dumps(sub_msg))
-                        log(f"COPY-TRADE: subscribed via ST shredSubscribe for {len(top_traders)} wallets — V41.17y Yellowstone-equivalent (base64 + accountRequired=pump + local solders parse)")
+                        bc_sub = {
+                            "jsonrpc": "2.0", "id": 9001,
+                            "method": "programSubscribe",
+                            "params": [
+                                _PUMP_PROGRAM_STR,
+                                {"encoding": "base64", "commitment": "processed",
+                                 "filters": [{"memcmp": {"offset": 0, "bytes": _BC_DISC_B58}}]},
+                            ],
+                        }
+                        await ws.send(json.dumps(shred_sub))
+                        await ws.send(json.dumps(bc_sub))
+                        log(f"COPY-TRADE: subscribed via ST shredSubscribe for {len(top_traders)} wallets — V41.17y Yellowstone-equivalent + V41.17z trend cache (multiplexed on 1 WS)")
                         async for raw in ws:
                             data = json.loads(raw)
-                            if "method" not in data:
+                            method = data.get("method", "")
+                            if not method:
                                 continue
-                            res = (data.get("params", {}) or {}).get("result", {})
-                            sig = res.get("signature")
-                            if not sig:
-                                continue
-                            if time.time() - last_refresh > COPY_TRADE_REFRESH_HOURS * 3600:
-                                log("COPY-TRADE: leaderboard refresh due — reconnecting")
-                                break
-                            # V41.17i: pass the shred result for fast-path direct parse
-                            asyncio.create_task(_handle_copy_trader_tx(client, kp, sig, trader_set, res))
+                            if "shred" in method.lower():
+                                res = (data.get("params", {}) or {}).get("result", {})
+                                sig = res.get("signature")
+                                if not sig:
+                                    continue
+                                if time.time() - last_refresh > COPY_TRADE_REFRESH_HOURS * 3600:
+                                    log("COPY-TRADE: leaderboard refresh due — reconnecting")
+                                    break
+                                asyncio.create_task(_handle_copy_trader_tx(client, kp, sig, trader_set, res))
+                            elif "program" in method.lower():
+                                # Update bc state cache for trend gate
+                                val = (data.get("params") or {}).get("result", {}).get("value", {})
+                                pubkey = val.get("pubkey")
+                                if not pubkey:
+                                    continue
+                                acc = val.get("account") or {}
+                                acc_data = acc.get("data")
+                                if isinstance(acc_data, list):
+                                    acc_data = acc_data[0]
+                                if not isinstance(acc_data, str):
+                                    continue
+                                try:
+                                    raw_bytes = base64.b64decode(acc_data)
+                                    if len(raw_bytes) < 0x18 or raw_bytes[:8] != _BC_DISC_BYTES:
+                                        continue
+                                    vtoken = struct.unpack_from("<Q", raw_bytes, 0x08)[0]
+                                    vsol = struct.unpack_from("<Q", raw_bytes, 0x10)[0]
+                                    _bc_state_cache[pubkey].append((int(time.time() * 1000), vsol, vtoken))
+                                except Exception:
+                                    continue
                 else:
                     # Fallback: Helius logsSubscribe (slower, ~500-1500ms)
                     async with websockets.connect(SOLANA_WS_URL, ping_interval=10, ping_timeout=20) as ws:
@@ -5628,8 +5663,10 @@ async def main():
     asyncio.create_task(refresh_risk_cache())
     # V41.17x: rebuild active sniper pool every hour
     asyncio.create_task(active_sniper_refresh_loop())
-    # V41.17z: BondingCurve programSubscribe → trend cache for the dump-gate
-    asyncio.create_task(pump_program_bc_listener())
+    # V41.17z: BondingCurve programSubscribe is now MULTIPLEXED on the same WS as
+    # shredSubscribe (inside copy_trader_listener). Standalone listener disabled
+    # to stay under the ST RPC 2-conn cap.
+    # asyncio.create_task(pump_program_bc_listener())
     # V41.17 Fix #2: warm /stream/swap pool (live mode + keypair)
     if not PAPER_TRADING and kp:
         asyncio.create_task(warm_raptor_swap_pool(kp))
