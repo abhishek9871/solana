@@ -3919,13 +3919,13 @@ SMART_BUYER_MAX_PRICE_RATIO = float(os.environ.get("SMART_BUYER_MAX_PRICE_RATIO"
 # we follow at +1s, curve has already topped. Solution: compare our probe quote price to
 # the trader's actual buy price (parsed from their tx pre/post balances). If our entry
 # price > trader * 1.05, abort — curve moved against us, we'd be entering at peak.
-COPY_FAST_MAX_PRICE_RATIO = float(os.environ.get("COPY_FAST_MAX_PRICE_RATIO", "1.05"))
+COPY_FAST_MAX_PRICE_RATIO = float(os.environ.get("COPY_FAST_MAX_PRICE_RATIO", "1.10"))
 # V41.17h: bidirectional. Second observed loss (CsZiG33J -3.6% capped by Fix #9) showed
 # the inverse pattern: ratio=0.473x meant the curve had ALREADY DUMPED 53% between
 # trader's buy and ours. Catching a falling knife — momentum broken, no rebound. Floor
 # at 0.85 catches obvious post-trader dumps while leaving margin for normal post-buy
 # settling (which moves ratio to ~0.95-1.00 on large trader buys, never to 0.85).
-COPY_FAST_MIN_PRICE_RATIO = float(os.environ.get("COPY_FAST_MIN_PRICE_RATIO", "0.85"))
+COPY_FAST_MIN_PRICE_RATIO = float(os.environ.get("COPY_FAST_MIN_PRICE_RATIO", "0.80"))
 # Fix #5: tighter wallet allowlist filter (uses existing top-traders metrics)
 COPY_TRADE_MIN_REALIZED_SOL = float(os.environ.get("COPY_TRADE_MIN_REALIZED_SOL", "1.0"))
 # V41.17o: REVERTED WR 0.40 → 0.50. V41.17m bumped pool 56 → 90 but shred volume
@@ -5647,6 +5647,9 @@ async def main():
     log(f"  V41.8 BIG-WIN MODE: pos=0.05 SOL ($4.20), V40 TP=+50%, GRAD TP=+50%, target $2.10 per TP hit")
     log(f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} (was 6) | Session halt: -{MAX_SESSION_LOSS_SOL:.3f} SOL")
     log(f"  Latency stack: Helius WS (logs+accounts) + PumpPortal WS + bonk parallel stream")
+    log(f"=== V41.17z3 WIDER FIX#11 BAND ===")
+    log(f"  Fix #11 ratio band: {COPY_FAST_MIN_PRICE_RATIO:.2f}x - {COPY_FAST_MAX_PRICE_RATIO:.2f}x (was 0.85-1.05)")
+    log(f"  Dead-peak guard makes wider band safe — borderline duds capped at -3% via 5s exit")
     log(f"=== V41.17z2 DEAD-PEAK GUARD ===")
     log(f"  Exit copy_fast at 5s if peak < 1.005x (curve never moved up = dead)")
     log(f"  Empirical: 100% of losses had peak=1.00x; 100% of wins peaked >=1.05x in <7s")
