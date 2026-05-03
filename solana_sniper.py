@@ -1329,6 +1329,7 @@ ALPHA_CONTEXT_ONLY_MIN_WR = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_WR", "0
 ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET", "0.050"))
 COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL", "0.003125"))
 COPY_FAST_ALPHA_CORE_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_CORE_AMOUNT_SOL", "0.0125"))
+COPY_FAST_CONFIRMED_AMOUNT_SOL = float(os.environ.get("COPY_FAST_CONFIRMED_AMOUNT_SOL", str(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)))
 COPY_FAST_ALPHA_MIN_ENTRY_MULT = float(os.environ.get("COPY_FAST_ALPHA_MIN_ENTRY_MULT", "1.006"))
 COPY_FAST_ALPHA_EXPLORATION_MIN_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MIN_MULT", "1.22"))
 COPY_FAST_ALPHA_EXPLORATION_MAX_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MAX_MULT", "1.55"))
@@ -1565,7 +1566,12 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                 entry_amount = COPY_FAST_SOLO_ROCKET_AMOUNT_SOL
                 _copy_fast_solo_rocket_mints.discard(mint)
             elif not entry_override:
-                entry_amount = GRAD_AMOUNT_SOL * 0.5 if launchpad == "copy_fast_swarm" else GRAD_AMOUNT_SOL
+                if launchpad == "copy_fast_swarm":
+                    entry_amount = GRAD_AMOUNT_SOL * 0.5
+                elif launchpad == "copy_fast":
+                    entry_amount = COPY_FAST_CONFIRMED_AMOUNT_SOL
+                else:
+                    entry_amount = GRAD_AMOUNT_SOL
             if not _claim_entry_mint(mint, launchpad):
                 return
             claimed_entry = True
@@ -1577,7 +1583,9 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             # Warm txs are built at GRAD_AMOUNT_SOL. Do not use them for capped
             # swarm overrides, or live mode can silently break the half-size cap.
             warm = (_consume_warm_swap_tx(mint)
-                    if (entry_launchpad == "copy_fast" and not PAPER_TRADING and kp)
+                    if (entry_launchpad == "copy_fast"
+                        and abs(entry_amount - GRAD_AMOUNT_SOL) < 1e-9
+                        and not PAPER_TRADING and kp)
                     else None)
             if warm:
                 tx_b64, _lvbh = warm
@@ -7907,6 +7915,8 @@ async def main():
         f"+{(COPY_FAST_CONFIRM_MIN_MULT-1)*100:.1f}% move, cap<={COPY_FAST_CONFIRM_MAX_MULT:.2f}x, "
         f"within {COPY_FAST_CONFIRM_MAX_OFF_PEAK*100:.1f}% of local peak, "
         f"SWARM-{COPY_FAST_CONFIRM_MIN_SWARM} or continued SWARM-3.")
+    log(f"  Confirmed raw copy_fast size: {COPY_FAST_CONFIRMED_AMOUNT_SOL:.4f} SOL "
+        f"(alpha core remains {COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL).")
     if COPY_FAST_SOLO_ROCKET_ENABLED:
         log(f"  Solo rocket scout: copy_fast may enter {COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL "
             f"at >={COPY_FAST_SOLO_ROCKET_MIN_MULT:.2f}x without swarm "
