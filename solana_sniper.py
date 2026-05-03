@@ -1288,6 +1288,7 @@ COPY_FAST_CONFIRM_ENABLED = os.environ.get("COPY_FAST_CONFIRM_ENABLED", "1") == 
 COPY_FAST_CONFIRM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_WINDOW_SEC", "3.0"))
 COPY_FAST_CONFIRM_POLL_SEC = float(os.environ.get("COPY_FAST_CONFIRM_POLL_SEC", "0.10"))
 COPY_FAST_CONFIRM_MIN_MULT = float(os.environ.get("COPY_FAST_CONFIRM_MIN_MULT", "1.12"))
+COPY_FAST_CONFIRM_MAX_MULT = float(os.environ.get("COPY_FAST_CONFIRM_MAX_MULT", "1.75"))
 COPY_FAST_CONFIRM_MAX_OFF_PEAK = float(os.environ.get("COPY_FAST_CONFIRM_MAX_OFF_PEAK", "0.02"))
 COPY_FAST_CONFIRM_MAX_DUMP = float(os.environ.get("COPY_FAST_CONFIRM_MAX_DUMP", "-0.04"))
 COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS = int(os.environ.get("COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS", "600"))
@@ -5586,6 +5587,11 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                 break
             peak_price = max(peak_price, price)
             last_mult = price / baseline_price if baseline_price else 1.0
+            if last_mult > COPY_FAST_CONFIRM_MAX_MULT:
+                _copy_trade_stats["confirm_blocked"] = _copy_trade_stats.get("confirm_blocked", 0) + 1
+                log(f"  GRAD CONFIRM-CHASE-BLOCK {mint[:8]} ({launchpad}): "
+                    f"mult={last_mult:.3f}x > {COPY_FAST_CONFIRM_MAX_MULT:.3f}x")
+                return False
             if last_mult <= 1.0 + COPY_FAST_CONFIRM_MAX_DUMP:
                 _copy_trade_stats["confirm_dump_blocked"] = _copy_trade_stats.get("confirm_dump_blocked", 0) + 1
                 log(f"  GRAD CONFIRM-DUMP {mint[:8]} ({launchpad}): mult={last_mult:.3f}x <= "
@@ -7335,7 +7341,8 @@ async def main():
     log(f"=== V41.18 CONFIRM-THEN-ENTER ===")
     log(f"  Raw copy_fast is DISABLED as a blind entry; every copy signal must prove follow-through.")
     log(f"  Confirm gate: fresh bc-cache <= {COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS}ms, "
-        f"+{(COPY_FAST_CONFIRM_MIN_MULT-1)*100:.1f}% move, within {COPY_FAST_CONFIRM_MAX_OFF_PEAK*100:.1f}% of local peak, "
+        f"+{(COPY_FAST_CONFIRM_MIN_MULT-1)*100:.1f}% move, cap<={COPY_FAST_CONFIRM_MAX_MULT:.2f}x, "
+        f"within {COPY_FAST_CONFIRM_MAX_OFF_PEAK*100:.1f}% of local peak, "
         f"SWARM-{COPY_FAST_CONFIRM_MIN_SWARM} or continued SWARM-3.")
     if COPY_FAST_SOLO_ROCKET_ENABLED:
         log(f"  Solo rocket scout: copy_fast may enter {COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL "
