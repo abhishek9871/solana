@@ -1491,19 +1491,21 @@ MOONSHOT_TRAIL_DISTANCE = float(os.environ.get("MOONSHOT_TRAIL_DISTANCE", "0.880
 VELOCITY_IGNITION_ENABLED = os.environ.get("VELOCITY_IGNITION_ENABLED", "1") == "1"
 VELOCITY_WINDOW_MS = int(os.environ.get("VELOCITY_WINDOW_MS", "1200"))
 VELOCITY_MAX_CACHE_AGE_MS = int(os.environ.get("VELOCITY_MAX_CACHE_AGE_MS", "450"))
-VELOCITY_MIN_MOVE_MULT = float(os.environ.get("VELOCITY_MIN_MOVE_MULT", "1.035"))
-VELOCITY_STRONG_MOVE_MULT = float(os.environ.get("VELOCITY_STRONG_MOVE_MULT", "1.080"))
+VELOCITY_MIN_MOVE_MULT = float(os.environ.get("VELOCITY_MIN_MOVE_MULT", "1.080"))
+VELOCITY_STRONG_MOVE_MULT = float(os.environ.get("VELOCITY_STRONG_MOVE_MULT", "1.140"))
 VELOCITY_MAX_CHASE_MULT = float(os.environ.get("VELOCITY_MAX_CHASE_MULT", "1.650"))
 VELOCITY_MAX_OFF_PEAK = float(os.environ.get("VELOCITY_MAX_OFF_PEAK", "0.035"))
-VELOCITY_MIN_UNIQUE = int(os.environ.get("VELOCITY_MIN_UNIQUE", "5"))
-VELOCITY_STRONG_UNIQUE = int(os.environ.get("VELOCITY_STRONG_UNIQUE", "8"))
-VELOCITY_MIN_TRACKED = int(os.environ.get("VELOCITY_MIN_TRACKED", "1"))
-VELOCITY_MIN_BUY_SOL = float(os.environ.get("VELOCITY_MIN_BUY_SOL", "1.25"))
-VELOCITY_STRONG_BUY_SOL = float(os.environ.get("VELOCITY_STRONG_BUY_SOL", "4.0"))
-VELOCITY_MAX_SELL_SOL = float(os.environ.get("VELOCITY_MAX_SELL_SOL", "0.030"))
-VELOCITY_MAX_SELL_BUY_RATIO = float(os.environ.get("VELOCITY_MAX_SELL_BUY_RATIO", "0.08"))
-VELOCITY_AMOUNT_SOL = float(os.environ.get("VELOCITY_AMOUNT_SOL", "0.00625"))
-VELOCITY_STRONG_AMOUNT_SOL = float(os.environ.get("VELOCITY_STRONG_AMOUNT_SOL", "0.0125"))
+VELOCITY_MIN_UNIQUE = int(os.environ.get("VELOCITY_MIN_UNIQUE", "7"))
+VELOCITY_STRONG_UNIQUE = int(os.environ.get("VELOCITY_STRONG_UNIQUE", "10"))
+VELOCITY_MIN_TRACKED = int(os.environ.get("VELOCITY_MIN_TRACKED", "2"))
+VELOCITY_MIN_BUY_SOL = float(os.environ.get("VELOCITY_MIN_BUY_SOL", "2.50"))
+VELOCITY_STRONG_BUY_SOL = float(os.environ.get("VELOCITY_STRONG_BUY_SOL", "6.0"))
+VELOCITY_MAX_SELL_SOL = float(os.environ.get("VELOCITY_MAX_SELL_SOL", "0.015"))
+VELOCITY_MAX_SELL_BUY_RATIO = float(os.environ.get("VELOCITY_MAX_SELL_BUY_RATIO", "0.04"))
+VELOCITY_CONFIRM_DELAY_SEC = float(os.environ.get("VELOCITY_CONFIRM_DELAY_SEC", "0.08"))
+VELOCITY_CONFIRM_MIN_MULT = float(os.environ.get("VELOCITY_CONFIRM_MIN_MULT", "1.003"))
+VELOCITY_AMOUNT_SOL = float(os.environ.get("VELOCITY_AMOUNT_SOL", "0.003125"))
+VELOCITY_STRONG_AMOUNT_SOL = float(os.environ.get("VELOCITY_STRONG_AMOUNT_SOL", "0.00625"))
 VELOCITY_TIMEOUT_SEC = float(os.environ.get("VELOCITY_TIMEOUT_SEC", "10.0"))
 VELOCITY_FAST_KILL_SEC = float(os.environ.get("VELOCITY_FAST_KILL_SEC", "0.9"))
 VELOCITY_FAST_KILL_PEAK = float(os.environ.get("VELOCITY_FAST_KILL_PEAK", "1.025"))
@@ -7630,6 +7632,35 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         )
         if velocity_plan:
             _copy_trade_stats["velocity_candidates"] = _copy_trade_stats.get("velocity_candidates", 0) + 1
+            trigger_price = float(velocity_plan.get("trigger_price") or 0.0)
+            if trigger_price <= 0:
+                _copy_trade_stats["velocity_blocked"] = _copy_trade_stats.get("velocity_blocked", 0) + 1
+                _mt_gate("vel_no_price")
+                return
+            if VELOCITY_CONFIRM_DELAY_SEC > 0:
+                await asyncio.sleep(VELOCITY_CONFIRM_DELAY_SEC)
+                confirm_price = _bc_cache_price_for_mint(
+                    mint,
+                    max(VELOCITY_MAX_CACHE_AGE_MS, MARKET_TAPE_BC_CACHE_MAX_AGE_MS),
+                )
+                if not confirm_price or confirm_price[1] or confirm_price[0] <= 0:
+                    _copy_trade_stats["velocity_blocked"] = _copy_trade_stats.get("velocity_blocked", 0) + 1
+                    _mt_gate("vel_confirm")
+                    log(f"  VELOCITY BLOCK {mint[:8]}: no fresh confirm price after "
+                        f"{VELOCITY_CONFIRM_DELAY_SEC:.2f}s")
+                    return
+                confirm_mult = float(confirm_price[0]) / trigger_price
+                if confirm_mult < VELOCITY_CONFIRM_MIN_MULT:
+                    _copy_trade_stats["velocity_blocked"] = _copy_trade_stats.get("velocity_blocked", 0) + 1
+                    _mt_gate("vel_confirm")
+                    log(f"  VELOCITY BLOCK {mint[:8]}: confirm_mult={confirm_mult:.3f}x "
+                        f"< {VELOCITY_CONFIRM_MIN_MULT:.3f}x after "
+                        f"{VELOCITY_CONFIRM_DELAY_SEC:.2f}s")
+                    return
+                velocity_plan["reason"] = (
+                    f"{velocity_plan.get('reason', 'velocity')} confirm={confirm_mult:.3f}x/"
+                    f"{VELOCITY_CONFIRM_DELAY_SEC:.2f}s"
+                )
             graduated_seen.add(mint)
             if len(graduated_seen) > 500:
                 graduated_seen.clear()
@@ -8701,6 +8732,7 @@ async def main():
             f"{VELOCITY_STRONG_AMOUNT_SOL:.4f} SOL on rolling {VELOCITY_WINDOW_MS}ms tape "
             f"with {VELOCITY_MIN_UNIQUE}+ unique, tracked>={VELOCITY_MIN_TRACKED} or "
             f"buy>={VELOCITY_STRONG_BUY_SOL:.1f} SOL, move>={VELOCITY_MIN_MOVE_MULT:.3f}x, "
+            f"confirm>={VELOCITY_CONFIRM_MIN_MULT:.3f}x/{VELOCITY_CONFIRM_DELAY_SEC:.2f}s, "
             f"off_peak<={VELOCITY_MAX_OFF_PEAK:.1%}; exits fast-kill "
             f"{VELOCITY_FAST_KILL_SEC:.1f}s/{VELOCITY_FAST_KILL_PEAK:.3f}x.")
     if COPY_FAST_CONFIRMED_ENTRY_ENABLED:
