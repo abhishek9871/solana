@@ -364,6 +364,7 @@ daily_loss_halt_reason = ""
 _positions_closing: set[str] = set()
 _entry_inflight_mints: set[str] = set()
 _swarm_compound_locks: dict[str, asyncio.Lock] = {}
+_swarm_compound_reserved_sol: dict[str, float] = {}
 _recently_closed_mints: dict[str, float] = {}
 # V41.5: trade-counting and pause state
 daily_trade_count = 0                  # count of entries opened this session
@@ -615,6 +616,7 @@ def _remove_open_position(pos: Position) -> None:
     _positions_closing.discard(pos.mint)
     _entry_inflight_mints.discard(pos.mint)
     _swarm_compound_locks.pop(pos.mint, None)
+    _swarm_compound_reserved_sol.pop(pos.mint, None)
     _persist_positions()
 
 
@@ -7717,6 +7719,7 @@ async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
     Uses merge_position_add — token-weighted average entry, never averages down."""
     lock = _get_swarm_compound_lock(mint)
     reserved = False
+    add_amount = 0.0
     pos = None
     async with lock:
         pos = positions.get(mint)
@@ -7739,10 +7742,19 @@ async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
             log(f"  SWARM-COMPOUND SKIP {mint[:8]}: mult={current_mult:.3f}x "
                 f"< {SWARM_COMPOUND_MIN_MULT:.3f}x (age={age_ms}ms)")
             return
+        desired_add = GRAD_AMOUNT_SOL * 0.5 if swarm_size == 2 else GRAD_AMOUNT_SOL
+        already_reserved = float(_swarm_compound_reserved_sol.get(mint, 0.0) or 0.0)
+        cap_left = min(MAX_POSITION_AMOUNT_SOL, GRAD_AMOUNT_SOL * 2.0) - pos.entry_amount_sol - already_reserved
+        add_amount = min(desired_add, cap_left)
+        if add_amount <= 0.000001:
+            log(f"  SWARM-COMPOUND SKIP {mint[:8]}: cap reached "
+                f"exposure={pos.entry_amount_sol:.4f} reserved={already_reserved:.4f} "
+                f"cap={min(MAX_POSITION_AMOUNT_SOL, GRAD_AMOUNT_SOL * 2.0):.4f}")
+            return
         pos.adds_done = (pos.adds_done or 0) + 1
+        _swarm_compound_reserved_sol[mint] = already_reserved + add_amount
         reserved = True
         _persist_positions()
-    add_amount = GRAD_AMOUNT_SOL * 0.5 if swarm_size == 2 else GRAD_AMOUNT_SOL
     log(f"  SWARM-COMPOUND {mint[:8]} (SWARM-{swarm_size}): reserved add #{pos.adds_done}, "
         f"adding {add_amount:.4f} SOL on {signer[:8]} only after >={SWARM_COMPOUND_MIN_MULT:.3f}x")
 
@@ -7755,6 +7767,11 @@ async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
             if current is pos and (current.adds_done or 0) > 0:
                 current.adds_done = max(0, (current.adds_done or 0) - 1)
                 _persist_positions()
+            left = float(_swarm_compound_reserved_sol.get(mint, 0.0) or 0.0) - add_amount
+            if left > 0.000001:
+                _swarm_compound_reserved_sol[mint] = left
+            else:
+                _swarm_compound_reserved_sol.pop(mint, None)
         reserved = False
 
     try:
@@ -7774,6 +7791,11 @@ async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
             current = None
         else:
             merge_position_add(current, add_pos)
+            left = float(_swarm_compound_reserved_sol.get(mint, 0.0) or 0.0) - add_amount
+            if left > 0.000001:
+                _swarm_compound_reserved_sol[mint] = left
+            else:
+                _swarm_compound_reserved_sol.pop(mint, None)
             _persist_positions()
             reserved = False
             log(f"  SWARM-COMPOUND DONE {mint[:8]}: total exposure now {current.entry_amount_sol:.4f} SOL "
