@@ -1359,14 +1359,19 @@ ALPHA_BLOCK_MIN_SAMPLES = int(os.environ.get("ALPHA_BLOCK_MIN_SAMPLES", "4"))
 ALPHA_BLOCK_MAX_WR = float(os.environ.get("ALPHA_BLOCK_MAX_WR", "0.25"))
 ALPHA_BLOCK_MAX_AVG_BEST_NET = float(os.environ.get("ALPHA_BLOCK_MAX_AVG_BEST_NET", "0.000"))
 ALPHA_CONTEXT_ONLY_MIN_SAMPLES = int(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_SAMPLES", "5"))
-ALPHA_CONTEXT_ONLY_MIN_WR = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_WR", "0.60"))
+ALPHA_CONTEXT_ONLY_MIN_WR = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_WR", "0.70"))
 ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET", "0.050"))
 ALPHA_WALLET_ONLY_MIN_SAMPLES = int(os.environ.get("ALPHA_WALLET_ONLY_MIN_SAMPLES", "20"))
-ALPHA_WALLET_ONLY_MIN_WR = float(os.environ.get("ALPHA_WALLET_ONLY_MIN_WR", "0.70"))
+ALPHA_WALLET_ONLY_MIN_WR = float(os.environ.get("ALPHA_WALLET_ONLY_MIN_WR", "0.75"))
 ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET = float(os.environ.get("ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET", "0.080"))
 ALPHA_RUNNER_TP1_MULT = float(os.environ.get("ALPHA_RUNNER_TP1_MULT", "1.055"))
 ALPHA_RUNNER_TP1_FRACTION = float(os.environ.get("ALPHA_RUNNER_TP1_FRACTION", "0.70"))
+ALPHA_RUNNER_TP1_MID_MULT = float(os.environ.get("ALPHA_RUNNER_TP1_MID_MULT", "1.100"))
+ALPHA_RUNNER_TP1_MID_FRACTION = float(os.environ.get("ALPHA_RUNNER_TP1_MID_FRACTION", "0.60"))
+ALPHA_RUNNER_TP1_STRONG_MULT = float(os.environ.get("ALPHA_RUNNER_TP1_STRONG_MULT", "1.200"))
+ALPHA_RUNNER_TP1_STRONG_FRACTION = float(os.environ.get("ALPHA_RUNNER_TP1_STRONG_FRACTION", "0.50"))
 COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL", "0.003125"))
+COPY_FAST_ALPHA_STRONG_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_STRONG_AMOUNT_SOL", "0.00625"))
 COPY_FAST_ALPHA_CORE_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_CORE_AMOUNT_SOL", "0.0125"))
 COPY_FAST_CONFIRMED_AMOUNT_SOL = float(os.environ.get("COPY_FAST_CONFIRMED_AMOUNT_SOL", str(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)))
 COPY_FAST_ALPHA_MIN_ENTRY_MULT = float(os.environ.get("COPY_FAST_ALPHA_MIN_ENTRY_MULT", "1.060"))
@@ -1388,7 +1393,17 @@ MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CON
 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT", "0.998"))
 MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
 MARKET_TAPE_ALPHA_MIN_MOVE_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_MOVE_MULT", "1.040"))
-MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.000"))
+MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.020"))
+MARKET_TAPE_ALPHA_MIN_WR = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_WR", "0.65"))
+MARKET_TAPE_ALPHA_LOW_SAMPLE_N = int(os.environ.get("MARKET_TAPE_ALPHA_LOW_SAMPLE_N", "10"))
+MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_WR = float(os.environ.get("MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_WR", "0.75"))
+MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_AVG_EXIT = float(os.environ.get("MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_AVG_EXIT", "0.100"))
+MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_SAMPLES = int(os.environ.get("MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_SAMPLES", "20"))
+MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_WR = float(os.environ.get("MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_WR", "0.75"))
+MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_AVG_EXIT = float(os.environ.get("MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_AVG_EXIT", "0.050"))
+MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_UNIQUE", "8"))
+MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_TRACKED", "4"))
+MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_BUY_SOL", "5.0"))
 MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET", "0.020"))
 MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_SAMPLES = int(os.environ.get("MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_SAMPLES", "5"))
 MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_WR = float(os.environ.get("MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_WR", "0.70"))
@@ -1500,7 +1515,7 @@ MOONSHOT_TP2_MULT = float(os.environ.get("MOONSHOT_TP2_MULT", "1.700"))
 MOONSHOT_TP2_FRACTION = float(os.environ.get("MOONSHOT_TP2_FRACTION", "0.50"))
 MOONSHOT_TRAIL_ACTIVATION = float(os.environ.get("MOONSHOT_TRAIL_ACTIVATION", "1.180"))
 MOONSHOT_TRAIL_DISTANCE = float(os.environ.get("MOONSHOT_TRAIL_DISTANCE", "0.880"))
-VELOCITY_IGNITION_ENABLED = os.environ.get("VELOCITY_IGNITION_ENABLED", "1") == "1"
+VELOCITY_IGNITION_ENABLED = os.environ.get("VELOCITY_IGNITION_ENABLED", "0") == "1"
 VELOCITY_WINDOW_MS = int(os.environ.get("VELOCITY_WINDOW_MS", "1200"))
 VELOCITY_MAX_CACHE_AGE_MS = int(os.environ.get("VELOCITY_MAX_CACHE_AGE_MS", "450"))
 VELOCITY_MIN_MOVE_MULT = float(os.environ.get("VELOCITY_MIN_MOVE_MULT", "1.080"))
@@ -2101,12 +2116,14 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # Require: trail_floor must be > 1 + GRAD_TRAILING_MIN_LOCK (clear slippage).
             change = (sol_per_unit - pos.entry_price) / pos.entry_price
             if pos.launchpad == "moonshot_ignition":
-                alpha_runner = (
-                    pos.entry_amount_sol <= COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL * 1.10
-                    and pos.quality_score <= 8
-                )
+                alpha_runner = pos.quality_score == 6
                 if alpha_runner and pos.rung_hit == 0 and multiplier >= ALPHA_RUNNER_TP1_MULT:
-                    sell_frac = max(0.0, min(1.0, ALPHA_RUNNER_TP1_FRACTION))
+                    raw_sell_frac = ALPHA_RUNNER_TP1_FRACTION
+                    if multiplier >= ALPHA_RUNNER_TP1_STRONG_MULT:
+                        raw_sell_frac = ALPHA_RUNNER_TP1_STRONG_FRACTION
+                    elif multiplier >= ALPHA_RUNNER_TP1_MID_MULT:
+                        raw_sell_frac = ALPHA_RUNNER_TP1_MID_FRACTION
+                    sell_frac = max(0.0, min(1.0, raw_sell_frac))
                     log(f"  ALPHA-RUNNER TP1 mult={multiplier:.3f}x: selling {sell_frac*100:.0f}%")
                     if try_grad_sell(f"ALPHA-RUNNER TP1 {ALPHA_RUNNER_TP1_MULT:.3f}x mult={multiplier:.3f}x",
                                      sell_frac, multiplier):
@@ -5464,6 +5481,37 @@ def _alpha_bypass_static_guards(n: int, wr: float, avg_exit: float) -> bool:
     )
 
 
+def _alpha_market_tape_live_ok(n: int, wr: float, avg_exit: float) -> bool:
+    if n <= 0:
+        return False
+    if n < MARKET_TAPE_ALPHA_LOW_SAMPLE_N:
+        return (
+            wr >= MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_WR
+            and avg_exit >= MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_AVG_EXIT
+        )
+    return wr >= MARKET_TAPE_ALPHA_MIN_WR and avg_exit >= MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET
+
+
+def _alpha_market_tape_amount(n: int, wr: float, avg_exit: float,
+                              unique_count: int, tracked_count: int,
+                              buy_sol: float) -> float:
+    learned_strong = (
+        n >= MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_SAMPLES
+        and wr >= MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_WR
+        and avg_exit >= MARKET_TAPE_ALPHA_STRONG_SIZE_MIN_AVG_EXIT
+    )
+    tape_strong = (
+        unique_count >= MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_UNIQUE
+        and tracked_count >= MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_TRACKED
+        and buy_sol >= MARKET_TAPE_ALPHA_TAPE_STRONG_MIN_BUY_SOL
+        and wr >= MARKET_TAPE_ALPHA_MIN_WR
+        and avg_exit >= MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_AVG_EXIT
+    )
+    if learned_strong or tape_strong:
+        return max(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL, COPY_FAST_ALPHA_STRONG_AMOUNT_SOL)
+    return COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL
+
+
 def _alpha_promoted(stat: Optional[dict], min_samples: int = ALPHA_MIN_SAMPLES) -> bool:
     n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
     return n >= min_samples and wr >= ALPHA_PROMOTE_MIN_WR and avg_best >= ALPHA_PROMOTE_MIN_AVG_BEST_NET
@@ -5619,6 +5667,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
         return {
             "launchpad": "moonshot_ignition",
             "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL if core_ok else COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "quality": 6,
             "reason": (f"{'core' if core_ok else 'scout'} pair n={n} wr={wr:.0%} "
                        f"avg_best={avg_best:+.1%} avg_exit={avg_exit:+.1%}"),
         }
@@ -5631,6 +5680,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
         return {
             "launchpad": "moonshot_ignition",
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "quality": 6,
             "reason": (f"wallet_context scout w={wn}/{wwr:.0%}/{wavg:+.1%}/{wexit:+.1%} "
                        f"c={cn}/{cwr:.0%}/{cavg:+.1%}/{cexit:+.1%}"),
         }
@@ -5640,6 +5690,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
         return {
             "launchpad": "moonshot_ignition",
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "quality": 6,
             "reason": f"wallet_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} avg_exit={avg_exit:+.1%}",
         }
 
@@ -5651,6 +5702,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
         return {
             "launchpad": "moonshot_ignition",
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "quality": 6,
             "reason": f"explore sw={swarm_count} mult={last_mult:.3f}x ctx={context}",
         }
     return None
@@ -5689,11 +5741,12 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         bypass_static = _alpha_bypass_static_guards(n, wr, avg_exit)
         if move_mult < MARKET_TAPE_ALPHA_MIN_MOVE_MULT and not bypass_static:
             return None
-        if avg_exit < MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:
+        if not _alpha_market_tape_live_ok(n, wr, avg_exit):
             return None
+        amount = _alpha_market_tape_amount(n, wr, avg_exit, unique_count, tracked_count, buy_sol)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
-            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "amount": amount,
             "quality": 6,
             "context": context,
             "ratio_bypass": bypass_static,
@@ -5717,14 +5770,19 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
     if _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2) and _alpha_promoted(context_stat):
         wn, wwr, wavg, wexit = _alpha_stat_view(wallet_stat)
         cn, cwr, cavg, cexit = _alpha_stat_view(context_stat)
-        if min(wexit, cexit) < MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:
+        joint_n = min(wn, cn)
+        joint_wr = min(wwr, cwr)
+        joint_exit = min(wexit, cexit)
+        if not _alpha_market_tape_live_ok(joint_n, joint_wr, joint_exit):
             return None
         bypass_static = _alpha_bypass_static_guards(cn, cwr, cexit)
         if move_mult < MARKET_TAPE_ALPHA_MIN_MOVE_MULT and not bypass_static:
             return None
+        amount = _alpha_market_tape_amount(joint_n, joint_wr, joint_exit,
+                                           unique_count, tracked_count, buy_sol)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
-            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "amount": amount,
             "quality": 6,
             "context": context,
             "ratio_bypass": bypass_static,
@@ -7925,7 +7983,7 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             client, kp, mint, now_ms, reason,
             amount_sol=float(alpha_plan.get("amount") or COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL),
             launchpad="moonshot_ignition",
-            quality_score=max(8, int(alpha_plan.get("quality") or 6)),
+            quality_score=int(alpha_plan.get("quality") or 6),
         ))
         return
     ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
@@ -8856,6 +8914,8 @@ async def main():
             f"confirm>={VELOCITY_CONFIRM_MIN_MULT:.3f}x/{VELOCITY_CONFIRM_DELAY_SEC:.2f}s, "
             f"off_peak<={VELOCITY_MAX_OFF_PEAK:.1%}; exits fast-kill "
             f"{VELOCITY_FAST_KILL_SEC:.1f}s/{VELOCITY_FAST_KILL_PEAK:.3f}x.")
+    else:
+        log("  Velocity ignition: DISABLED for live entries; raw velocity tape still trains market alpha.")
     if COPY_FAST_CONFIRMED_ENTRY_ENABLED:
         log(f"  Confirmed raw copy_fast size: {COPY_FAST_CONFIRMED_AMOUNT_SOL:.4f} SOL "
             f"(alpha core remains {COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL).")
@@ -8888,14 +8948,20 @@ async def main():
         log(f"  Wallet-only alpha scout requires {ALPHA_WALLET_ONLY_MIN_SAMPLES}+ samples, "
             f"WR>={ALPHA_WALLET_ONLY_MIN_WR:.0%}, "
             f"avg_exit>={ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET:+.1%}.")
-        log(f"  Alpha exits: learned copy/tape alpha uses scout-sized moonshot runner exits, "
-            f"selling {ALPHA_RUNNER_TP1_FRACTION*100:.0f}% at {ALPHA_RUNNER_TP1_MULT:.3f}x; "
-            f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
+        log(f"  Alpha exits: learned copy/tape alpha uses moonshot runner exits, selling "
+            f"{ALPHA_RUNNER_TP1_FRACTION*100:.0f}%/{ALPHA_RUNNER_TP1_MID_FRACTION*100:.0f}%/"
+            f"{ALPHA_RUNNER_TP1_STRONG_FRACTION*100:.0f}% at "
+            f"{ALPHA_RUNNER_TP1_MULT:.3f}x/{ALPHA_RUNNER_TP1_MID_MULT:.3f}x/"
+            f"{ALPHA_RUNNER_TP1_STRONG_MULT:.3f}x; toxic pairs stop adapting after "
+            f"{ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
         if MARKET_TAPE_ALPHA_ENABLED:
-            log(f"  Market-tape alpha: context-promoted tape enters scout size before static gates "
+            log(f"  Market-tape alpha: context-promoted tape enters scout/strong size before static gates "
                 f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s, tracked>={MARKET_TAPE_ALPHA_MIN_TRACKED}, "
                 f"sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, move>={MARKET_TAPE_ALPHA_MIN_MOVE_MULT:.3f}x, "
-                f"avg_exit>={MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:+.1%}, "
+                f"WR>={MARKET_TAPE_ALPHA_MIN_WR:.0%}, avg_exit>={MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:+.1%}, "
+                f"low-sample n<{MARKET_TAPE_ALPHA_LOW_SAMPLE_N} requires "
+                f"WR>={MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_WR:.0%}/"
+                f"avg_exit>={MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_AVG_EXIT:+.1%}, "
                 f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
                 f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s; strong avg-exit buckets may retain "
                 f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x and bypass static ratio/move guards "
