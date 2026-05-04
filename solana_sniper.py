@@ -7451,13 +7451,25 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         ))
         return
     alpha_cached_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+    alpha_price_ratio = None
+    if trader_price > 0 and alpha_cached_price and not alpha_cached_price[1] and alpha_cached_price[0] > 0:
+        alpha_price_ratio = float(alpha_cached_price[0]) / trader_price
     alpha_plan = _alpha_market_tape_entry_plan(
         mint, signer,
-        float(trade.get("trader_price") or 0.0),
+        trader_price,
         float(alpha_cached_price[0]) if alpha_cached_price and not alpha_cached_price[1] else 0.0,
         len(unique_buyers), len(tracked_buyers), buy_sol, sell_sol, observed_age_ms,
     )
     if alpha_plan:
+        if (alpha_price_ratio is not None
+                and (alpha_price_ratio < MARKET_TAPE_MIN_PRICE_RATIO
+                     or alpha_price_ratio > MARKET_TAPE_MAX_PRICE_RATIO)):
+            _market_tape_ratio_violation_until[mint] = now_ms + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_alpha_ratio")
+            log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: price_ratio={alpha_price_ratio:.3f}x "
+                f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
+            return
         if not alpha_cached_price or alpha_cached_price[1] or alpha_cached_price[0] <= 0:
             _mt_gate("mt_alpha_no_price")
             return
