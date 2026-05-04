@@ -1364,7 +1364,7 @@ ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_CONTEXT_ONLY_M
 COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL", "0.003125"))
 COPY_FAST_ALPHA_CORE_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_CORE_AMOUNT_SOL", "0.0125"))
 COPY_FAST_CONFIRMED_AMOUNT_SOL = float(os.environ.get("COPY_FAST_CONFIRMED_AMOUNT_SOL", str(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)))
-COPY_FAST_ALPHA_MIN_ENTRY_MULT = float(os.environ.get("COPY_FAST_ALPHA_MIN_ENTRY_MULT", "1.006"))
+COPY_FAST_ALPHA_MIN_ENTRY_MULT = float(os.environ.get("COPY_FAST_ALPHA_MIN_ENTRY_MULT", "1.080"))
 COPY_FAST_ALPHA_EXPLORATION_MIN_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MIN_MULT", "1.22"))
 COPY_FAST_ALPHA_EXPLORATION_MAX_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MAX_MULT", "1.55"))
 COPY_FAST_ALPHA_TP_MULT = float(os.environ.get("COPY_FAST_ALPHA_TP_MULT", "1.045"))
@@ -1378,6 +1378,7 @@ MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CO
 MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT", "0.998"))
 MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
+MARKET_TAPE_ALPHA_MIN_MOVE_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_MOVE_MULT", "1.040"))
 MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.000"))
 MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET", "0.020"))
 MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC", "2.0"))
@@ -1487,6 +1488,14 @@ MOONSHOT_TP2_MULT = float(os.environ.get("MOONSHOT_TP2_MULT", "1.700"))
 MOONSHOT_TP2_FRACTION = float(os.environ.get("MOONSHOT_TP2_FRACTION", "0.50"))
 MOONSHOT_TRAIL_ACTIVATION = float(os.environ.get("MOONSHOT_TRAIL_ACTIVATION", "1.180"))
 MOONSHOT_TRAIL_DISTANCE = float(os.environ.get("MOONSHOT_TRAIL_DISTANCE", "0.880"))
+COPY_FAST_IGNITION_ENABLED = os.environ.get("COPY_FAST_IGNITION_ENABLED", "1") == "1"
+COPY_FAST_IGNITION_MIN_MULT = float(os.environ.get("COPY_FAST_IGNITION_MIN_MULT", "1.450"))
+COPY_FAST_IGNITION_STRONG_MULT = float(os.environ.get("COPY_FAST_IGNITION_STRONG_MULT", "1.550"))
+COPY_FAST_IGNITION_MIN_SWARM = int(os.environ.get("COPY_FAST_IGNITION_MIN_SWARM", "4"))
+COPY_FAST_IGNITION_STRONG_SWARM = int(os.environ.get("COPY_FAST_IGNITION_STRONG_SWARM", "5"))
+COPY_FAST_IGNITION_MAX_CACHE_AGE_MS = int(os.environ.get("COPY_FAST_IGNITION_MAX_CACHE_AGE_MS", "250"))
+COPY_FAST_IGNITION_AMOUNT_SOL = float(os.environ.get("COPY_FAST_IGNITION_AMOUNT_SOL", "0.0125"))
+COPY_FAST_IGNITION_STRONG_AMOUNT_SOL = float(os.environ.get("COPY_FAST_IGNITION_STRONG_AMOUNT_SOL", "0.01875"))
 SWARM_SCOUT_ENABLED = os.environ.get("SWARM_SCOUT_ENABLED", "1") == "1"
 SWARM_SCOUT_MIN_SIGNERS = int(os.environ.get("SWARM_SCOUT_MIN_SIGNERS", "3"))
 SWARM_SCOUT_AMOUNT_SOL = float(os.environ.get("SWARM_SCOUT_AMOUNT_SOL", str(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)))
@@ -1628,9 +1637,13 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             # risk management since they bypass the rug check.
             entry_override = _copy_fast_entry_overrides.pop(mint, None)
             solo_rocket = launchpad == "copy_fast" and mint in _copy_fast_solo_rocket_mints
+            entry_quality = 8
+            entry_reason = ""
             if entry_override:
                 entry_launchpad = str(entry_override.get("launchpad") or "copy_fast_alpha")
                 entry_amount = float(entry_override.get("amount") or COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)
+                entry_quality = int(entry_override.get("quality") or 8)
+                entry_reason = str(entry_override.get("reason") or "")
                 _copy_fast_solo_rocket_mints.discard(mint)
             else:
                 entry_launchpad = "copy_fast_solo" if solo_rocket else launchpad
@@ -1690,7 +1703,9 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                     _copy_trade_stats["warm_miss"] += 1
             # Fallback to standard buy_token (does its own quote+swap+send)
             if pos is None:
-                log(f"  GRAD ENTRY {mint[:8]} ({entry_launchpad}): confirmed follow-through, buying {entry_amount} SOL")
+                reason_suffix = f" | {entry_reason}" if entry_reason else ""
+                log(f"  GRAD ENTRY {mint[:8]} ({entry_launchpad}): confirmed follow-through, "
+                    f"buying {entry_amount} SOL{reason_suffix}")
                 pos = buy_token(kp, client, mint, entry_amount)
                 if not pos:
                     log(f"  GRAD BUY FAILED {mint[:8]}")
@@ -1700,7 +1715,7 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
             pos.late_scalp = True
             pos.entry_progress = 1.0
             pos.entry_size_sol = entry_amount
-            pos.quality_score = 8
+            pos.quality_score = entry_quality
             pos.launchpad = entry_launchpad
             # V41.17 Fix #9: stamp signal time so manage_graduation_position can apply
             # the no-pump time-stops after we actually enter. Confirm-gated copy
@@ -3526,6 +3541,7 @@ async def session_reporter():
                 f"mt_birth={s.get('market_tape_birth_triggers', 0)} "
                 f"moon_cand={s.get('moonshot_candidates', 0)} moon_trig={s.get('moonshot_triggers', 0)} "
                 f"moon_blk={s.get('moonshot_blocked', 0)} "
+                f"cf_ign={s.get('copy_fast_ignition', 0)} "
                 f"mt_blk={s.get('market_tape_blocked', 0)} ===")
             log(f"=== MARKET-TAPE-GATES: pos={s.get('mt_pos', 0)} cd={s.get('mt_cooldown', 0)} "
                 f"rate={s.get('mt_rate', 0)} uniq={s.get('mt_no_unique', 0)} "
@@ -5235,6 +5251,7 @@ _copy_trade_stats = {
     "market_tape_seen": 0, "market_tape_triggers": 0, "market_tape_entered": 0,
     "market_tape_blocked": 0, "market_tape_birth_triggers": 0,
     "moonshot_candidates": 0, "moonshot_triggers": 0, "moonshot_blocked": 0,
+    "copy_fast_ignition": 0,
     # V41.20 executable-alpha learner
     "alpha_shadow": 0, "alpha_outcomes": 0, "alpha_no_price": 0,
     "alpha_promoted": 0, "alpha_toxic": 0, "alpha_scouts": 0,
@@ -5511,6 +5528,15 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
     if sell_sol > MARKET_TAPE_ALPHA_MAX_SELL_SOL:
         return None
     if tracked_count < MARKET_TAPE_ALPHA_MIN_TRACKED or unique_count < 3 or buy_sol < 0.50:
+        return None
+    move_stats = _bc_cache_window_stats_for_mint(
+        mint,
+        max(MARKET_TAPE_WINDOW_MS + 800, 1500),
+        MARKET_TAPE_BC_CACHE_MAX_AGE_MS,
+    )
+    if (not move_stats
+            or move_stats["complete"]
+            or float(move_stats["move"]) < MARKET_TAPE_ALPHA_MIN_MOVE_MULT):
         return None
     context = _alpha_context_key("market_tape", mint, signer, trader_price, trigger_price)
     wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
@@ -6411,6 +6437,35 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
 
             off_peak_ok = price >= peak_price * (1.0 - COPY_FAST_CONFIRM_MAX_OFF_PEAK)
             if last_mult >= COPY_FAST_CONFIRM_MIN_MULT and off_peak_ok and swarm_ok:
+                if (COPY_FAST_IGNITION_ENABLED
+                        and launchpad == "copy_fast"
+                        and len(recent) >= COPY_FAST_IGNITION_MIN_SWARM
+                        and last_mult >= COPY_FAST_IGNITION_MIN_MULT
+                        and last_age_ms <= COPY_FAST_IGNITION_MAX_CACHE_AGE_MS):
+                    strong = (
+                        last_mult >= COPY_FAST_IGNITION_STRONG_MULT
+                        and len(recent) >= COPY_FAST_IGNITION_STRONG_SWARM
+                    )
+                    amount = (
+                        COPY_FAST_IGNITION_STRONG_AMOUNT_SOL
+                        if strong else COPY_FAST_IGNITION_AMOUNT_SOL
+                    )
+                    _copy_fast_entry_overrides[mint] = {
+                        "launchpad": "moonshot_ignition",
+                        "amount": amount,
+                        "quality": 10 if strong else 9,
+                        "reason": (
+                            f"copy_fast_ignition mult={last_mult:.3f}x "
+                            f"swarm={len(recent)} age={last_age_ms}ms "
+                            f"amount={amount:.4f} SOL"
+                        ),
+                    }
+                    _copy_trade_stats["copy_fast_ignition"] = _copy_trade_stats.get("copy_fast_ignition", 0) + 1
+                    _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
+                    log(f"  GRAD CONFIRM-OK {mint[:8]} (copy_fast_ignition): "
+                        f"mult={last_mult:.3f}x peak={peak_price / baseline_price:.3f}x "
+                        f"swarm={len(recent)} age={last_age_ms}ms amount={amount:.4f} SOL")
+                    return True
                 _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
                 log(f"  GRAD CONFIRM-OK {mint[:8]} ({launchpad}): mult={last_mult:.3f}x "
                     f"peak={peak_price / baseline_price:.3f}x swarm={len(recent)} age={last_age_ms}ms")
@@ -8425,6 +8480,11 @@ async def main():
         f"+{(COPY_FAST_CONFIRM_MIN_MULT-1)*100:.1f}% move, cap<={COPY_FAST_CONFIRM_MAX_MULT:.2f}x, "
         f"within {COPY_FAST_CONFIRM_MAX_OFF_PEAK*100:.1f}% of local peak, "
         f"SWARM-{COPY_FAST_CONFIRM_MIN_SWARM} or continued SWARM-3.")
+    if COPY_FAST_IGNITION_ENABLED:
+        log(f"  Copy-fast ignition: {COPY_FAST_IGNITION_AMOUNT_SOL:.4f}/"
+            f"{COPY_FAST_IGNITION_STRONG_AMOUNT_SOL:.4f} SOL when confirm move>="
+            f"{COPY_FAST_IGNITION_MIN_MULT:.2f}x, swarm>={COPY_FAST_IGNITION_MIN_SWARM}, "
+            f"cache<={COPY_FAST_IGNITION_MAX_CACHE_AGE_MS}ms; managed as moonshot.")
     if COPY_FAST_CONFIRMED_ENTRY_ENABLED:
         log(f"  Confirmed raw copy_fast size: {COPY_FAST_CONFIRMED_AMOUNT_SOL:.4f} SOL "
             f"(alpha core remains {COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL).")
@@ -8458,7 +8518,8 @@ async def main():
         if MARKET_TAPE_ALPHA_ENABLED:
             log(f"  Market-tape alpha: context-promoted tape enters scout size before static gates "
                 f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s, tracked>={MARKET_TAPE_ALPHA_MIN_TRACKED}, "
-                f"sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, avg_exit>={MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:+.1%}, "
+                f"sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, move>={MARKET_TAPE_ALPHA_MIN_MOVE_MULT:.3f}x, "
+                f"avg_exit>={MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:+.1%}, "
                 f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
                 f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s; strong avg-exit buckets may retain "
                 f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x.")
