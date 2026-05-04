@@ -5601,7 +5601,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
         )
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
-            "launchpad": "copy_fast_alpha",
+            "launchpad": "moonshot_ignition",
             "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL if core_ok else COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "reason": (f"{'core' if core_ok else 'scout'} pair n={n} wr={wr:.0%} "
                        f"avg_best={avg_best:+.1%} avg_exit={avg_exit:+.1%}"),
@@ -5613,7 +5613,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
             return None
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
-            "launchpad": "copy_fast_alpha",
+            "launchpad": "moonshot_ignition",
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "reason": (f"wallet_context scout w={wn}/{wwr:.0%}/{wavg:+.1%}/{wexit:+.1%} "
                        f"c={cn}/{cwr:.0%}/{cavg:+.1%}/{cexit:+.1%}"),
@@ -5622,7 +5622,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
         n, wr, avg_best, avg_exit = _alpha_stat_view(wallet_stat)
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
-            "launchpad": "copy_fast_alpha",
+            "launchpad": "moonshot_ignition",
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "reason": f"wallet_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} avg_exit={avg_exit:+.1%}",
         }
@@ -5633,7 +5633,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
             and COPY_FAST_ALPHA_EXPLORATION_MIN_MULT <= last_mult <= COPY_FAST_ALPHA_EXPLORATION_MAX_MULT):
         _copy_trade_stats["alpha_scouts"] = _copy_trade_stats.get("alpha_scouts", 0) + 1
         return {
-            "launchpad": "copy_fast_alpha",
+            "launchpad": "moonshot_ignition",
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "reason": f"explore sw={swarm_count} mult={last_mult:.3f}x ctx={context}",
         }
@@ -6723,7 +6723,7 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
             if (alpha_plan
                     and launchpad == "copy_fast"
                     and (float(alpha_plan.get("amount", 0.0)) >= COPY_FAST_SOLO_ROCKET_AMOUNT_SOL
-                         or not solo_rocket_ok)):
+                         or not (COPY_FAST_SOLO_ROCKET_ENABLED and solo_rocket_ok))):
                 _copy_fast_entry_overrides[mint] = alpha_plan
                 _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
                 log(f"  GRAD CONFIRM-OK {mint[:8]} (copy_fast_alpha): "
@@ -7905,8 +7905,8 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         asyncio.create_task(_enter_market_tape_position(
             client, kp, mint, now_ms, reason,
             amount_sol=float(alpha_plan.get("amount") or COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL),
-            launchpad="market_tape_scout",
-            quality_score=int(alpha_plan.get("quality") or 6),
+            launchpad="moonshot_ignition",
+            quality_score=max(8, int(alpha_plan.get("quality") or 6)),
         ))
         return
     ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
@@ -8868,8 +8868,7 @@ async def main():
         log(f"  Wallet-only alpha scout requires {ALPHA_WALLET_ONLY_MIN_SAMPLES}+ samples, "
             f"WR>={ALPHA_WALLET_ONLY_MIN_WR:.0%}, "
             f"avg_exit>={ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET:+.1%}.")
-        log(f"  Alpha exits: TP={COPY_FAST_ALPHA_TP_MULT:.3f}x fast-kill "
-            f"{COPY_FAST_ALPHA_FAST_KILL_SEC:.1f}s/{COPY_FAST_ALPHA_FAST_KILL_PEAK:.3f}x; "
+        log(f"  Alpha exits: learned copy/tape alpha uses scout-sized moonshot runner exits; "
             f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
         if MARKET_TAPE_ALPHA_ENABLED:
             log(f"  Market-tape alpha: context-promoted tape enters scout size before static gates "
