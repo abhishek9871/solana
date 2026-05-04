@@ -645,6 +645,15 @@ class EntrySignal:
     stats6: WindowStats
 
 
+@dataclass
+class PendingStrike:
+    mint: str
+    signal: EntrySignal
+    created_ts_ms: int
+    base_price: float
+    expires_ts_ms: int
+
+
 def age_bucket(age_sec: float) -> str:
     if age_sec < 3:
         return "a0_3"
@@ -768,6 +777,7 @@ class FlowFollowerBot:
         self.broker = PaperBroker(config)
         self.tapes: dict[str, MintTape] = {}
         self.tracked_wallets = self.load_snipers(config.snipers_file)
+        self.pending: dict[str, PendingStrike] = {}
         self.seen_trade_limit = 20000
         self.seen_trade_keys: Deque[tuple[str, str, bool, int, int]] = deque()
         self.seen_trade_key_set: set[tuple[str, str, bool, int, int]] = set()
@@ -851,9 +861,57 @@ class FlowFollowerBot:
             await self.manage_position(tape, event.ts_ms, event.price, source="event")
 
         if event.is_buy and event.price > 0:
+            if self.try_activate_strike(tape, event):
+                return
             signal = self.detect_entry(tape, event)
             if signal:
-                self.broker.open(signal, event)
+                self.arm_strike(signal, event)
+
+    def arm_strike(self, signal: EntrySignal, event: FlowEvent) -> None:
+        if event.mint in self.pending or event.mint in self.broker.positions:
+            return
+        self.pending[event.mint] = PendingStrike(
+            mint=event.mint,
+            signal=signal,
+            created_ts_ms=event.ts_ms,
+            base_price=event.price,
+            expires_ts_ms=event.ts_ms + 2_500,
+        )
+        log(
+            f"FLOW-STRIKE {short_mint(event.mint)} phase={signal.phase} "
+            f"base={event.price:.6e} score={signal.score:.1f} ctx={signal.context}"
+        )
+
+    def try_activate_strike(self, tape: MintTape, event: FlowEvent) -> bool:
+        pending = self.pending.get(event.mint)
+        if not pending:
+            return False
+        if event.ts_ms <= pending.created_ts_ms:
+            return False
+        stats2 = tape.stats(2_000, event.ts_ms)
+        friction_mult = 1.0 + (2.0 * self.broker.drag) + 0.01
+        target_price = pending.base_price * friction_mult
+        if event.price >= target_price and stats2.sell_sol <= max(0.02, stats2.buy_sol * 0.50):
+            self.pending.pop(event.mint, None)
+            strike_signal = EntrySignal(
+                phase=pending.signal.phase,
+                context=pending.signal.context,
+                reason=f"{pending.signal.reason}; strike_continue={event.price / pending.base_price:.4f}x",
+                amount_sol=pending.signal.amount_sol,
+                score=pending.signal.score,
+                stats6=pending.signal.stats6,
+            )
+            self.broker.open(strike_signal, event)
+            return True
+        if event.ts_ms >= pending.expires_ts_ms:
+            self.pending.pop(event.mint, None)
+            log(f"FLOW-STRIKE-CANCEL {short_mint(event.mint)} reason=expired mult={event.price / pending.base_price:.4f}x")
+            return False
+        if event.price <= pending.base_price * 0.985 or stats2.sell_sol > max(0.04, stats2.buy_sol * 0.80):
+            self.pending.pop(event.mint, None)
+            log(f"FLOW-STRIKE-CANCEL {short_mint(event.mint)} reason=failed mult={event.price / pending.base_price:.4f}x")
+            return False
+        return False
 
     def detect_entry(self, tape: MintTape, event: FlowEvent) -> Optional[EntrySignal]:
         ts_ms = event.ts_ms
@@ -1083,6 +1141,12 @@ class FlowFollowerBot:
     async def heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
             ts_ms = now_ms()
+            for mint, pending in list(self.pending.items()):
+                if ts_ms >= pending.expires_ts_ms:
+                    curve = self.bc.price_for_mint(mint, self.config.curve_max_age_ms, ts_ms)
+                    mult = (curve[0] / pending.base_price) if curve and pending.base_price > 0 else 1.0
+                    self.pending.pop(mint, None)
+                    log(f"FLOW-STRIKE-CANCEL {short_mint(mint)} reason=heartbeat_expired mult={mult:.4f}x")
             for mint, pos in list(self.broker.positions.items()):
                 tape = self.tapes.get(mint)
                 if not tape:
@@ -1121,7 +1185,7 @@ class FlowFollowerBot:
             f"FLOW-STATUS entries={self.broker.stats.entries} closes={self.broker.stats.closes} "
             f"W/L={self.broker.stats.wins}/{self.broker.stats.losses} "
             f"realized={realized:+.5f} SOL open_pnl={open_pnl:+.5f} SOL "
-            f"open={len(self.broker.positions)} [{open_text}] "
+            f"open={len(self.broker.positions)} pending={len(self.pending)} [{open_text}] "
             f"shreds={self.broker.stats.shreds} trades={self.broker.stats.trades} "
             f"bc_updates={self.bc.updates}"
         )
