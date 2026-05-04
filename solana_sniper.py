@@ -1343,6 +1343,10 @@ COPY_FAST_SOLO_ROCKET_AMOUNT_SOL = float(os.environ.get("COPY_FAST_SOLO_ROCKET_A
 COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS = int(os.environ.get("COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS", "300"))
 COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC", "0.05"))
 COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN = float(os.environ.get("COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN", "0.995"))
+COPY_FAST_SOLO_ROCKET_WALLET_FILTER_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_WALLET_FILTER_ENABLED", "1") == "1"
+COPY_FAST_SOLO_ROCKET_MIN_WALLET_SAMPLES = int(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_WALLET_SAMPLES", "50"))
+COPY_FAST_SOLO_ROCKET_MIN_WALLET_WR = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_WALLET_WR", "0.65"))
+COPY_FAST_SOLO_ROCKET_MIN_WALLET_AVG_EXIT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_WALLET_AVG_EXIT", "0.050"))
 COPY_FAST_SOLO_ROCKET_TP_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TP_MULT", "1.055"))
 COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC", "2.0"))
 COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK", "1.012"))
@@ -3699,6 +3703,7 @@ async def session_reporter():
                 f"vel_cand={s.get('velocity_candidates', 0)} vel_trig={s.get('velocity_triggers', 0)} "
                 f"vel_blk={s.get('velocity_blocked', 0)} "
                 f"cf_ign={s.get('copy_fast_ignition', 0)} "
+                f"solo_wblk={s.get('solo_rocket_wallet_blocked', 0)} "
                 f"mt_blk={s.get('market_tape_blocked', 0)} ===")
             log(f"=== MARKET-TAPE-GATES: pos={s.get('mt_pos', 0)} cd={s.get('mt_cooldown', 0)} "
                 f"rate={s.get('mt_rate', 0)} uniq={s.get('mt_no_unique', 0)} "
@@ -5632,6 +5637,23 @@ def _alpha_wallet_only_promoted(stat: Optional[dict]) -> bool:
     )
 
 
+def _solo_rocket_wallet_ok(signer: str) -> tuple[bool, str]:
+    if not COPY_FAST_SOLO_ROCKET_WALLET_FILTER_ENABLED:
+        return True, "wallet_filter_off"
+    stat = _alpha_stats.get("wallets", {}).get(signer)
+    n, wr, avg_best, avg_exit = _alpha_stat_view(stat)
+    ok = (
+        n >= COPY_FAST_SOLO_ROCKET_MIN_WALLET_SAMPLES
+        and wr >= COPY_FAST_SOLO_ROCKET_MIN_WALLET_WR
+        and avg_exit >= COPY_FAST_SOLO_ROCKET_MIN_WALLET_AVG_EXIT
+    )
+    reason = (
+        f"wallet n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
+        f"avg_exit={avg_exit:+.1%}"
+    )
+    return ok, reason
+
+
 def _alpha_toxic(stat: Optional[dict]) -> bool:
     n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
     return n >= ALPHA_BLOCK_MIN_SAMPLES and wr <= ALPHA_BLOCK_MAX_WR and avg_best <= ALPHA_BLOCK_MAX_AVG_BEST_NET
@@ -7022,6 +7044,12 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                     and solo_rocket_ok
                     and off_peak_ok
                     and last_age_ms <= COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS):
+                wallet_ok, wallet_reason = _solo_rocket_wallet_ok(signer)
+                if not wallet_ok:
+                    _copy_trade_stats["solo_rocket_wallet_blocked"] = _copy_trade_stats.get("solo_rocket_wallet_blocked", 0) + 1
+                    reason = f"solo rocket wallet reject {wallet_reason}"
+                    await asyncio.sleep(COPY_FAST_CONFIRM_POLL_SEC)
+                    continue
                 if COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC > 0:
                     required_mult = (
                         COPY_FAST_SOLO_ROCKET_MIN_MULT if single_rocket_ok
@@ -7053,6 +7081,7 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                         "reason": (
                             f"solo_rocket_runner mult={last_mult:.3f}x "
                             f"swarm={len(recent)} age={last_age_ms}ms "
+                            f"{wallet_reason} "
                             f"amount={COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL"
                         ),
                     }
@@ -7061,7 +7090,7 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                 _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
                 log(f"  GRAD CONFIRM-OK {mint[:8]} (copy_fast_solo): "
                     f"solo rocket mult={last_mult:.3f}x peak={peak_price / baseline_price:.3f}x "
-                    f"swarm={len(recent)} age={last_age_ms}ms")
+                    f"swarm={len(recent)} age={last_age_ms}ms {wallet_reason}")
                 return True
             reason = (f"mult={last_mult:.3f}x peak={peak_price / baseline_price:.3f}x "
                       f"swarm={len(recent)} off_peak={off_peak_ok} age={last_age_ms}ms")
@@ -9248,7 +9277,12 @@ async def main():
             f"SWARM-2 lowers trigger to {COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT:.2f}x; "
             f"cache<={COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS}ms; "
             f"must retain {COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN:.1%} after "
-            f"{COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC:.2f}s; {solo_exit}.")
+            f"{COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC:.2f}s; "
+            f"wallet gate {'on' if COPY_FAST_SOLO_ROCKET_WALLET_FILTER_ENABLED else 'off'} "
+            f"({COPY_FAST_SOLO_ROCKET_MIN_WALLET_SAMPLES}+ samples, "
+            f"WR>={COPY_FAST_SOLO_ROCKET_MIN_WALLET_WR:.0%}, "
+            f"avg_exit>={COPY_FAST_SOLO_ROCKET_MIN_WALLET_AVG_EXIT:+.1%}); "
+            f"{solo_exit}.")
     else:
         log("  Solo rocket scout: DISABLED; copy_fast entries must pass swarm confirm or alpha promotion.")
     if ALPHA_LEARNER_ENABLED:
