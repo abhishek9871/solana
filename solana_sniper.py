@@ -1381,6 +1381,9 @@ MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKE
 MARKET_TAPE_ALPHA_MIN_MOVE_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_MOVE_MULT", "1.040"))
 MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.000"))
 MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET", "0.020"))
+MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_SAMPLES = int(os.environ.get("MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_SAMPLES", "5"))
+MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_WR = float(os.environ.get("MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_WR", "0.70"))
+MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_AVG_EXIT = float(os.environ.get("MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_AVG_EXIT", "0.050"))
 MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC", "2.0"))
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
@@ -1641,10 +1644,6 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                         ratio = our_price / trader_price
                         if ratio > COPY_FAST_MAX_PRICE_RATIO:
                             _copy_trade_stats["price_blocked"] += 1
-                            _market_tape_ratio_violation_until[mint] = (
-                                int(time.time() * 1000)
-                                + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
-                            )
                             log(f"  GRAD ABORT {mint[:8]} (copy_fast): our_px={our_price:.4e} "
                                 f"trader_px={trader_price:.4e} ratio={ratio:.3f}x > "
                                 f"{COPY_FAST_MAX_PRICE_RATIO:.2f}x — curve already moved past us")
@@ -1653,10 +1652,6 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                         # CsZiG33J was 0.473x; would have caught it.
                         if ratio < COPY_FAST_MIN_PRICE_RATIO:
                             _copy_trade_stats["price_blocked"] += 1
-                            _market_tape_ratio_violation_until[mint] = (
-                                int(time.time() * 1000)
-                                + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
-                            )
                             log(f"  GRAD ABORT {mint[:8]} (copy_fast): our_px={our_price:.4e} "
                                 f"trader_px={trader_price:.4e} ratio={ratio:.3f}x < "
                                 f"{COPY_FAST_MIN_PRICE_RATIO:.2f}x — token dumped after trader, momentum broken")
@@ -5438,6 +5433,14 @@ def _alpha_stat_view(stat: Optional[dict]) -> tuple[int, float, float, float]:
     return n, wr, avg_best, avg_exit
 
 
+def _alpha_bypass_static_guards(n: int, wr: float, avg_exit: float) -> bool:
+    return (
+        n >= MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_SAMPLES
+        and wr >= MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_WR
+        and avg_exit >= MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_AVG_EXIT
+    )
+
+
 def _alpha_promoted(stat: Optional[dict], min_samples: int = ALPHA_MIN_SAMPLES) -> bool:
     n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
     return n >= min_samples and wr >= ALPHA_PROMOTE_MIN_WR and avg_best >= ALPHA_PROMOTE_MIN_AVG_BEST_NET
@@ -5620,10 +5623,9 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         max(MARKET_TAPE_WINDOW_MS + 800, 1500),
         MARKET_TAPE_BC_CACHE_MAX_AGE_MS,
     )
-    if (not move_stats
-            or move_stats["complete"]
-            or float(move_stats["move"]) < MARKET_TAPE_ALPHA_MIN_MOVE_MULT):
+    if not move_stats or move_stats["complete"]:
         return None
+    move_mult = float(move_stats["move"])
     context = _alpha_context_key("market_tape", mint, signer, trader_price, trigger_price)
     wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
     context_stat = _alpha_stats.get("contexts", {}).get(context)
@@ -5631,8 +5633,11 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
     if _alpha_toxic(pair_stat) or _alpha_toxic(context_stat) or _alpha_toxic(wallet_stat):
         _copy_trade_stats["alpha_toxic"] = _copy_trade_stats.get("alpha_toxic", 0) + 1
         return None
-    if _alpha_promoted(pair_stat):
-        n, wr, avg_best, avg_exit = _alpha_stat_view(pair_stat)
+    def _plan_from_stat(n: int, wr: float, avg_best: float, avg_exit: float,
+                        reason: str) -> Optional[dict]:
+        bypass_static = _alpha_bypass_static_guards(n, wr, avg_exit)
+        if move_mult < MARKET_TAPE_ALPHA_MIN_MOVE_MULT and not bypass_static:
+            return None
         if avg_exit < MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:
             return None
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
@@ -5640,24 +5645,39 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "quality": 6,
             "context": context,
+            "ratio_bypass": bypass_static,
+            "move_bypass": bypass_static and move_mult < MARKET_TAPE_ALPHA_MIN_MOVE_MULT,
             "min_confirm_mult": (
                 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
                 if avg_exit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
                 else MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT
             ),
-            "reason": f"alpha_pair_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
-                      f"avg_exit={avg_exit:+.1%} ctx={context}",
+            "reason": reason,
         }
+    if _alpha_promoted(pair_stat):
+        n, wr, avg_best, avg_exit = _alpha_stat_view(pair_stat)
+        pair_plan = _plan_from_stat(
+            n, wr, avg_best, avg_exit,
+            f"alpha_pair_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
+            f"avg_exit={avg_exit:+.1%} ctx={context}",
+        )
+        if pair_plan:
+            return pair_plan
     if _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2) and _alpha_promoted(context_stat):
         wn, wwr, wavg, wexit = _alpha_stat_view(wallet_stat)
         cn, cwr, cavg, cexit = _alpha_stat_view(context_stat)
         if min(wexit, cexit) < MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:
+            return None
+        bypass_static = _alpha_bypass_static_guards(cn, cwr, cexit)
+        if move_mult < MARKET_TAPE_ALPHA_MIN_MOVE_MULT and not bypass_static:
             return None
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "quality": 6,
             "context": context,
+            "ratio_bypass": bypass_static,
+            "move_bypass": bypass_static and move_mult < MARKET_TAPE_ALPHA_MIN_MOVE_MULT,
             "min_confirm_mult": (
                 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
                 if cexit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
@@ -5668,21 +5688,11 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         }
     if _alpha_context_only_promoted(context_stat):
         n, wr, avg_best, avg_exit = _alpha_stat_view(context_stat)
-        if avg_exit < MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:
-            return None
-        _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
-        return {
-            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
-            "quality": 6,
-            "context": context,
-            "min_confirm_mult": (
-                MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
-                if avg_exit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
-                else MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT
-            ),
-            "reason": f"alpha_context n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
-                      f"avg_exit={avg_exit:+.1%} ctx={context}",
-        }
+        return _plan_from_stat(
+            n, wr, avg_best, avg_exit,
+            f"alpha_context n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
+            f"avg_exit={avg_exit:+.1%} ctx={context}",
+        )
     return None
 
 
@@ -7768,13 +7778,6 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             quality_score=int(moonshot_plan.get("quality") or 9),
         ))
         return
-    ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
-    if ratio_block_until > now_ms:
-        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
-        _mt_gate("mt_ratio")
-        log(f"  MARKET-TAPE BLOCK {mint[:8]}: recent price_ratio violation "
-            f"cooldown {(ratio_block_until - now_ms) / 1000:.1f}s")
-        return
     alpha_cached_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
     alpha_price_ratio = None
     if trader_price > 0 and alpha_cached_price and not alpha_cached_price[1] and alpha_cached_price[0] > 0:
@@ -7786,15 +7789,26 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         len(unique_buyers), len(tracked_buyers), buy_sol, sell_sol, observed_age_ms,
     )
     if alpha_plan:
+        alpha_ratio_bypass = bool(alpha_plan.get("ratio_bypass"))
+        ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
+        if ratio_block_until > now_ms and not alpha_ratio_bypass:
+            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+            _mt_gate("mt_ratio")
+            log(f"  MARKET-TAPE BLOCK {mint[:8]}: recent price_ratio violation "
+                f"cooldown {(ratio_block_until - now_ms) / 1000:.1f}s")
+            return
         if (alpha_price_ratio is not None
                 and (alpha_price_ratio < MARKET_TAPE_MIN_PRICE_RATIO
                      or alpha_price_ratio > MARKET_TAPE_MAX_PRICE_RATIO)):
-            _market_tape_ratio_violation_until[mint] = now_ms + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
-            _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
-            _mt_gate("mt_alpha_ratio")
-            log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: price_ratio={alpha_price_ratio:.3f}x "
-                f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
-            return
+            if not alpha_ratio_bypass:
+                _market_tape_ratio_violation_until[mint] = now_ms + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+                _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                _mt_gate("mt_alpha_ratio")
+                log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: price_ratio={alpha_price_ratio:.3f}x "
+                    f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
+                return
+            log(f"  MARKET-TAPE-ALPHA RATIO-BYPASS {mint[:8]}: price_ratio={alpha_price_ratio:.3f}x "
+                f"ctx={alpha_plan.get('context', '')}")
         if not alpha_cached_price or alpha_cached_price[1] or alpha_cached_price[0] <= 0:
             _mt_gate("mt_alpha_no_price")
             return
@@ -7836,8 +7850,13 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         _market_tape_entered_recent[mint] = entry_ms
         _market_tape_entry_times.append(entry_ms)
         _copy_trade_stats["market_tape_triggers"] = _copy_trade_stats.get("market_tape_triggers", 0) + 1
+        guard_note = ""
+        if alpha_plan.get("ratio_bypass") or alpha_plan.get("move_bypass"):
+            guard_note = (f" guard_bypass=ratio:{int(bool(alpha_plan.get('ratio_bypass')))}"
+                          f"/move:{int(bool(alpha_plan.get('move_bypass')))}")
         reason = (f"{alpha_plan['reason']} unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
-                  f"buy={buy_sol:.3f} sell={sell_sol:.3f} seen={observed_age_ms/1000:.1f}s")
+                  f"buy={buy_sol:.3f} sell={sell_sol:.3f} seen={observed_age_ms/1000:.1f}s"
+                  f"{guard_note}")
         log(f"  *** MARKET-TAPE-ALPHA TRIGGER *** {mint[:8]}: {reason}")
         asyncio.create_task(_enter_market_tape_position(
             client, kp, mint, now_ms, reason,
@@ -7845,6 +7864,13 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             launchpad="market_tape_scout",
             quality_score=int(alpha_plan.get("quality") or 6),
         ))
+        return
+    ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
+    if ratio_block_until > now_ms:
+        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        _mt_gate("mt_ratio")
+        log(f"  MARKET-TAPE BLOCK {mint[:8]}: recent price_ratio violation "
+            f"cooldown {(ratio_block_until - now_ms) / 1000:.1f}s")
         return
     if not birth_lane:
         if len(unique_buyers) < MARKET_TAPE_MIN_UNIQUE:
@@ -8803,7 +8829,10 @@ async def main():
                 f"avg_exit>={MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:+.1%}, "
                 f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
                 f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s; strong avg-exit buckets may retain "
-                f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x.")
+                f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x and bypass static ratio/move guards "
+                f"after n>={MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_SAMPLES}, "
+                f"WR>={MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_WR:.0%}, "
+                f"avg_exit>={MARKET_TAPE_ALPHA_BYPASS_GUARDS_MIN_AVG_EXIT:+.1%}.")
     log(f"  Dump kill: skip if price falls below {1.0 + COPY_FAST_CONFIRM_MAX_DUMP:.3f}x during the "
         f"{COPY_FAST_CONFIRM_WINDOW_SEC:.1f}s confirm window.")
     log(f"=== V41.19 MARKET-WIDE TAPE SCALPER ===")
