@@ -1334,13 +1334,15 @@ COPY_FAST_CONFIRM_SWARM_WINDOW_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWA
 COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC = float(os.environ.get("COPY_FAST_CONFIRM_SWARM3_CONTINUE_SEC", "1.0"))
 COPY_FAST_CONFIRMED_ENTRY_ENABLED = os.environ.get("COPY_FAST_CONFIRMED_ENTRY_ENABLED", "0") == "1"
 COPY_FAST_SWARM_ENTRY_ENABLED = os.environ.get("COPY_FAST_SWARM_ENTRY_ENABLED", "0") == "1"
-COPY_FAST_SOLO_ROCKET_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_ENABLED", "0") == "1"
+COPY_FAST_SOLO_ROCKET_ENABLED = os.environ.get("COPY_FAST_SOLO_ROCKET_ENABLED", "1") == "1"
+COPY_FAST_SOLO_ROCKET_AS_MOONSHOT = os.environ.get("COPY_FAST_SOLO_ROCKET_AS_MOONSHOT", "1") == "1"
 COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE = os.environ.get("COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE", "1") == "1"
-COPY_FAST_SOLO_ROCKET_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_MULT", "1.40"))
-COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT", "1.35"))
+COPY_FAST_SOLO_ROCKET_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_MIN_MULT", "1.35"))
+COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT", "1.28"))
 COPY_FAST_SOLO_ROCKET_AMOUNT_SOL = float(os.environ.get("COPY_FAST_SOLO_ROCKET_AMOUNT_SOL", "0.00625"))
-COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC", "0.12"))
-COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN = float(os.environ.get("COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN", "0.97"))
+COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS = int(os.environ.get("COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS", "300"))
+COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC", "0.05"))
+COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN = float(os.environ.get("COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN", "0.995"))
 COPY_FAST_SOLO_ROCKET_TP_MULT = float(os.environ.get("COPY_FAST_SOLO_ROCKET_TP_MULT", "1.055"))
 COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC", "2.0"))
 COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK", "1.012"))
@@ -7018,14 +7020,15 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
             if (COPY_FAST_SOLO_ROCKET_ENABLED
                     and launchpad == "copy_fast"
                     and solo_rocket_ok
-                    and off_peak_ok):
+                    and off_peak_ok
+                    and last_age_ms <= COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS):
                 if COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC > 0:
                     required_mult = (
                         COPY_FAST_SOLO_ROCKET_MIN_MULT if single_rocket_ok
                         else COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT
                     ) * COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN
                     await asyncio.sleep(COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC)
-                    confirm_price_info = _bc_cache_price_for_mint(mint, COPY_FAST_CONFIRM_CACHE_MAX_AGE_MS)
+                    confirm_price_info = _bc_cache_price_for_mint(mint, COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS)
                     if not confirm_price_info or confirm_price_info[1]:
                         reason = f"solo rocket no confirm price after {COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC:.2f}s"
                         await asyncio.sleep(COPY_FAST_CONFIRM_POLL_SEC)
@@ -7042,7 +7045,19 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                         continue
                     last_mult = confirm_mult
                     off_peak_ok = confirm_off_peak
-                _copy_fast_solo_rocket_mints.add(mint)
+                if COPY_FAST_SOLO_ROCKET_AS_MOONSHOT:
+                    _copy_fast_entry_overrides[mint] = {
+                        "launchpad": "moonshot_ignition",
+                        "amount": COPY_FAST_SOLO_ROCKET_AMOUNT_SOL,
+                        "quality": 6,
+                        "reason": (
+                            f"solo_rocket_runner mult={last_mult:.3f}x "
+                            f"swarm={len(recent)} age={last_age_ms}ms "
+                            f"amount={COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL"
+                        ),
+                    }
+                else:
+                    _copy_fast_solo_rocket_mints.add(mint)
                 _copy_trade_stats["confirm_ok"] = _copy_trade_stats.get("confirm_ok", 0) + 1
                 log(f"  GRAD CONFIRM-OK {mint[:8]} (copy_fast_solo): "
                     f"solo rocket mult={last_mult:.3f}x peak={peak_price / baseline_price:.3f}x "
@@ -9220,14 +9235,20 @@ async def main():
     else:
         log("  Confirmed raw copy_fast entries: DISABLED; copy signals train alpha and can still enter via alpha/tape.")
     if COPY_FAST_SOLO_ROCKET_ENABLED:
+        solo_exit = (
+            "managed as moonshot runner exits"
+            if COPY_FAST_SOLO_ROCKET_AS_MOONSHOT
+            else (f"TP={COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x fast-kill "
+                  f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s/"
+                  f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK:.3f}x")
+        )
         log(f"  Solo rocket scout: copy_fast may enter {COPY_FAST_SOLO_ROCKET_AMOUNT_SOL:.4f} SOL "
             f"at >={COPY_FAST_SOLO_ROCKET_MIN_MULT:.2f}x without swarm "
             f"({'on' if COPY_FAST_SOLO_ROCKET_ALLOW_SINGLE else 'off'}); "
             f"SWARM-2 lowers trigger to {COPY_FAST_SOLO_ROCKET_SWARM2_MIN_MULT:.2f}x; "
-            f"must retain {COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN:.0%} after "
-            f"{COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC:.2f}s; "
-            f"TP={COPY_FAST_SOLO_ROCKET_TP_MULT:.3f}x fast-kill "
-            f"{COPY_FAST_SOLO_ROCKET_FAST_KILL_SEC:.1f}s/{COPY_FAST_SOLO_ROCKET_FAST_KILL_PEAK:.3f}x.")
+            f"cache<={COPY_FAST_SOLO_ROCKET_MAX_CACHE_AGE_MS}ms; "
+            f"must retain {COPY_FAST_SOLO_ROCKET_CONFIRM_RETAIN:.1%} after "
+            f"{COPY_FAST_SOLO_ROCKET_CONFIRM_DELAY_SEC:.2f}s; {solo_exit}.")
     else:
         log("  Solo rocket scout: DISABLED; copy_fast entries must pass swarm confirm or alpha promotion.")
     if ALPHA_LEARNER_ENABLED:
