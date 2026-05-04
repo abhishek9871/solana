@@ -1580,6 +1580,34 @@ VELOCITY_TP1_FRACTION = float(os.environ.get("VELOCITY_TP1_FRACTION", "0.40"))
 VELOCITY_TRAIL_ACTIVATION = float(os.environ.get("VELOCITY_TRAIL_ACTIVATION", "1.100"))
 VELOCITY_TRAIL_DISTANCE = float(os.environ.get("VELOCITY_TRAIL_DISTANCE", "0.920"))
 VELOCITY_SELL_PRESSURE_MIN_AGE_SEC = float(os.environ.get("VELOCITY_SELL_PRESSURE_MIN_AGE_SEC", "0.75"))
+ROCKET_TAPE_ENABLED = os.environ.get("ROCKET_TAPE_ENABLED", "1") == "1"
+ROCKET_TAPE_WINDOW_MS = int(os.environ.get("ROCKET_TAPE_WINDOW_MS", "900"))
+ROCKET_TAPE_MICRO_WINDOW_MS = int(os.environ.get("ROCKET_TAPE_MICRO_WINDOW_MS", "240"))
+ROCKET_TAPE_CANDIDATE_TTL_MS = int(os.environ.get("ROCKET_TAPE_CANDIDATE_TTL_MS", "650"))
+ROCKET_TAPE_MAX_AGE_SEC = float(os.environ.get("ROCKET_TAPE_MAX_AGE_SEC", "10.0"))
+ROCKET_TAPE_MAX_CACHE_AGE_MS = int(os.environ.get("ROCKET_TAPE_MAX_CACHE_AGE_MS", "550"))
+ROCKET_TAPE_MIN_UNIQUE = int(os.environ.get("ROCKET_TAPE_MIN_UNIQUE", "4"))
+ROCKET_TAPE_MIN_BUY_SOL = float(os.environ.get("ROCKET_TAPE_MIN_BUY_SOL", "1.20"))
+ROCKET_TAPE_MIN_MOVE_MULT = float(os.environ.get("ROCKET_TAPE_MIN_MOVE_MULT", "1.060"))
+ROCKET_TAPE_STRONG_MOVE_MULT = float(os.environ.get("ROCKET_TAPE_STRONG_MOVE_MULT", "1.180"))
+ROCKET_TAPE_MAX_CHASE_MULT = float(os.environ.get("ROCKET_TAPE_MAX_CHASE_MULT", "2.350"))
+ROCKET_TAPE_MAX_OFF_PEAK = float(os.environ.get("ROCKET_TAPE_MAX_OFF_PEAK", "0.120"))
+ROCKET_TAPE_MAX_SELL_SOL = float(os.environ.get("ROCKET_TAPE_MAX_SELL_SOL", "0.160"))
+ROCKET_TAPE_MAX_SELL_BUY_RATIO = float(os.environ.get("ROCKET_TAPE_MAX_SELL_BUY_RATIO", "0.180"))
+ROCKET_TAPE_MIN_SCORE = float(os.environ.get("ROCKET_TAPE_MIN_SCORE", "14.0"))
+ROCKET_TAPE_STRONG_SCORE = float(os.environ.get("ROCKET_TAPE_STRONG_SCORE", "21.0"))
+ROCKET_TAPE_TOP_FRACTION = float(os.environ.get("ROCKET_TAPE_TOP_FRACTION", "0.92"))
+ROCKET_TAPE_CONFIRM_DELAY_SEC = float(os.environ.get("ROCKET_TAPE_CONFIRM_DELAY_SEC", "0.04"))
+ROCKET_TAPE_CONFIRM_RETAIN_MULT = float(os.environ.get("ROCKET_TAPE_CONFIRM_RETAIN_MULT", "0.992"))
+ROCKET_TAPE_AMOUNT_SOL = float(os.environ.get("ROCKET_TAPE_AMOUNT_SOL", "0.009375"))
+ROCKET_TAPE_STRONG_AMOUNT_SOL = float(os.environ.get("ROCKET_TAPE_STRONG_AMOUNT_SOL", "0.01875"))
+ROCKET_TAPE_MAX_AMOUNT_SOL = float(os.environ.get("ROCKET_TAPE_MAX_AMOUNT_SOL", "0.03125"))
+ROCKET_TAPE_SCALE_IN_ENABLED = os.environ.get("ROCKET_TAPE_SCALE_IN_ENABLED", "1") == "1"
+ROCKET_TAPE_SLAM_DELAY_SEC = float(os.environ.get("ROCKET_TAPE_SLAM_DELAY_SEC", "0.22"))
+ROCKET_TAPE_SLAM_MIN_SCORE = float(os.environ.get("ROCKET_TAPE_SLAM_MIN_SCORE", "24.0"))
+ROCKET_TAPE_SLAM_MIN_RETAIN_MULT = float(os.environ.get("ROCKET_TAPE_SLAM_MIN_RETAIN_MULT", "1.035"))
+ROCKET_TAPE_SLAM_MIN_BUY_SOL = float(os.environ.get("ROCKET_TAPE_SLAM_MIN_BUY_SOL", "0.90"))
+ROCKET_TAPE_SLAM_AMOUNT_SOL = float(os.environ.get("ROCKET_TAPE_SLAM_AMOUNT_SOL", "0.009375"))
 COPY_FAST_IGNITION_ENABLED = os.environ.get("COPY_FAST_IGNITION_ENABLED", "1") == "1"
 COPY_FAST_IGNITION_MIN_MULT = float(os.environ.get("COPY_FAST_IGNITION_MIN_MULT", "1.300"))
 COPY_FAST_IGNITION_STRONG_MULT = float(os.environ.get("COPY_FAST_IGNITION_STRONG_MULT", "1.550"))
@@ -3702,6 +3730,8 @@ async def session_reporter():
                 f"bb_blk={s.get('birth_breakout_blocked', 0)} "
                 f"vel_cand={s.get('velocity_candidates', 0)} vel_trig={s.get('velocity_triggers', 0)} "
                 f"vel_blk={s.get('velocity_blocked', 0)} "
+                f"rocket_cand={s.get('rocket_candidates', 0)} rocket_trig={s.get('rocket_triggers', 0)} "
+                f"rocket_blk={s.get('rocket_blocked', 0)} rocket_slam={s.get('rocket_slam', 0)} "
                 f"cf_ign={s.get('copy_fast_ignition', 0)} "
                 f"solo_wblk={s.get('solo_rocket_wallet_blocked', 0)} "
                 f"mt_blk={s.get('market_tape_blocked', 0)} ===")
@@ -3730,6 +3760,17 @@ async def session_reporter():
                 f"down={s.get('birth_breakout_down_ticks', 0)} "
                 f"ratio={s.get('birth_breakout_ratio', 0)} "
                 f"confirm={s.get('birth_breakout_confirm', 0)} ===")
+            log(f"=== ROCKET-TAPE: cand={s.get('rocket_candidates', 0)} "
+                f"trig={s.get('rocket_triggers', 0)} blk={s.get('rocket_blocked', 0)} "
+                f"age={s.get('rocket_age', 0)} flow={s.get('rocket_flow', 0)} "
+                f"sell={s.get('rocket_sell', 0)} no_px={s.get('rocket_no_px', 0)} "
+                f"complete={s.get('rocket_complete', 0)} move={s.get('rocket_move', 0)} "
+                f"chase={s.get('rocket_chase', 0)} off_peak={s.get('rocket_off_peak', 0)} "
+                f"score={s.get('rocket_score', 0)} rank={s.get('rocket_rank', 0)} "
+                f"edge={s.get('rocket_no_edge', 0)} confirm={s.get('rocket_confirm', 0)} "
+                f"busy={s.get('rocket_busy', 0)} slam={s.get('rocket_slam', 0)} "
+                f"slam_fade={s.get('rocket_slam_fade', 0)} slam_flow={s.get('rocket_slam_flow', 0)} "
+                f"active_rank={len(_rocket_tape_candidates)} ===")
             log(f"=== SWARM-SCOUT: cand={s.get('swarm_scout_candidates', 0)} "
                 f"trig={s.get('swarm_scout_triggers', 0)} "
                 f"no_px={s.get('swarm_scout_no_price', 0)} "
@@ -5401,6 +5442,7 @@ _market_tape_ratio_violation_until: dict[str, int] = {}
 _market_tape_alpha_context_recent_ms: dict[str, int] = {}
 _moonshot_context_recent_ms: dict[str, int] = {}
 _market_tape_entry_times: deque = deque(maxlen=200)
+_rocket_tape_candidates: dict[str, dict] = {}
 _copy_fast_entry_overrides: dict[str, dict] = {}
 
 _alpha_stats: dict[str, dict[str, dict]] = {"wallets": {}, "contexts": {}, "pairs": {}}
@@ -6238,6 +6280,266 @@ def _birth_breakout_plan(mint: str, signer: str, trader_price: float,
             + (f" ratio={price_ratio:.3f}x" if price_ratio is not None else "")
         ),
     }
+
+
+def _rocket_tape_window(tape: deque, now_ms: int, window_ms: int) -> dict:
+    cutoff = now_ms - window_ms
+    recent = [e for e in tape if int(e.get("ts") or 0) >= cutoff]
+    buys = [e for e in recent if e.get("is_buy")]
+    sells = [e for e in recent if not e.get("is_buy")]
+    unique_buyers = {e.get("signer") for e in buys if e.get("signer")}
+    tracked_buyers = {e.get("signer") for e in buys if e.get("tracked")}
+    buy_sol = sum(float(e.get("sol") or 0.0) for e in buys)
+    sell_sol = sum(float(e.get("sol") or 0.0) for e in sells)
+    return {
+        "recent": recent,
+        "buys": buys,
+        "sells": sells,
+        "unique": unique_buyers,
+        "tracked": tracked_buyers,
+        "buy_sol": buy_sol,
+        "sell_sol": sell_sol,
+        "buy_count": len(buys),
+        "sell_count": len(sells),
+    }
+
+
+def _rocket_tape_plan(mint: str, tape: deque, observed_age_ms: int,
+                      tracked_count_hint: int, now_ms: int) -> Optional[dict]:
+    """Rank fresh pump.fun tape and enter the current fastest live candidate.
+
+    This lane is deliberately market-wide. Tracked wallets add weight, but they
+    are not required when the tape itself shows a real stampede: fast curve
+    repricing, accelerating buy SOL, broad unique-buyer spread, and little sell
+    pressure.
+    """
+    if not ROCKET_TAPE_ENABLED:
+        return None
+    if observed_age_ms > ROCKET_TAPE_MAX_AGE_SEC * 1000:
+        _mt_gate("rocket_age")
+        return None
+
+    long_w = _rocket_tape_window(tape, now_ms, ROCKET_TAPE_WINDOW_MS)
+    micro_w = _rocket_tape_window(tape, now_ms, ROCKET_TAPE_MICRO_WINDOW_MS)
+    unique_count = len(long_w["unique"])
+    tracked_count = max(len(long_w["tracked"]), tracked_count_hint)
+    buy_sol = float(long_w["buy_sol"])
+    sell_sol = float(long_w["sell_sol"])
+    if unique_count < ROCKET_TAPE_MIN_UNIQUE or buy_sol < ROCKET_TAPE_MIN_BUY_SOL:
+        _mt_gate("rocket_flow")
+        return None
+    sell_ratio = sell_sol / buy_sol if buy_sol > 0 else 1.0
+    if sell_sol > ROCKET_TAPE_MAX_SELL_SOL or sell_ratio > ROCKET_TAPE_MAX_SELL_BUY_RATIO:
+        _mt_gate("rocket_sell")
+        return None
+
+    stats = _bc_cache_window_stats_for_mint(
+        mint,
+        max(ROCKET_TAPE_WINDOW_MS + 800, MOONSHOT_WINDOW_MS),
+        max(ROCKET_TAPE_MAX_CACHE_AGE_MS, MARKET_TAPE_BC_CACHE_MAX_AGE_MS),
+    )
+    if not stats:
+        stats = _market_tape_price_window_stats_for_mint(
+            mint,
+            max(ROCKET_TAPE_WINDOW_MS, MOONSHOT_WINDOW_MS),
+        )
+        if not stats:
+            _mt_gate("rocket_no_px")
+            return None
+    if stats.get("complete"):
+        _mt_gate("rocket_complete")
+        return None
+    move_mult = float(stats.get("move") or 1.0)
+    if move_mult < ROCKET_TAPE_MIN_MOVE_MULT:
+        _mt_gate("rocket_move")
+        return None
+    if move_mult > ROCKET_TAPE_MAX_CHASE_MULT:
+        _mt_gate("rocket_chase")
+        return None
+    off_peak = float(stats.get("off_peak") or 0.0)
+    if off_peak > ROCKET_TAPE_MAX_OFF_PEAK:
+        _mt_gate("rocket_off_peak")
+        return None
+
+    long_rate = buy_sol / max(ROCKET_TAPE_WINDOW_MS / 1000.0, 0.001)
+    micro_buy_sol = float(micro_w["buy_sol"])
+    micro_rate = micro_buy_sol / max(ROCKET_TAPE_MICRO_WINDOW_MS / 1000.0, 0.001)
+    accel = micro_rate / max(long_rate, 0.001)
+    micro_unique = len(micro_w["unique"])
+
+    score = 0.0
+    move_pct = max(0.0, (move_mult - 1.0) * 100.0)
+    score += min(10.0, move_pct * 0.75)
+    score += min(5.0, max(0.0, accel - 1.0) * 2.2)
+    score += min(6.0, unique_count * 0.75)
+    score += min(4.0, micro_unique * 0.70)
+    score += min(7.0, buy_sol * 1.15)
+    score += min(5.0, micro_buy_sol * 2.0)
+    score += min(6.0, tracked_count * 1.50)
+    score += min(3.0, max(0, int(stats.get("up_ticks") or 0) - int(stats.get("down_ticks") or 0)) * 0.75)
+    if sell_sol <= 0.003:
+        score += 2.0
+    else:
+        score -= min(5.0, sell_ratio * 18.0)
+    score -= min(4.0, off_peak * 20.0)
+    age_s = observed_age_ms / 1000.0
+    if age_s > 4.0:
+        score -= min(3.0, (age_s - 4.0) * 0.45)
+
+    operator_stampede = (
+        unique_count >= max(7, ROCKET_TAPE_MIN_UNIQUE + 3)
+        and buy_sol >= max(3.0, ROCKET_TAPE_MIN_BUY_SOL * 2.5)
+        and move_mult >= max(ROCKET_TAPE_STRONG_MOVE_MULT, ROCKET_TAPE_MIN_MOVE_MULT + 0.06)
+    )
+    if operator_stampede:
+        score += 1.5
+    if tracked_count <= 0 and not operator_stampede:
+        _mt_gate("rocket_no_edge")
+        return None
+
+    # Maintain a tiny live leaderboard. This prevents an okay mint from firing
+    # while a better one is exploding in the same sub-second window.
+    stale_before = now_ms - ROCKET_TAPE_CANDIDATE_TTL_MS
+    for cand_mint, cand in list(_rocket_tape_candidates.items()):
+        if int(cand.get("ts") or 0) < stale_before:
+            _rocket_tape_candidates.pop(cand_mint, None)
+    _rocket_tape_candidates[mint] = {
+        "score": score,
+        "ts": now_ms,
+        "move": move_mult,
+        "buy_sol": buy_sol,
+        "unique": unique_count,
+    }
+    best_mint = mint
+    best_score = score
+    for cand_mint, cand in _rocket_tape_candidates.items():
+        cand_score = float(cand.get("score") or 0.0)
+        if cand_score > best_score:
+            best_score = cand_score
+            best_mint = cand_mint
+    if score < ROCKET_TAPE_MIN_SCORE:
+        _mt_gate("rocket_score")
+        return None
+    if best_mint != mint and score < best_score * ROCKET_TAPE_TOP_FRACTION:
+        _mt_gate("rocket_rank")
+        return None
+
+    strong = (
+        score >= ROCKET_TAPE_STRONG_SCORE
+        or move_mult >= ROCKET_TAPE_STRONG_MOVE_MULT
+        or operator_stampede
+        or accel >= 2.1
+    )
+    amount = ROCKET_TAPE_STRONG_AMOUNT_SOL if strong else ROCKET_TAPE_AMOUNT_SOL
+    if score >= ROCKET_TAPE_SLAM_MIN_SCORE and move_mult >= ROCKET_TAPE_STRONG_MOVE_MULT:
+        amount = max(amount, min(ROCKET_TAPE_MAX_AMOUNT_SOL, ROCKET_TAPE_STRONG_AMOUNT_SOL))
+    amount = min(amount, ROCKET_TAPE_MAX_AMOUNT_SOL)
+    return {
+        "amount": amount,
+        "quality": 10 if score >= ROCKET_TAPE_STRONG_SCORE else 8,
+        "score": score,
+        "trigger_price": float(stats.get("last") or 0.0),
+        "allow_slam": score >= ROCKET_TAPE_SLAM_MIN_SCORE,
+        "reason": (
+            f"rocket_tape score={score:.1f}/{best_score:.1f} "
+            f"unique={unique_count} micro_unique={micro_unique} tracked={tracked_count} "
+            f"buy={buy_sol:.3f} micro_buy={micro_buy_sol:.3f} "
+            f"sell={sell_sol:.3f}/{sell_ratio:.1%} move={move_mult:.3f}x "
+            f"accel={accel:.2f} off_peak={off_peak:.1%} "
+            f"up/down={int(stats.get('up_ticks') or 0)}/{int(stats.get('down_ticks') or 0)} "
+            f"age={age_s:.1f}s source={stats.get('source', 'bc_cache')} "
+            f"px_age={int(stats.get('age_ms') or 0)}ms amount={amount:.4f} SOL"
+        ),
+    }
+
+
+async def _confirm_rocket_tape_plan(mint: str, trigger_price: float) -> tuple[bool, float, str]:
+    if ROCKET_TAPE_CONFIRM_DELAY_SEC <= 0 or trigger_price <= 0:
+        return True, 1.0, "no_confirm"
+    await asyncio.sleep(ROCKET_TAPE_CONFIRM_DELAY_SEC)
+    confirm_price = _bc_cache_price_for_mint(
+        mint,
+        max(ROCKET_TAPE_MAX_CACHE_AGE_MS, MARKET_TAPE_BC_CACHE_MAX_AGE_MS),
+    )
+    confirm_value = 0.0
+    source = "bc_cache"
+    if confirm_price and not confirm_price[1] and confirm_price[0] > 0:
+        confirm_value = float(confirm_price[0])
+        source = f"bc_cache:{confirm_price[2]}ms"
+    else:
+        stats = _market_tape_price_window_stats_for_mint(
+            mint,
+            max(ROCKET_TAPE_WINDOW_MS, MOONSHOT_WINDOW_MS),
+        )
+        if stats and not stats.get("complete") and float(stats.get("last") or 0.0) > 0:
+            confirm_value = float(stats["last"])
+            source = f"tape_price:{int(stats.get('age_ms') or 0)}ms"
+    if confirm_value <= 0:
+        return False, 0.0, "no_confirm_price"
+    retain_mult = confirm_value / trigger_price
+    return retain_mult >= ROCKET_TAPE_CONFIRM_RETAIN_MULT, retain_mult, source
+
+
+async def _rocket_tape_slam_if_continues(client: Client, kp: Optional[Keypair],
+                                         mint: str, trigger_price: float,
+                                         score: float) -> None:
+    if not ROCKET_TAPE_SCALE_IN_ENABLED or score < ROCKET_TAPE_SLAM_MIN_SCORE:
+        return
+    await asyncio.sleep(ROCKET_TAPE_SLAM_DELAY_SEC)
+    lock = _get_swarm_compound_lock(mint)
+    async with lock:
+        pos = positions.get(mint)
+        if not pos or pos.mint in _positions_closing or pos.remaining_pct <= 0.01:
+            return
+        if pos.adds_done >= 1:
+            return
+        cap = min(MAX_POSITION_AMOUNT_SOL, ROCKET_TAPE_MAX_AMOUNT_SOL)
+        add_amount = min(ROCKET_TAPE_SLAM_AMOUNT_SOL, cap - pos.entry_amount_sol)
+        if add_amount <= 0.000001:
+            return
+        cached = _bc_cache_price_for_pos(pos)
+        if not cached or cached[1] or cached[0] <= 0:
+            return
+        current_price = float(cached[0])
+        pos.last_price = current_price
+        if pos.entry_price > 0:
+            pos.peak_price = max(pos.peak_price, current_price / pos.entry_price)
+        trigger_retain = current_price / trigger_price if trigger_price > 0 else 1.0
+        if trigger_retain < ROCKET_TAPE_SLAM_MIN_RETAIN_MULT and pos.peak_price < 1.060:
+            _mt_gate("rocket_slam_fade")
+            return
+        now_ms = int(time.time() * 1000)
+        recent = _rocket_tape_window(
+            _market_tape_per_mint.get(mint, deque()),
+            now_ms,
+            max(ROCKET_TAPE_MICRO_WINDOW_MS * 2, 400),
+        )
+        buy_sol = float(recent["buy_sol"])
+        sell_sol = float(recent["sell_sol"])
+        sell_ratio = sell_sol / buy_sol if buy_sol > 0 else 1.0
+        if buy_sol < ROCKET_TAPE_SLAM_MIN_BUY_SOL or sell_ratio > ROCKET_TAPE_MAX_SELL_BUY_RATIO:
+            _mt_gate("rocket_slam_flow")
+            return
+        pos.adds_done += 1
+        log(f"  ROCKET-TAPE SLAM {mint[:8]}: adding {add_amount:.4f} SOL "
+            f"score={score:.1f} retain={trigger_retain:.3f}x "
+            f"buy={buy_sol:.3f} sell={sell_sol:.3f}/{sell_ratio:.1%}")
+        add_pos = await asyncio.to_thread(buy_token, kp, client, mint, add_amount)
+        if not add_pos:
+            pos.adds_done -= 1
+            _mt_gate("rocket_slam_fail")
+            log(f"  ROCKET-TAPE SLAM FAILED {mint[:8]}")
+            return
+        current = positions.get(mint)
+        if current is not pos or mint in _positions_closing:
+            log(f"  ROCKET-TAPE SLAM POST-CLOSE {mint[:8]}: disposing add leg")
+            await asyncio.to_thread(sell_token, kp, client, add_pos, 1.0, 1.0)
+            return
+        merge_position_add(pos, add_pos)
+        _persist_positions()
+        _copy_trade_stats["rocket_slam"] = _copy_trade_stats.get("rocket_slam", 0) + 1
+        log(f"  ROCKET-TAPE SLAM DONE {mint[:8]}: total exposure "
+            f"{pos.entry_amount_sol:.4f} SOL avg_entry={pos.entry_price:.6e}")
 
 
 def _evaluate_risk(snap: dict) -> tuple[bool, str]:
@@ -7719,6 +8021,10 @@ def _market_tape_cleanup(now_ms: int) -> None:
     for mint, until_ms in list(_market_tape_ratio_violation_until.items()):
         if until_ms <= now_ms:
             _market_tape_ratio_violation_until.pop(mint, None)
+    rocket_stale = now_ms - max(ROCKET_TAPE_CANDIDATE_TTL_MS, 2_000)
+    for mint, cand in list(_rocket_tape_candidates.items()):
+        if int(cand.get("ts") or 0) < rocket_stale:
+            _rocket_tape_candidates.pop(mint, None)
     stale_seen = now_ms - 10 * 60_000
     for mint, ts in list(_market_tape_last_seen_ms.items()):
         if ts < stale_seen:
@@ -8038,6 +8344,62 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             sig=f"{sig}:mt:{len(unique_buyers)}:{effective_tracked_count}",
         )
     trader_price = float(trade.get("trader_price") or 0.0)
+    if not _mint_recently_closed(mint, now_ms / 1000.0):
+        rocket_plan = _rocket_tape_plan(
+            mint,
+            tape,
+            observed_age_ms,
+            effective_tracked_count,
+            now_ms,
+        )
+        if rocket_plan:
+            _copy_trade_stats["rocket_candidates"] = _copy_trade_stats.get("rocket_candidates", 0) + 1
+            trigger_price = float(rocket_plan.get("trigger_price") or 0.0)
+            if trigger_price <= 0:
+                _copy_trade_stats["rocket_blocked"] = _copy_trade_stats.get("rocket_blocked", 0) + 1
+                _mt_gate("rocket_no_px")
+                return
+            ok, retain_mult, confirm_source = await _confirm_rocket_tape_plan(mint, trigger_price)
+            if not ok:
+                _copy_trade_stats["rocket_blocked"] = _copy_trade_stats.get("rocket_blocked", 0) + 1
+                _mt_gate("rocket_confirm")
+                log(f"  ROCKET-TAPE BLOCK {mint[:8]}: retain={retain_mult:.3f}x "
+                    f"< {ROCKET_TAPE_CONFIRM_RETAIN_MULT:.3f}x after "
+                    f"{ROCKET_TAPE_CONFIRM_DELAY_SEC:.2f}s src={confirm_source}")
+                return
+            entry_ms = int(time.time() * 1000)
+            if (mint in positions or mint in _positions_closing
+                    or _market_tape_rate_limited(entry_ms)
+                    or entry_ms - _market_tape_entered_recent.get(mint, 0) < MARKET_TAPE_COOLDOWN_SEC * 1000):
+                _copy_trade_stats["rocket_blocked"] = _copy_trade_stats.get("rocket_blocked", 0) + 1
+                _mt_gate("rocket_busy")
+                return
+            graduated_seen.add(mint)
+            if len(graduated_seen) > 500:
+                graduated_seen.clear()
+                graduated_seen.add(mint)
+            _market_tape_entered_recent[mint] = entry_ms
+            _market_tape_entry_times.append(entry_ms)
+            _copy_trade_stats["market_tape_triggers"] = _copy_trade_stats.get("market_tape_triggers", 0) + 1
+            _copy_trade_stats["moonshot_triggers"] = _copy_trade_stats.get("moonshot_triggers", 0) + 1
+            _copy_trade_stats["rocket_triggers"] = _copy_trade_stats.get("rocket_triggers", 0) + 1
+            reason = (
+                f"{rocket_plan.get('reason', 'rocket_tape')} "
+                f"retain={retain_mult:.3f}x/{ROCKET_TAPE_CONFIRM_DELAY_SEC:.2f}s "
+                f"confirm={confirm_source}"
+            )
+            log(f"  *** ROCKET-TAPE TRIGGER *** {mint[:8]}: {reason}")
+            asyncio.create_task(_enter_market_tape_position(
+                client, kp, mint, entry_ms, reason,
+                amount_sol=float(rocket_plan.get("amount") or ROCKET_TAPE_AMOUNT_SOL),
+                launchpad="moonshot_ignition",
+                quality_score=int(rocket_plan.get("quality") or 8),
+            ))
+            if bool(rocket_plan.get("allow_slam")):
+                asyncio.create_task(_rocket_tape_slam_if_continues(
+                    client, kp, mint, trigger_price, float(rocket_plan.get("score") or 0.0)
+                ))
+            return
     if not _mint_recently_closed(mint, now_ms / 1000.0):
         velocity_plan = _velocity_ignition_plan(
             mint,
@@ -9258,6 +9620,19 @@ async def main():
             f"{VELOCITY_FAST_KILL_SEC:.1f}s/{VELOCITY_FAST_KILL_PEAK:.3f}x.")
     else:
         log("  Velocity ignition: DISABLED for live entries; raw velocity tape still trains market alpha.")
+    if ROCKET_TAPE_ENABLED:
+        log(f"  Rocket tape ranker: {ROCKET_TAPE_AMOUNT_SOL:.4f}/"
+            f"{ROCKET_TAPE_STRONG_AMOUNT_SOL:.4f} SOL on rolling "
+            f"{ROCKET_TAPE_WINDOW_MS}ms/{ROCKET_TAPE_MICRO_WINDOW_MS}ms tape; "
+            f"score>={ROCKET_TAPE_MIN_SCORE:.1f}, top>={ROCKET_TAPE_TOP_FRACTION:.0%}, "
+            f"unique>={ROCKET_TAPE_MIN_UNIQUE}, buy>={ROCKET_TAPE_MIN_BUY_SOL:.2f} SOL, "
+            f"move={ROCKET_TAPE_MIN_MOVE_MULT:.3f}-{ROCKET_TAPE_MAX_CHASE_MULT:.3f}x; "
+            f"confirm retain>={ROCKET_TAPE_CONFIRM_RETAIN_MULT:.3f}x/"
+            f"{ROCKET_TAPE_CONFIRM_DELAY_SEC:.2f}s; "
+            f"slam {'on' if ROCKET_TAPE_SCALE_IN_ENABLED else 'off'} at "
+            f"score>={ROCKET_TAPE_SLAM_MIN_SCORE:.1f}.")
+    else:
+        log("  Rocket tape ranker: DISABLED.")
     if COPY_FAST_CONFIRMED_ENTRY_ENABLED:
         log(f"  Confirmed raw copy_fast size: {COPY_FAST_CONFIRMED_AMOUNT_SOL:.4f} SOL "
             f"(alpha core remains {COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL).")
