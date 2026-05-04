@@ -134,6 +134,12 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+
+def _env_clean(name: str, default: str = "") -> str:
+    """Read env vars defensively; systemd/.env values can carry CRLF/quotes."""
+    return os.environ.get(name, default).strip().strip('"').strip("'")
+
+
 # === CONFIG ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -147,14 +153,14 @@ ALPHA_STATE_FILE = os.environ.get(
 )
 
 # Wallet & RPC
-SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=c2fa0510-cddd-4768-9424-e5db39429bbb")
+SOLANA_RPC_URL = _env_clean("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=c2fa0510-cddd-4768-9424-e5db39429bbb")
 SOLANA_WS_URL = SOLANA_RPC_URL.replace("https://", "wss://").replace("http://", "ws://")
-PRIVATE_KEY_B58 = os.environ.get("SOLANA_PRIVATE_KEY", "")
+PRIVATE_KEY_B58 = _env_clean("SOLANA_PRIVATE_KEY", "")
 
 # V41.14: Solana Tracker RPC with shredSubscribe (50-150ms latency vs Helius ~500-1500ms)
-ST_RPC_KEY = os.environ.get("SOLANATRACKER_RPC_KEY", "")
-ST_RPC_HTTP = os.environ.get("SOLANATRACKER_RPC_HTTP", "")
-ST_RPC_WS = os.environ.get("SOLANATRACKER_RPC_WS", "")
+ST_RPC_KEY = _env_clean("SOLANATRACKER_RPC_KEY")
+ST_RPC_HTTP = _env_clean("SOLANATRACKER_RPC_HTTP")
+ST_RPC_WS = _env_clean("SOLANATRACKER_RPC_WS")
 ST_RPC_ENABLED = bool(ST_RPC_KEY and ST_RPC_WS)
 
 # Pump.fun program (post-2026-04-28 update)
@@ -168,12 +174,16 @@ BONK_ENABLED = os.environ.get("BONK_ENABLED", "1") == "1"
 # V41.12: Solana Tracker pre-filters bundled launches via their multi-heuristic engine.
 # Free tier: 10k req/month, 1 req/sec. Provides riskScore + bundlers/snipers/insiders/dev/top10.
 # Source: https://docs.solanatracker.io/data-api
-SOLANATRACKER_API_KEY = os.environ.get("SOLANATRACKER_API_KEY", "")
+SOLANATRACKER_API_KEY = _env_clean("SOLANATRACKER_API_KEY")
 SOLANATRACKER_ENABLED = bool(SOLANATRACKER_API_KEY) and os.environ.get("SOLANATRACKER_ENABLED", "1") == "1"
 SOLANATRACKER_BASE = "https://data.solanatracker.io"
 # V41.13: 2-min poll per user request. Burns ~21,600 calls/month — exhausts 10k plan
 # by ~day 14. User explicitly accepted this trade-off for faster candidate discovery.
 SOLANATRACKER_POLL_SEC = int(os.environ.get("SOLANATRACKER_POLL_SEC", "120"))
+ST_DATA_API_AUTH_BACKOFF_SEC = float(os.environ.get("ST_DATA_API_AUTH_BACKOFF_SEC", "300"))
+ST_DATA_API_RATE_BACKOFF_SEC = float(os.environ.get("ST_DATA_API_RATE_BACKOFF_SEC", "45"))
+ST_DATA_API_CREDIT_BACKOFF_SEC = float(os.environ.get("ST_DATA_API_CREDIT_BACKOFF_SEC", "1800"))
+ST_DATA_API_BACKOFF_LOG_SEC = float(os.environ.get("ST_DATA_API_BACKOFF_LOG_SEC", "60"))
 # Filter thresholds — tokens passing ALL of these enter our pipeline.
 # V41.13f: tightened filters to match HfpkGDz1 quality (the only ST entry that won).
 # HfpkGDz1: score=3, 0% bundlers, 0% dev, 0.3% top10, curve=34.9%.
@@ -305,6 +315,10 @@ DAILY_LOSS_EXIT_ENABLED = os.environ.get("DAILY_LOSS_EXIT_ENABLED", "1") == "1"
 MIN_WALLET_BALANCE_SOL = float(os.environ.get("MIN_WALLET_BALANCE_SOL", "0.05"))
 WALLET_BALANCE_CHECK_SEC = int(os.environ.get("WALLET_BALANCE_CHECK_SEC", "60"))
 MAX_CONSEC_LOSSES = int(os.environ.get("MAX_CONSEC_LOSSES", "5"))               # halt at 5 straight
+# Tiny paper scouts often close for -0.0000/-0.0001 SOL on fees/slippage. Count
+# those in W/L, but only real losses should trip the consecutive-loss brake.
+CONSEC_LOSS_COUNT_MIN_SOL = float(os.environ.get("CONSEC_LOSS_COUNT_MIN_SOL", "0.0002"))
+CONSEC_LOSS_HALT_SEC = float(os.environ.get("CONSEC_LOSS_HALT_SEC", "180"))
 MAX_CONCURRENT_POSITIONS = int(os.environ.get("MAX_CONCURRENT_POSITIONS", "10"))
 # V41.19: high-frequency market tape needs a data cap, not a low-frequency throttle.
 MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "250"))
@@ -343,6 +357,7 @@ session_pnl_sol = 0.0
 session_wins = 0
 session_losses = 0
 consec_losses = 0
+consec_loss_halt_until = 0.0
 daily_pnl_sol = 0.0
 daily_loss_reset_ts = time.time()
 daily_loss_halt_reason = ""
@@ -368,7 +383,7 @@ def _entry_circuit_breakers_open() -> tuple[bool, str]:
     """V41.5: centralised entry gate. Returns (blocked, reason).
     Checks session loss, consec losses, daily trade cap, streak pause.
     """
-    global daily_trade_count, daily_count_reset_ts
+    global daily_trade_count, daily_count_reset_ts, consec_losses, consec_loss_halt_until
     now = time.time()
     # Daily window resets every 24h. If the last reset was over 24h ago, zero the counter.
     if now - daily_count_reset_ts > 86400:
@@ -379,7 +394,17 @@ def _entry_circuit_breakers_open() -> tuple[bool, str]:
     if _daily_loss_limit_hit():
         return True, daily_loss_halt_reason or f"daily loss limit hit ({daily_pnl_sol:+.4f} SOL)"
     if consec_losses >= MAX_CONSEC_LOSSES:
-        return True, f"consec_loss limit hit ({consec_losses})"
+        if CONSEC_LOSS_HALT_SEC <= 0:
+            return True, f"consec_loss limit hit ({consec_losses})"
+        if consec_loss_halt_until <= 0:
+            consec_loss_halt_until = now + CONSEC_LOSS_HALT_SEC
+            log(f"  CONSEC-LOSS COOLDOWN: {consec_losses} real losses; pausing entries for "
+                f"{CONSEC_LOSS_HALT_SEC:.0f}s")
+        if now < consec_loss_halt_until:
+            return True, f"consec_loss cooldown ({int(consec_loss_halt_until - now)}s remaining)"
+        log(f"  CONSEC-LOSS COOLDOWN DONE: resuming entries after {consec_losses} real losses")
+        consec_losses = 0
+        consec_loss_halt_until = 0.0
     if daily_trade_count >= MAX_TRADES_PER_DAY:
         return True, f"daily trade cap hit ({daily_trade_count}/{MAX_TRADES_PER_DAY})"
     if now < streak_pause_until:
@@ -393,6 +418,7 @@ def _record_trade_close(pnl: float) -> None:
     - Triggers streak pause when consec_losses >= LOSS_STREAK_PAUSE_THRESHOLD
     """
     global session_pnl_sol, session_wins, session_losses, consec_losses, streak_pause_until
+    global consec_loss_halt_until
     global daily_pnl_sol, daily_loss_reset_ts, daily_loss_halt_reason
     now = time.time()
     if now - daily_loss_reset_ts > 86400:
@@ -403,12 +429,19 @@ def _record_trade_close(pnl: float) -> None:
     if pnl > MIN_REAL_WIN_SOL:
         session_wins += 1
         consec_losses = 0
+        consec_loss_halt_until = 0.0
     else:
         session_losses += 1
-        consec_losses += 1
-        if consec_losses >= LOSS_STREAK_PAUSE_THRESHOLD and streak_pause_until < time.time():
+        if pnl <= -CONSEC_LOSS_COUNT_MIN_SOL:
+            consec_losses += 1
+        if consec_losses >= LOSS_STREAK_PAUSE_THRESHOLD and streak_pause_until < now:
             streak_pause_until = time.time() + LOSS_STREAK_PAUSE_SEC
-            log(f"  STREAK PAUSE: {consec_losses} consec losses — pausing new entries for {LOSS_STREAK_PAUSE_SEC}s")
+            log(f"  STREAK PAUSE: {consec_losses} real consec losses; pausing new entries for "
+                f"{LOSS_STREAK_PAUSE_SEC}s")
+        if consec_losses >= MAX_CONSEC_LOSSES and CONSEC_LOSS_HALT_SEC > 0 and consec_loss_halt_until <= now:
+            consec_loss_halt_until = now + CONSEC_LOSS_HALT_SEC
+            log(f"  CONSEC-LOSS COOLDOWN: {consec_losses} real losses; pausing entries for "
+                f"{CONSEC_LOSS_HALT_SEC:.0f}s")
     if _daily_loss_limit_hit():
         daily_loss_halt_reason = f"daily loss limit hit ({daily_pnl_sol:+.4f} SOL / -{MAX_DAILY_LOSS_SOL:.4f} SOL)"
 
@@ -1347,6 +1380,7 @@ MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_
 MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
 MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.000"))
 MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET", "0.020"))
+MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC", "2.0"))
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
 MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
@@ -2054,8 +2088,8 @@ async def cobuy_snipe(client: Client, kp: Optional[Keypair], mint: str, smart_na
     """
     global session_pnl_sol, consec_losses
     try:
-        if session_pnl_sol <= -MAX_SESSION_LOSS_SOL: return
-        if consec_losses >= MAX_CONSEC_LOSSES: return
+        blocked, _reason = _entry_circuit_breakers_open()
+        if blocked: return
         if len(positions) >= MAX_CONCURRENT_POSITIONS: return
         if mint in positions:
             return
@@ -2903,8 +2937,8 @@ async def evaluate_and_snipe(client: Client, kp: Optional[Keypair], mint: str):
     """
     global session_pnl_sol, consec_losses
     try:
-        if session_pnl_sol <= -MAX_SESSION_LOSS_SOL: return
-        if consec_losses >= MAX_CONSEC_LOSSES: return
+        blocked, _reason = _entry_circuit_breakers_open()
+        if blocked: return
         if len(positions) >= MAX_CONCURRENT_POSITIONS: return
         if mint in positions: return
         if mint in cobuy_fired: return
@@ -3383,13 +3417,7 @@ async def manage_position(client: Client, kp: Optional[Keypair], pos: Position):
 
     # === Final accounting ===
     pnl = pos.realized_sol - pos.entry_amount_sol
-    session_pnl_sol += pnl
-    if pnl >= 0:
-        session_wins += 1
-        consec_losses = 0
-    else:
-        session_losses += 1
-        consec_losses += 1
+    _record_trade_close(pnl)
     log(f"  CLOSED {pos.mint[:8]} strategy={pos.strategy} peak={pos.peak_price:.2f}x recv={pos.realized_sol:.4f} cost={pos.entry_amount_sol:.4f} "
         f"pnl={pnl:+.4f} SOL | session={session_pnl_sol:+.4f} W={session_wins} L={session_losses} "
         f"reason={close_reason}")
@@ -4580,6 +4608,9 @@ _warm_swap_cache: dict = {}
 _warm_pool_stats = {"hits": 0, "misses": 0, "stale": 0, "subscribes": 0, "msgs_in": 0}
 # First-buyer holding-rate cache: mint -> (rate, fetched_at_epoch)
 _first_buyers_cache: dict = {}
+_st_data_api_backoff_until = 0.0
+_st_data_api_backoff_reason = ""
+_st_data_api_backoff_last_log = 0.0
 # Wallets currently warm in /stream/swap (single set for all subs on the connection)
 _warm_subscribed_mints: set = set()
 _warm_priority_mints: dict[str, float] = {}
@@ -4590,16 +4621,60 @@ def _mark_warm_priority_mint(mint: str) -> None:
         _warm_priority_mints[mint] = time.time()
 
 
+def _st_auth_headers() -> dict:
+    return {"x-api-key": SOLANATRACKER_API_KEY.strip()}
+
+
+def _st_data_api_blocked(path: str = "") -> bool:
+    global _st_data_api_backoff_last_log
+    now = time.time()
+    if now >= _st_data_api_backoff_until:
+        return False
+    if now - _st_data_api_backoff_last_log >= ST_DATA_API_BACKOFF_LOG_SEC:
+        _st_data_api_backoff_last_log = now
+        suffix = f" [{path}]" if path else ""
+        log(f"  ST Data API backoff{suffix}: {int(_st_data_api_backoff_until - now)}s remaining "
+            f"({_st_data_api_backoff_reason})")
+    return True
+
+
+def _st_note_data_api_status(path: str, status_code: int, body: str = "") -> None:
+    global _st_data_api_backoff_until, _st_data_api_backoff_reason, _st_data_api_backoff_last_log
+    if status_code not in (401, 403, 429):
+        return
+    now = time.time()
+    reason = f"HTTP {status_code}"
+    clean_body = (body or "").replace("\n", " ").replace("\r", " ").strip()
+    if clean_body:
+        reason = f"{reason}: {clean_body[:120]}"
+    body_lc = clean_body.lower()
+    if "insufficient credit" in body_lc or "insufficient credits" in body_lc:
+        wait_sec = ST_DATA_API_CREDIT_BACKOFF_SEC
+    else:
+        wait_sec = ST_DATA_API_RATE_BACKOFF_SEC if status_code == 429 else ST_DATA_API_AUTH_BACKOFF_SEC
+    until = now + wait_sec
+    if until > _st_data_api_backoff_until:
+        _st_data_api_backoff_until = until
+        _st_data_api_backoff_reason = reason
+        _st_data_api_backoff_last_log = now
+        log(f"  ST Data API backoff set for {wait_sec:.0f}s [{path}]: {reason}")
+
+
 def _st_fetch(path: str):
+    if _st_data_api_blocked(path):
+        return None
     try:
         r = requests.get(
             f"{SOLANATRACKER_BASE}{path}",
-            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            headers=_st_auth_headers(),
             timeout=10,
         )
         if r.status_code == 200:
             return r.json()
-        log(f"  ST fetch err [{path}]: HTTP {r.status_code}")
+        body = (r.text or "").replace("\n", " ").replace("\r", " ").strip()
+        _st_note_data_api_status(path, r.status_code, body)
+        if r.status_code not in (401, 403, 429):
+            log(f"  ST fetch err [{path}]: HTTP {r.status_code}")
     except Exception as e:
         log(f"  ST fetch err [{path}]: {type(e).__name__}: {e}")
     return None
@@ -4723,26 +4798,34 @@ def _st_fetch_top_traders(needed: int = 25):
     V41.17w fix: retry per-page on HTTP 429 (up to 2 retries with backoff). On a
     page that finally fails, CONTINUE to subsequent pages rather than abort —
     losing 25 wallets is better than losing the rest of the leaderboard."""
+    if _st_data_api_blocked("/top-traders/all"):
+        return None
     overfetch = max(needed, int(needed * 1.5))
     pages_needed = max(1, min(20, (overfetch + 24) // 25))
     all_wallets = []
     for page in range(1, pages_needed + 1):
+        if _st_data_api_blocked(f"/top-traders/all/{page}"):
+            break
         attempt = 0
         while attempt < 3:
+            if _st_data_api_blocked(f"/top-traders/all/{page}"):
+                break
             try:
                 r = requests.get(
                     f"{SOLANATRACKER_BASE}/top-traders/all/{page}",
-                    headers={"x-api-key": SOLANATRACKER_API_KEY},
+                    headers=_st_auth_headers(),
                     params={"expandPnl": "true"},
                     timeout=15,
                 )
                 if r.status_code == 429:
+                    _st_note_data_api_status(f"/top-traders/all/{page}", r.status_code, r.text or "")
                     backoff = 4 * (attempt + 1)  # 4s, 8s, 12s
                     log(f"  COPY-TRADE fetch 429 page={page} attempt={attempt+1}, backing off {backoff}s")
                     time.sleep(backoff)
                     attempt += 1
                     continue
                 if r.status_code != 200:
+                    _st_note_data_api_status(f"/top-traders/all/{page}", r.status_code, r.text or "")
                     log(f"  COPY-TRADE fetch err page={page}: HTTP {r.status_code} (skipping page)")
                     break  # break inner retry loop, continue to next page
                 data = r.json()
@@ -4801,16 +4884,21 @@ def _st_build_active_sniper_pool() -> list[str]:
     median trades/24h was 0 in old pool, 472 in active pool.
     """
     from collections import Counter
+    if _st_data_api_blocked("active-sniper build"):
+        return []
     # Step 1: gather recent graduations + actively trending tokens (V41.17z7).
     # Pull from /tokens/multi/all (graduated + graduating + latest) AND
     # /tokens/trending/5m for currently-hot tokens. Broader sample = more
     # diverse wallet coverage = higher swarm correlation rate.
     mints: set[str] = set()
     for ep in ["/tokens/multi/all?limit=500", "/tokens/trending/5m"]:
+        if _st_data_api_blocked(ep):
+            break
         try:
             r = requests.get(f"{SOLANATRACKER_BASE}{ep}",
-                             headers={"x-api-key": SOLANATRACKER_API_KEY}, timeout=15)
+                             headers=_st_auth_headers(), timeout=15)
             if r.status_code != 200:
+                _st_note_data_api_status(ep, r.status_code, r.text or "")
                 continue
             d = r.json()
             if isinstance(d, dict):
@@ -4835,12 +4923,16 @@ def _st_build_active_sniper_pool() -> list[str]:
     counter: Counter[str] = Counter()
     skipped = 0
     for i, mint in enumerate(grads):
+        if _st_data_api_blocked(f"/top-traders/{mint[:8]}"):
+            break
         try:
             r = requests.get(f"{SOLANATRACKER_BASE}/top-traders/{mint}",
-                             headers={"x-api-key": SOLANATRACKER_API_KEY}, timeout=10)
+                             headers=_st_auth_headers(), timeout=10)
             if r.status_code == 429:
+                _st_note_data_api_status(f"/top-traders/{mint}", r.status_code, r.text or "")
                 time.sleep(4); continue
             if r.status_code != 200:
+                _st_note_data_api_status(f"/top-traders/{mint}", r.status_code, r.text or "")
                 skipped += 1; continue
             d = r.json()
             traders = d if isinstance(d, list) else (d.get("traders") if isinstance(d, dict) else [])
@@ -4899,13 +4991,16 @@ def _first_buyers_smart_count(mint: str, min_realized: float = 1.0) -> tuple[int
 
     Uses ST's /first-buyers endpoint which returns PnL DATA INLINE — no per-wallet
     /pnl calls needed. Single call per graduating token (~100ms-2s)."""
+    if _st_data_api_blocked(f"/first-buyers/{mint[:8]}"):
+        return (0, 0, 0.0)
     try:
         r = requests.get(
             f"{SOLANATRACKER_BASE}/first-buyers/{mint}",
-            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            headers=_st_auth_headers(),
             timeout=5,
         )
         if r.status_code != 200:
+            _st_note_data_api_status(f"/first-buyers/{mint[:8]}", r.status_code, r.text or "")
             return (0, 0, 0.0)
         data = r.json()
         if isinstance(data, list):
@@ -4947,14 +5042,17 @@ def _wallet_hot_signal(wallet: str) -> Optional[dict]:
     was taking 7+ minutes. 8s catches the fast 95% and skips the slow tail
     (those wallets get marked as 'err' and dropped — acceptable trade-off for
     reliable 2-3min boot)."""
+    if _st_data_api_blocked(f"/pnl/{wallet[:8]}"):
+        return None
     try:
         r = requests.get(
             f"{SOLANATRACKER_BASE}/pnl/{wallet}",
-            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            headers=_st_auth_headers(),
             params={"showHistoricPnL": "true", "hideDetails": "true"},
             timeout=8,
         )
         if r.status_code != 200:
+            _st_note_data_api_status(f"/pnl/{wallet[:8]}", r.status_code, r.text or "")
             return None
         d = r.json()
         hs = (d.get("historic") or {}).get("summary") or {}
@@ -4973,13 +5071,16 @@ def _wallet_hot_signal(wallet: str) -> Optional[dict]:
 def _wallet_last_trade_ms(wallet: str) -> Optional[int]:
     """V41.17p: most-recent trade timestamp for a wallet via /wallet/{addr}/trades.
     Returns ms-epoch of trades[0].time, or None on error / no trades."""
+    if _st_data_api_blocked(f"/wallet/{wallet[:8]}/trades"):
+        return None
     try:
         r = requests.get(
             f"{SOLANATRACKER_BASE}/wallet/{wallet}/trades",
-            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            headers=_st_auth_headers(),
             timeout=10,
         )
         if r.status_code != 200:
+            _st_note_data_api_status(f"/wallet/{wallet[:8]}/trades", r.status_code, r.text or "")
             return None
         d = r.json()
         trades = d.get("trades", []) or []
@@ -5020,6 +5121,7 @@ _market_tape_first_seen_ms: dict[str, int] = {}
 _market_tape_last_seen_ms: dict[str, int] = {}
 _market_tape_entered_recent: dict[str, int] = {}
 _market_tape_ratio_violation_until: dict[str, int] = {}
+_market_tape_alpha_context_recent_ms: dict[str, int] = {}
 _market_tape_entry_times: deque = deque(maxlen=200)
 _copy_fast_entry_overrides: dict[str, dict] = {}
 
@@ -5334,6 +5436,7 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "quality": 6,
+            "context": context,
             "min_confirm_mult": (
                 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
                 if avg_exit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
@@ -5351,6 +5454,7 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "quality": 6,
+            "context": context,
             "min_confirm_mult": (
                 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
                 if cexit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
@@ -5367,6 +5471,7 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return {
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "quality": 6,
+            "context": context,
             "min_confirm_mult": (
                 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT
                 if avg_exit >= MARKET_TAPE_ALPHA_STRONG_MIN_AVG_EXIT_NET
@@ -5523,13 +5628,16 @@ def _rug_check_with_snapshot(mint: str) -> tuple[bool, str, Optional[dict]]:
         _risk_cache_stats["misses"] += 1
     # Cache miss / stale — fall back to live HTTP (preserves V41.16b behavior)
     _risk_cache_stats["live_fallback"] += 1
+    if _st_data_api_blocked(f"/tokens/{mint[:8]}"):
+        return True, "rug-check Data API backoff - proceeding", None
     try:
         r = requests.get(
             f"{SOLANATRACKER_BASE}/tokens/{mint}",
-            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            headers=_st_auth_headers(),
             timeout=1.5,
         )
         if r.status_code != 200:
+            _st_note_data_api_status(f"/tokens/{mint[:8]}", r.status_code, r.text or "")
             return True, f"rug-check API {r.status_code} — proceeding", None
         d = r.json()
         snap = _build_risk_snapshot_from_token(d)
@@ -5576,13 +5684,16 @@ def _first_buyer_holding_rate(mint: str) -> Optional[float]:
         rate, fetched_at = cached
         if time.time() - fetched_at < FIRST_BUYER_CACHE_TTL_SEC:
             return rate
+    if _st_data_api_blocked(f"/first-buyers/{mint[:8]}"):
+        return None
     try:
         r = requests.get(
             f"{SOLANATRACKER_BASE}/first-buyers/{mint}",
-            headers={"x-api-key": SOLANATRACKER_API_KEY},
+            headers=_st_auth_headers(),
             timeout=2.0,
         )
         if r.status_code != 200:
+            _st_note_data_api_status(f"/first-buyers/{mint[:8]}", r.status_code, r.text or "")
             return None
         data = r.json()
         # Endpoint returns a list directly per docs; tolerate dict shapes
@@ -6705,6 +6816,10 @@ def _market_tape_cleanup(now_ms: int) -> None:
     for mint, ts in list(_market_tape_entered_recent.items()):
         if ts < stale:
             _market_tape_entered_recent.pop(mint, None)
+    context_stale = now_ms - int(max(MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC * 1000, 10_000))
+    for context, ts in list(_market_tape_alpha_context_recent_ms.items()):
+        if ts < context_stale:
+            _market_tape_alpha_context_recent_ms.pop(context, None)
     for mint, until_ms in list(_market_tape_ratio_violation_until.items()):
         if until_ms <= now_ms:
             _market_tape_ratio_violation_until.pop(mint, None)
@@ -7009,12 +7124,24 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
                     f"< {min_confirm_mult:.3f}x after "
                     f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s")
                 return
+        entry_ms = int(time.time() * 1000)
+        alpha_context = str(alpha_plan.get("context") or "")
+        if alpha_context and MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC > 0:
+            cooldown_ms = int(MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC * 1000)
+            last_context_ms = _market_tape_alpha_context_recent_ms.get(alpha_context, 0)
+            if entry_ms - last_context_ms < cooldown_ms:
+                _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                _mt_gate("mt_alpha_context_cd")
+                log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: context cooldown "
+                    f"{(cooldown_ms - (entry_ms - last_context_ms)) / 1000:.1f}s ctx={alpha_context}")
+                return
+            _market_tape_alpha_context_recent_ms[alpha_context] = entry_ms
         graduated_seen.add(mint)
         if len(graduated_seen) > 500:
             graduated_seen.clear()
             graduated_seen.add(mint)
-        _market_tape_entered_recent[mint] = now_ms
-        _market_tape_entry_times.append(now_ms)
+        _market_tape_entered_recent[mint] = entry_ms
+        _market_tape_entry_times.append(entry_ms)
         _copy_trade_stats["market_tape_triggers"] = _copy_trade_stats.get("market_tape_triggers", 0) + 1
         reason = (f"{alpha_plan['reason']} unique={len(unique_buyers)} tracked={len(tracked_buyers)} "
                   f"buy={buy_sol:.3f} sell={sell_sol:.3f} seen={observed_age_ms/1000:.1f}s")
@@ -7891,8 +8018,10 @@ async def main():
     log(f"  Cobuy strategy: {'ENABLED' if COBUY_ENABLED else 'DISABLED'} (Xwu6 demoted)")
     log(f"  Holders gate: V40 entries skip if <4 real holders")
     log(f"  Daily trade cap: {MAX_TRADES_PER_DAY}")
-    log(f"  Streak pause: {LOSS_STREAK_PAUSE_SEC}s after {LOSS_STREAK_PAUSE_THRESHOLD} consec losses")
-    log(f"  Hard halts: -{MAX_SESSION_LOSS_SOL*1e3:.1f} mSOL session OR {MAX_CONSEC_LOSSES} consec losses")
+    log(f"  Streak pause: {LOSS_STREAK_PAUSE_SEC}s after {LOSS_STREAK_PAUSE_THRESHOLD} real consec losses")
+    log(f"  Consec loss counting: pnl <= -{CONSEC_LOSS_COUNT_MIN_SOL:.4f} SOL; "
+        f"{MAX_CONSEC_LOSSES} losses triggers {CONSEC_LOSS_HALT_SEC:.0f}s cooldown")
+    log(f"  Hard halts: -{MAX_SESSION_LOSS_SOL*1e3:.1f} mSOL session; daily loss still permanent")
     log(f"  Daily loss halt: -{MAX_DAILY_LOSS_SOL:.4f} SOL/24h | live min wallet balance: {MIN_WALLET_BALANCE_SOL:.4f} SOL")
     log(f"  Win classifier: pnl > {MIN_REAL_WIN_SOL:.4f} SOL (paper break-even = LOSS)")
     log(f"=========================================")
