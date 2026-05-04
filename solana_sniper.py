@@ -1589,6 +1589,7 @@ ROCKET_TAPE_CANDIDATE_TTL_MS = int(os.environ.get("ROCKET_TAPE_CANDIDATE_TTL_MS"
 ROCKET_TAPE_MAX_AGE_SEC = float(os.environ.get("ROCKET_TAPE_MAX_AGE_SEC", "10.0"))
 ROCKET_TAPE_MAX_CACHE_AGE_MS = int(os.environ.get("ROCKET_TAPE_MAX_CACHE_AGE_MS", "550"))
 ROCKET_TAPE_MIN_UNIQUE = int(os.environ.get("ROCKET_TAPE_MIN_UNIQUE", "4"))
+ROCKET_TAPE_MIN_TRACKED = int(os.environ.get("ROCKET_TAPE_MIN_TRACKED", "2"))
 ROCKET_TAPE_MIN_BUY_SOL = float(os.environ.get("ROCKET_TAPE_MIN_BUY_SOL", "1.20"))
 ROCKET_TAPE_MIN_MOVE_MULT = float(os.environ.get("ROCKET_TAPE_MIN_MOVE_MULT", "1.060"))
 ROCKET_TAPE_STRONG_MOVE_MULT = float(os.environ.get("ROCKET_TAPE_STRONG_MOVE_MULT", "1.180"))
@@ -6401,7 +6402,7 @@ def _rocket_tape_plan(mint: str, tape: deque, observed_age_ms: int,
     )
     if operator_stampede:
         score += 1.5
-    if tracked_count <= 0 and not operator_stampede:
+    if tracked_count < ROCKET_TAPE_MIN_TRACKED and not operator_stampede:
         _mt_gate("rocket_no_edge")
         return None
     if stats_source == "tape_price" and not ROCKET_TAPE_ALLOW_TAPE_PRICE_ENTRY:
@@ -9668,7 +9669,8 @@ async def main():
             f"{ROCKET_TAPE_STRONG_AMOUNT_SOL:.4f} SOL on rolling "
             f"{ROCKET_TAPE_WINDOW_MS}ms/{ROCKET_TAPE_MICRO_WINDOW_MS}ms tape; "
             f"score>={ROCKET_TAPE_MIN_SCORE:.1f}, top>={ROCKET_TAPE_TOP_FRACTION:.0%}, "
-            f"unique>={ROCKET_TAPE_MIN_UNIQUE}, buy>={ROCKET_TAPE_MIN_BUY_SOL:.2f} SOL, "
+            f"unique>={ROCKET_TAPE_MIN_UNIQUE}, tracked>={ROCKET_TAPE_MIN_TRACKED}, "
+            f"buy>={ROCKET_TAPE_MIN_BUY_SOL:.2f} SOL, "
             f"move={ROCKET_TAPE_MIN_MOVE_MULT:.3f}-{ROCKET_TAPE_MAX_CHASE_MULT:.3f}x; "
             f"confirm retain>={ROCKET_TAPE_CONFIRM_RETAIN_MULT:.3f}x/"
             f"{ROCKET_TAPE_CONFIRM_DELAY_SEC:.2f}s; "
