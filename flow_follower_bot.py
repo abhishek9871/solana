@@ -24,13 +24,15 @@ import json
 import math
 import os
 import signal
+import struct
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Optional
 
 import websockets
+from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 
@@ -40,6 +42,8 @@ PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 BONK_PROGRAM = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
 DISC_BUY = bytes([102, 6, 61, 18, 1, 218, 235, 234])
 DISC_SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])
+BC_DISC = bytes([0x17, 0xB7, 0xF8, 0x37, 0x60, 0xD8, 0xAC, 0x60])
+BC_DISC_B58 = "4y6pru6YvC7"
 
 
 def _load_dotenv() -> None:
@@ -106,6 +110,8 @@ class FlowConfig:
     max_amount_sol: float = 0.025
     max_open_positions: int = 3
     max_tape_age_sec: int = 420
+    curve_max_age_ms: int = 800
+    curve_move_window_ms: int = 1500
     entry_cooldown_sec: float = 20.0
     min_seconds_between_entries: float = 0.7
     heartbeat_sec: float = 0.25
@@ -146,6 +152,8 @@ class FlowConfig:
             max_amount_sol=env_float("FLOW_MAX_AMOUNT_SOL", 0.025),
             max_open_positions=env_int("FLOW_MAX_OPEN_POSITIONS", 3),
             max_tape_age_sec=env_int("FLOW_MAX_TAPE_AGE_SEC", 420),
+            curve_max_age_ms=env_int("FLOW_CURVE_MAX_AGE_MS", 800),
+            curve_move_window_ms=env_int("FLOW_CURVE_MOVE_WINDOW_MS", 1500),
             entry_cooldown_sec=env_float("FLOW_ENTRY_COOLDOWN_SEC", 20.0),
             min_seconds_between_entries=env_float("FLOW_MIN_SECONDS_BETWEEN_ENTRIES", 0.7),
             heartbeat_sec=env_float("FLOW_HEARTBEAT_SEC", 0.25),
@@ -353,6 +361,102 @@ class AlphaBook:
                 f"wr={stats.wr * 100:.1f}% avg_exit={stats.avg_exit * 100:+.1f}% "
                 f"avg_best={stats.avg_best * 100:+.1f}% avg_worst={stats.avg_worst * 100:+.1f}%"
             )
+
+
+class BondingCurveCache:
+    """Hot pump.fun curve-price cache populated by programSubscribe.
+
+    Shred tape is for speed and intent. This cache is the price truth: all fills,
+    PnL, peaks, trails, and close decisions must come from virtual reserves.
+    """
+
+    def __init__(self) -> None:
+        self.by_curve: dict[str, Deque[tuple[int, int, int, bool]]] = defaultdict(lambda: deque(maxlen=80))
+        self._mint_to_curve: dict[str, str] = {}
+        self.updates = 0
+        self.decode_errors = 0
+
+    def curve_for_mint(self, mint: str) -> Optional[str]:
+        cached = self._mint_to_curve.get(mint)
+        if cached:
+            return cached
+        try:
+            pda, _ = Pubkey.find_program_address(
+                [b"bonding-curve", bytes(Pubkey.from_string(mint))],
+                Pubkey.from_string(PUMP_PROGRAM),
+            )
+            out = str(pda)
+            self._mint_to_curve[mint] = out
+            return out
+        except Exception:
+            return None
+
+    def update_from_program_value(self, value: dict[str, Any], ts_ms: int) -> bool:
+        pubkey = value.get("pubkey")
+        if not pubkey:
+            return False
+        account = value.get("account") or {}
+        acc_data = account.get("data")
+        if isinstance(acc_data, list):
+            acc_data = acc_data[0]
+        if not isinstance(acc_data, str):
+            return False
+        try:
+            raw = base64.b64decode(acc_data)
+            if len(raw) < 49 or raw[:8] != BC_DISC:
+                return False
+            vtoken = struct.unpack_from("<Q", raw, 0x08)[0]
+            vsol = struct.unpack_from("<Q", raw, 0x10)[0]
+            complete = raw[48] != 0
+            if vtoken <= 0 or vsol <= 0:
+                return False
+            self.by_curve[str(pubkey)].append((ts_ms, vsol, vtoken, complete))
+            self.updates += 1
+            return True
+        except Exception:
+            self.decode_errors += 1
+            return False
+
+    def price_for_mint(self, mint: str, max_age_ms: int, ts_ms: Optional[int] = None) -> Optional[tuple[float, bool, int]]:
+        curve = self.curve_for_mint(mint)
+        if not curve:
+            return None
+        items = self.by_curve.get(curve)
+        if not items:
+            return None
+        ts_ms = ts_ms or now_ms()
+        item_ts, vsol, vtoken, complete = items[-1]
+        age_ms = ts_ms - int(item_ts)
+        if age_ms < 0:
+            age_ms = 0
+        if age_ms > max_age_ms or vtoken <= 0:
+            return None
+        return float(vsol) / float(vtoken), bool(complete), age_ms
+
+    def move_for_mint(self, mint: str, window_ms: int, max_age_ms: int, ts_ms: Optional[int] = None) -> Optional[tuple[float, int, bool]]:
+        curve = self.curve_for_mint(mint)
+        if not curve:
+            return None
+        items = list(self.by_curve.get(curve) or [])
+        if len(items) < 2:
+            return None
+        ts_ms = ts_ms or now_ms()
+        latest_ts, latest_vsol, latest_vtoken, complete = items[-1]
+        latest_age = ts_ms - int(latest_ts)
+        if latest_age > max_age_ms or latest_vtoken <= 0:
+            return None
+        cutoff = ts_ms - window_ms
+        recent = [item for item in items if item[0] >= cutoff]
+        if len(recent) < 2:
+            return None
+        first = recent[0]
+        if first[2] <= 0:
+            return None
+        first_price = float(first[1]) / float(first[2])
+        last_price = float(latest_vsol) / float(latest_vtoken)
+        if first_price <= 0:
+            return None
+        return last_price / first_price, int(latest_age), bool(complete)
 
 
 @dataclass
@@ -660,6 +764,7 @@ class FlowFollowerBot:
     def __init__(self, config: FlowConfig):
         self.config = config
         self.alpha = AlphaBook(config.alpha_file, config)
+        self.bc = BondingCurveCache()
         self.broker = PaperBroker(config)
         self.tapes: dict[str, MintTape] = {}
         self.tracked_wallets = self.load_snipers(config.snipers_file)
@@ -707,9 +812,10 @@ class FlowFollowerBot:
             return None
         signer = str(trade.get("signer") or "")
         sol_lamports = int(trade.get("sol_lamports") or 0)
-        price = float(trade.get("price") or 0.0)
-        if sol_lamports <= 0 or price <= 0:
+        if sol_lamports <= 0:
             return None
+        curve = self.bc.price_for_mint(mint, self.config.curve_max_age_ms)
+        price = curve[0] if curve and not curve[1] else 0.0
         return FlowEvent(
             ts_ms=now_ms(),
             sig=sig,
@@ -741,10 +847,10 @@ class FlowFollowerBot:
             )
 
         pos = self.broker.positions.get(event.mint)
-        if pos:
+        if pos and event.price > 0:
             await self.manage_position(tape, event.ts_ms, event.price, source="event")
 
-        if event.is_buy:
+        if event.is_buy and event.price > 0:
             signal = self.detect_entry(tape, event)
             if signal:
                 self.broker.open(signal, event)
@@ -753,6 +859,19 @@ class FlowFollowerBot:
         ts_ms = event.ts_ms
         if not self.broker.can_enter(event.mint, ts_ms):
             return None
+        curve = self.bc.price_for_mint(event.mint, self.config.curve_max_age_ms, ts_ms)
+        if not curve:
+            return None
+        curve_price, complete, curve_age_ms = curve
+        if complete or curve_price <= 0:
+            return None
+        curve_move = self.bc.move_for_mint(
+            event.mint,
+            self.config.curve_move_window_ms,
+            self.config.curve_max_age_ms,
+            ts_ms,
+        )
+        curve_mult = curve_move[0] if curve_move else 1.0
         age = tape.age_sec(ts_ms)
         stats2 = tape.stats(2_000, ts_ms)
         stats3 = tape.stats(3_000, ts_ms)
@@ -766,7 +885,7 @@ class FlowFollowerBot:
         off_peak = tape.off_peak()
         bounce = tape.bounce_from_trough()
 
-        if stats2.sells and stats2.sell_sol > stats2.buy_sol * 1.25 and stats2.price_change < -0.025:
+        if stats2.sells and stats2.sell_sol > stats2.buy_sol * 1.25 and curve_mult < 0.99:
             return None
         if stats6.buy_sol + stats6.sell_sol < 0.025:
             return None
@@ -780,7 +899,7 @@ class FlowFollowerBot:
             and stats3.unique_buyers >= 3
             and stats3.buy_sol >= 0.14
             and stats3.sell_sol <= 0.035
-            and stats3.price_change >= 0.018
+            and curve_mult >= 1.006
             and off_peak >= 0.965
         )
         if birth_ignition:
@@ -789,7 +908,7 @@ class FlowFollowerBot:
                 25.0
                 + stats3.unique_buyers * 3.0
                 + stats3.buy_sol * 35.0
-                + stats3.price_change * 220.0
+                + (curve_mult - 1.0) * 320.0
                 + stats3.tracked_buyers * 6.0
             )
             reason = "fresh clustered expansion"
@@ -801,7 +920,7 @@ class FlowFollowerBot:
             and stats6.unique_buyers >= 2
             and stats6.buy_sol >= 0.10
             and stats6.buy_pressure >= 1.65
-            and stats6.price_change >= -0.004
+            and curve_mult >= 1.001
             and (alpha_strong or stats6.tracked_buyers >= 1 or stats12.buy_sol >= 0.24)
         )
         if absorption:
@@ -813,6 +932,7 @@ class FlowFollowerBot:
                 + stats6.unique_buyers * 3.5
                 + stats6.buy_pressure * 2.5
                 + stats6.tracked_buyers * 7.0
+                + (curve_mult - 1.0) * 240.0
             )
             reason = "dump absorbed and buyers reclaimed price"
 
@@ -821,7 +941,7 @@ class FlowFollowerBot:
             and stats12.unique_buyers >= 4
             and stats12.buy_sol >= 0.22
             and stats12.buy_pressure >= 1.35
-            and stats12.price_change >= 0.035
+            and curve_mult >= 1.004
             and off_peak >= 0.86
             and (alpha_strong or stats12.tracked_buyers >= 1 or stats30.buy_sol >= 0.45)
         )
@@ -831,23 +951,23 @@ class FlowFollowerBot:
                 28.0
                 + stats12.unique_buyers * 2.5
                 + stats12.buy_sol * 24.0
-                + stats12.price_change * 210.0
+                + (curve_mult - 1.0) * 280.0
                 + stats12.tracked_buyers * 6.0
             )
             reason = "late expansion leg confirmed"
 
         big_lift = (
             event.sol >= 0.55
-            and stats2.price_change >= 0.014
+            and curve_mult >= 1.004
             and stats2.sell_sol <= event.sol * 0.35
             and off_peak >= 0.90
         )
         if big_lift and live_score < 47.0:
             phase = "WHALE_LIFT"
-            live_score = 32.0 + min(28.0, event.sol * 20.0) + stats2.price_change * 180.0
+            live_score = 32.0 + min(28.0, event.sol * 20.0) + (curve_mult - 1.0) * 260.0
             reason = "single large lift with no sell response"
 
-        stable_absorption = bounce >= 1.005 or stats6.price_change >= -0.001
+        stable_absorption = bounce >= 1.005 or curve_mult >= 1.0
         alpha_absorption = (
             alpha_strong
             and 3.0 <= age <= 420.0
@@ -856,6 +976,7 @@ class FlowFollowerBot:
             and stats6.unique_buyers >= 2
             and stats6.buy_pressure >= 1.15
             and stable_absorption
+            and curve_mult >= 0.999
         )
         if alpha_absorption and live_score < 45.0:
             phase = "ALPHA_ABSORPTION"
@@ -870,6 +991,8 @@ class FlowFollowerBot:
             score -= 12.0
         if stats6.sell_sol > stats6.buy_sol * 0.95:
             score -= 10.0
+        if curve_mult < 1.0:
+            score -= 15.0
         if trend_bucket(stats12.price_change) == "chase" and off_peak < 0.97:
             score -= 16.0
 
@@ -890,7 +1013,7 @@ class FlowFollowerBot:
         return EntrySignal(
             phase=phase,
             context=ctx,
-            reason=reason,
+            reason=f"{reason}; curve={curve_mult:.4f}x age={curve_age_ms}ms",
             amount_sol=amount,
             score=score,
             stats6=stats6,
@@ -962,7 +1085,17 @@ class FlowFollowerBot:
             ts_ms = now_ms()
             for mint, pos in list(self.broker.positions.items()):
                 tape = self.tapes.get(mint)
-                if not tape or pos.last_price <= 0:
+                if not tape:
+                    continue
+                curve = self.bc.price_for_mint(mint, self.config.curve_max_age_ms, ts_ms)
+                if curve and not curve[1]:
+                    price = curve[0]
+                    tape.last_price = price
+                    tape.peak_price = max(tape.peak_price or price, price)
+                    tape.trough_price = min(tape.trough_price or price, price)
+                    await self.manage_position(tape, ts_ms, price, source="heartbeat")
+                    continue
+                if pos.last_price <= 0:
                     continue
                 stale_sec = max(0.0, (ts_ms - tape.last_seen_ms) / 1000.0)
                 if stale_sec >= 3.0 and pos.age_sec(ts_ms) >= 5.0 and pos.peak_mult < 1.08:
@@ -989,7 +1122,8 @@ class FlowFollowerBot:
             f"W/L={self.broker.stats.wins}/{self.broker.stats.losses} "
             f"realized={realized:+.5f} SOL open_pnl={open_pnl:+.5f} SOL "
             f"open={len(self.broker.positions)} [{open_text}] "
-            f"shreds={self.broker.stats.shreds} trades={self.broker.stats.trades}"
+            f"shreds={self.broker.stats.shreds} trades={self.broker.stats.trades} "
+            f"bc_updates={self.bc.updates}"
         )
 
     async def stream_loop(self) -> None:
@@ -1021,8 +1155,22 @@ class FlowFollowerBot:
                             },
                         ],
                     }
+                    bc_sub = {
+                        "jsonrpc": "2.0",
+                        "id": 41002,
+                        "method": "programSubscribe",
+                        "params": [
+                            PUMP_PROGRAM,
+                            {
+                                "encoding": "base64",
+                                "commitment": "processed",
+                                "filters": [{"memcmp": {"offset": 0, "bytes": BC_DISC_B58}}],
+                            },
+                        ],
+                    }
                     await ws.send(json.dumps(sub))
-                    log("FLOW: subscribed to market-wide pump.fun shred tape")
+                    await ws.send(json.dumps(bc_sub))
+                    log("FLOW: subscribed to market-wide pump.fun shred tape + BondingCurve price cache")
                     while not self.stop_event.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=20)
@@ -1030,7 +1178,12 @@ class FlowFollowerBot:
                             log("FLOW: no shred messages for 20s, reconnecting")
                             break
                         data = json.loads(raw)
-                        if "shred" not in str(data.get("method", "")).lower():
+                        method = str(data.get("method", "")).lower()
+                        if "program" in method:
+                            value = (((data.get("params") or {}).get("result") or {}).get("value") or {})
+                            self.bc.update_from_program_value(value, now_ms())
+                            continue
+                        if "shred" not in method:
                             continue
                         result = ((data.get("params") or {}).get("result") or {})
                         sig = str(result.get("signature") or "")
