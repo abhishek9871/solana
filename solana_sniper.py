@@ -1599,6 +1599,10 @@ ROCKET_TAPE_MAX_SELL_BUY_RATIO = float(os.environ.get("ROCKET_TAPE_MAX_SELL_BUY_
 ROCKET_TAPE_MIN_SCORE = float(os.environ.get("ROCKET_TAPE_MIN_SCORE", "14.0"))
 ROCKET_TAPE_STRONG_SCORE = float(os.environ.get("ROCKET_TAPE_STRONG_SCORE", "21.0"))
 ROCKET_TAPE_TOP_FRACTION = float(os.environ.get("ROCKET_TAPE_TOP_FRACTION", "0.92"))
+ROCKET_TAPE_ALLOW_TAPE_PRICE_ENTRY = os.environ.get("ROCKET_TAPE_ALLOW_TAPE_PRICE_ENTRY", "0") == "1"
+ROCKET_TAPE_TAPE_PRICE_MIN_TRACKED = int(os.environ.get("ROCKET_TAPE_TAPE_PRICE_MIN_TRACKED", "3"))
+ROCKET_TAPE_TAPE_PRICE_MIN_BUY_SOL = float(os.environ.get("ROCKET_TAPE_TAPE_PRICE_MIN_BUY_SOL", "6.0"))
+ROCKET_TAPE_TAPE_PRICE_MIN_MOVE_MULT = float(os.environ.get("ROCKET_TAPE_TAPE_PRICE_MIN_MOVE_MULT", "1.250"))
 ROCKET_TAPE_CONFIRM_DELAY_SEC = float(os.environ.get("ROCKET_TAPE_CONFIRM_DELAY_SEC", "0.04"))
 ROCKET_TAPE_CONFIRM_RETAIN_MULT = float(os.environ.get("ROCKET_TAPE_CONFIRM_RETAIN_MULT", "0.992"))
 ROCKET_TAPE_AMOUNT_SOL = float(os.environ.get("ROCKET_TAPE_AMOUNT_SOL", "0.009375"))
@@ -3769,7 +3773,8 @@ async def session_reporter():
                 f"complete={s.get('rocket_complete', 0)} move={s.get('rocket_move', 0)} "
                 f"chase={s.get('rocket_chase', 0)} off_peak={s.get('rocket_off_peak', 0)} "
                 f"score={s.get('rocket_score', 0)} rank={s.get('rocket_rank', 0)} "
-                f"edge={s.get('rocket_no_edge', 0)} confirm={s.get('rocket_confirm', 0)} "
+                f"edge={s.get('rocket_no_edge', 0)} tape_px={s.get('rocket_tape_px', 0)} "
+                f"confirm={s.get('rocket_confirm', 0)} "
                 f"busy={s.get('rocket_busy', 0)} slam={s.get('rocket_slam', 0)} "
                 f"slam_fade={s.get('rocket_slam_fade', 0)} slam_flow={s.get('rocket_slam_flow', 0)} "
                 f"active_rank={len(_rocket_tape_candidates)} ===")
@@ -6348,6 +6353,7 @@ def _rocket_tape_plan(mint: str, tape: deque, observed_age_ms: int,
         if not stats:
             _mt_gate("rocket_no_px")
             return None
+    stats_source = str(stats.get("source") or "bc_cache")
     if stats.get("complete"):
         _mt_gate("rocket_complete")
         return None
@@ -6398,6 +6404,16 @@ def _rocket_tape_plan(mint: str, tape: deque, observed_age_ms: int,
     if tracked_count <= 0 and not operator_stampede:
         _mt_gate("rocket_no_edge")
         return None
+    if stats_source == "tape_price" and not ROCKET_TAPE_ALLOW_TAPE_PRICE_ENTRY:
+        tape_price_strong_enough = (
+            tracked_count >= ROCKET_TAPE_TAPE_PRICE_MIN_TRACKED
+            and buy_sol >= ROCKET_TAPE_TAPE_PRICE_MIN_BUY_SOL
+            and move_mult >= ROCKET_TAPE_TAPE_PRICE_MIN_MOVE_MULT
+            and operator_stampede
+        )
+        if not tape_price_strong_enough:
+            _mt_gate("rocket_tape_px")
+            return None
 
     # Maintain a tiny live leaderboard. This prevents an okay mint from firing
     # while a better one is exploding in the same sub-second window.
@@ -6449,7 +6465,7 @@ def _rocket_tape_plan(mint: str, tape: deque, observed_age_ms: int,
             f"sell={sell_sol:.3f}/{sell_ratio:.1%} move={move_mult:.3f}x "
             f"accel={accel:.2f} off_peak={off_peak:.1%} "
             f"up/down={int(stats.get('up_ticks') or 0)}/{int(stats.get('down_ticks') or 0)} "
-            f"age={age_s:.1f}s source={stats.get('source', 'bc_cache')} "
+            f"age={age_s:.1f}s source={stats_source} "
             f"px_age={int(stats.get('age_ms') or 0)}ms amount={amount:.4f} SOL"
         ),
     }
@@ -7727,6 +7743,11 @@ async def _swarm_compound_position(client: Client, kp: Optional[Keypair],
             return
         if (pos.adds_done or 0) >= 2:
             return  # already compounded twice — cap
+        if pos.rung_hit > 0 or pos.remaining_pct < 0.99:
+            _mt_gate("swarm_compound_after_tp")
+            log(f"  SWARM-COMPOUND SKIP {mint[:8]}: TP/partial exit already hit "
+                f"(rung={pos.rung_hit}, remaining={pos.remaining_pct:.2f})")
+            return
         age_s = time.time() - pos.open_time
         if age_s >= 30 or pos.peak_price < SWARM_COMPOUND_MIN_MULT:
             return
@@ -9651,6 +9672,7 @@ async def main():
             f"move={ROCKET_TAPE_MIN_MOVE_MULT:.3f}-{ROCKET_TAPE_MAX_CHASE_MULT:.3f}x; "
             f"confirm retain>={ROCKET_TAPE_CONFIRM_RETAIN_MULT:.3f}x/"
             f"{ROCKET_TAPE_CONFIRM_DELAY_SEC:.2f}s; "
+            f"tape-price-only {'allowed' if ROCKET_TAPE_ALLOW_TAPE_PRICE_ENTRY else 'requires strong tracked flow'}; "
             f"slam {'on' if ROCKET_TAPE_SCALE_IN_ENABLED else 'off'} at "
             f"score>={ROCKET_TAPE_SLAM_MIN_SCORE:.1f}.")
     else:
