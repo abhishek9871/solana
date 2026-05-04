@@ -1394,12 +1394,15 @@ COPY_FAST_ALPHA_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_
 COPY_FAST_ALPHA_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_PEAK", "1.012"))
 COPY_FAST_ALPHA_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_ALPHA_TIMEOUT_SEC", "8.0"))
 MARKET_TAPE_ALPHA_ENABLED = os.environ.get("MARKET_TAPE_ALPHA_ENABLED", "1") == "1"
-MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_SEC", "12.0"))
+MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_SEC", "30.0"))
 MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SELL_SOL", "0.004"))
 MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT", "0.998"))
 MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT = os.environ.get("MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT", "1") == "1"
+MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_SAMPLES = int(os.environ.get("MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_SAMPLES", "50"))
+MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_WR = float(os.environ.get("MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_WR", "0.70"))
+MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_AVG_EXIT = float(os.environ.get("MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_AVG_EXIT", "0.050"))
 MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO", "0.820"))
 MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO", "1.750"))
 MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
@@ -5919,9 +5922,7 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return None
     move_mult = float(move_stats["move"])
     context = _alpha_context_key("market_tape", mint, signer, trader_price, trigger_price)
-    if MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT and _alpha_context_is_dump(context):
-        _copy_trade_stats["alpha_dump_context"] = _copy_trade_stats.get("alpha_dump_context", 0) + 1
-        return None
+    dump_context = _alpha_context_is_dump(context)
     wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
     context_stat = _alpha_stats.get("contexts", {}).get(context)
     pair_stat = _alpha_stats.get("pairs", {}).get(f"{signer}|{context}")
@@ -5930,6 +5931,15 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return None
     def _plan_from_stat(n: int, wr: float, avg_best: float, avg_exit: float,
                         reason: str) -> Optional[dict]:
+        if MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT and dump_context:
+            dump_stat_ok = (
+                n >= MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_SAMPLES
+                and wr >= MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_WR
+                and avg_exit >= MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_AVG_EXIT
+            )
+            if not dump_stat_ok:
+                _copy_trade_stats["alpha_dump_context"] = _copy_trade_stats.get("alpha_dump_context", 0) + 1
+                return None
         bypass_static = _alpha_bypass_static_guards(n, wr, avg_exit)
         if move_mult < MARKET_TAPE_ALPHA_MIN_MOVE_MULT and not bypass_static:
             return None
@@ -9848,7 +9858,7 @@ async def main():
                 f"avg_exit>={MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_AVG_EXIT:+.1%}, "
                 f"alpha ratio-bypass hard band {MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO:.2f}-"
                 f"{MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO:.2f}x, "
-                f"{'blocks dump/dumped contexts, ' if MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT else ''}"
+                f"{'dump/dumped contexts require their own strong stats, ' if MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT else ''}"
                 f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
                 f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s; strong avg-exit buckets may retain "
                 f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x and bypass static ratio/move guards "
