@@ -626,6 +626,16 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         s250 = features["s250"]
         s700 = features["s700"]
         if pos.lane in {"second_wave_after_cluster", "reclaim_wave"}:
+            if (
+                pos.state == "SCOUT"
+                and pos.age_sec(features["ts_ms"]) <= env_float("PIGGY_EARLY_FAIL_SEC", 8.0)
+                and pos.peak_mult < env_float("PIGGY_EARLY_FAIL_MIN_PEAK", 1.005)
+                and pos.last_mult <= env_float("PIGGY_EARLY_FAIL_MULT", 0.90)
+                and not features["flow_live"]
+                and features["last_sell_age_ms"] <= env_int("PIGGY_EARLY_FAIL_SELL_AGE_MS", 700)
+                and features["s1500"]["sell_sol"] > 0
+            ):
+                return "kill_early_entry_failed"
             if pos.last_mult <= env_float("PIGGY_MOON_HARD_BREAK_MULT", 0.68):
                 return "kill_moon_hard_break"
             return None
