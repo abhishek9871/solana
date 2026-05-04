@@ -66,8 +66,8 @@ def piggy_config(args: argparse.Namespace) -> BaseConfig:
         heartbeat_sec=env_float("PIGGY_HEARTBEAT_SEC", 0.020),
         curve_max_age_ms=env_int("PIGGY_CURVE_MAX_AGE_MS", 650),
         max_tape_age_sec=env_int("PIGGY_MAX_TAPE_AGE_SEC", 90),
-        scout_sol=env_float("PIGGY_SCOUT_SOL", 0.0040),
-        max_position_sol=env_float("PIGGY_MAX_POSITION_SOL", 0.0800),
+        scout_sol=env_float("PIGGY_SCOUT_SOL", 0.0200),
+        max_position_sol=env_float("PIGGY_MAX_POSITION_SOL", 0.2000),
         max_open_positions=env_int("PIGGY_MAX_OPEN_POSITIONS", 3),
         max_pending_strikes=env_int("PIGGY_MAX_PENDING_STRIKES", 6),
         min_seconds_between_strikes=env_float("PIGGY_MIN_SECONDS_BETWEEN_STRIKES", 0.04),
@@ -389,7 +389,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             self.config.max_position_sol,
             max(
                 self.config.scout_sol,
-                env_float("PIGGY_SECOND_ENTRY_SOL", self.config.max_position_sol * 0.25),
+                env_float("PIGGY_SECOND_ENTRY_SOL", self.config.max_position_sol),
             ),
         )
         quality = max(0.0, min(1.0, (score - 90.0) / 55.0))
