@@ -1488,6 +1488,31 @@ MOONSHOT_TP2_MULT = float(os.environ.get("MOONSHOT_TP2_MULT", "1.700"))
 MOONSHOT_TP2_FRACTION = float(os.environ.get("MOONSHOT_TP2_FRACTION", "0.50"))
 MOONSHOT_TRAIL_ACTIVATION = float(os.environ.get("MOONSHOT_TRAIL_ACTIVATION", "1.180"))
 MOONSHOT_TRAIL_DISTANCE = float(os.environ.get("MOONSHOT_TRAIL_DISTANCE", "0.880"))
+VELOCITY_IGNITION_ENABLED = os.environ.get("VELOCITY_IGNITION_ENABLED", "1") == "1"
+VELOCITY_WINDOW_MS = int(os.environ.get("VELOCITY_WINDOW_MS", "1200"))
+VELOCITY_MAX_CACHE_AGE_MS = int(os.environ.get("VELOCITY_MAX_CACHE_AGE_MS", "450"))
+VELOCITY_MIN_MOVE_MULT = float(os.environ.get("VELOCITY_MIN_MOVE_MULT", "1.035"))
+VELOCITY_STRONG_MOVE_MULT = float(os.environ.get("VELOCITY_STRONG_MOVE_MULT", "1.080"))
+VELOCITY_MAX_CHASE_MULT = float(os.environ.get("VELOCITY_MAX_CHASE_MULT", "1.650"))
+VELOCITY_MAX_OFF_PEAK = float(os.environ.get("VELOCITY_MAX_OFF_PEAK", "0.035"))
+VELOCITY_MIN_UNIQUE = int(os.environ.get("VELOCITY_MIN_UNIQUE", "5"))
+VELOCITY_STRONG_UNIQUE = int(os.environ.get("VELOCITY_STRONG_UNIQUE", "8"))
+VELOCITY_MIN_TRACKED = int(os.environ.get("VELOCITY_MIN_TRACKED", "1"))
+VELOCITY_MIN_BUY_SOL = float(os.environ.get("VELOCITY_MIN_BUY_SOL", "1.25"))
+VELOCITY_STRONG_BUY_SOL = float(os.environ.get("VELOCITY_STRONG_BUY_SOL", "4.0"))
+VELOCITY_MAX_SELL_SOL = float(os.environ.get("VELOCITY_MAX_SELL_SOL", "0.030"))
+VELOCITY_MAX_SELL_BUY_RATIO = float(os.environ.get("VELOCITY_MAX_SELL_BUY_RATIO", "0.08"))
+VELOCITY_AMOUNT_SOL = float(os.environ.get("VELOCITY_AMOUNT_SOL", "0.00625"))
+VELOCITY_STRONG_AMOUNT_SOL = float(os.environ.get("VELOCITY_STRONG_AMOUNT_SOL", "0.0125"))
+VELOCITY_TIMEOUT_SEC = float(os.environ.get("VELOCITY_TIMEOUT_SEC", "10.0"))
+VELOCITY_FAST_KILL_SEC = float(os.environ.get("VELOCITY_FAST_KILL_SEC", "0.9"))
+VELOCITY_FAST_KILL_PEAK = float(os.environ.get("VELOCITY_FAST_KILL_PEAK", "1.025"))
+VELOCITY_DROP_EXIT_MULT = float(os.environ.get("VELOCITY_DROP_EXIT_MULT", "0.975"))
+VELOCITY_TP1_MULT = float(os.environ.get("VELOCITY_TP1_MULT", "1.120"))
+VELOCITY_TP1_FRACTION = float(os.environ.get("VELOCITY_TP1_FRACTION", "0.40"))
+VELOCITY_TRAIL_ACTIVATION = float(os.environ.get("VELOCITY_TRAIL_ACTIVATION", "1.100"))
+VELOCITY_TRAIL_DISTANCE = float(os.environ.get("VELOCITY_TRAIL_DISTANCE", "0.920"))
+VELOCITY_SELL_PRESSURE_MIN_AGE_SEC = float(os.environ.get("VELOCITY_SELL_PRESSURE_MIN_AGE_SEC", "0.75"))
 COPY_FAST_IGNITION_ENABLED = os.environ.get("COPY_FAST_IGNITION_ENABLED", "1") == "1"
 COPY_FAST_IGNITION_MIN_MULT = float(os.environ.get("COPY_FAST_IGNITION_MIN_MULT", "1.300"))
 COPY_FAST_IGNITION_STRONG_MULT = float(os.environ.get("COPY_FAST_IGNITION_STRONG_MULT", "1.550"))
@@ -1857,6 +1882,9 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
 
     def try_grad_sell(reason: str, fraction: float, multiplier: float) -> bool:
         nonlocal close_reason, closed
+        if positions.get(pos.mint) is not pos:
+            closed = True
+            return False
         if pos.mint in _positions_closing:
             return False
         if pos.remaining_pct <= 0.01:
@@ -1885,7 +1913,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
     def poll_delay() -> float:
         if pos.launchpad in ("copy_fast_solo", "copy_fast_alpha"):
             return GRAD_SWARM_POLL_SEC
-        if pos.launchpad in ("market_tape", "market_tape_scout", "moonshot_ignition"):
+        if pos.launchpad in ("market_tape", "market_tape_scout", "moonshot_ignition", "velocity_ignition"):
             return GRAD_SWARM_POLL_SEC
         if pos.launchpad == "copy_fast_swarm":
             return GRAD_SWARM_POLL_SEC
@@ -1896,7 +1924,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
     async def current_price(force_quote: bool = False) -> Optional[tuple[float, str]]:
         nonlocal last_quote_check
         if pos.launchpad in ("copy_fast", "copy_fast_solo", "copy_fast_alpha", "copy_fast_swarm",
-                             "market_tape", "market_tape_scout"):
+                             "market_tape", "market_tape_scout", "moonshot_ignition",
+                             "velocity_ignition"):
             cached = _bc_cache_price_for_pos(pos)
             if cached:
                 price, complete, age_ms = cached
@@ -1905,7 +1934,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
         now = time.time()
         if (not force_quote
                 and pos.launchpad in ("copy_fast", "copy_fast_solo", "copy_fast_alpha", "copy_fast_swarm",
-                                      "market_tape", "market_tape_scout", "moonshot_ignition")
+                                      "market_tape", "market_tape_scout", "moonshot_ignition",
+                                      "velocity_ignition")
                 and now - last_quote_check < GRAD_JUPITER_FALLBACK_SEC):
             return None
         last_quote_check = now
@@ -1937,6 +1967,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                 timeout_for_pos = MARKET_TAPE_SCOUT_TIMEOUT_SEC
             elif pos.launchpad == "moonshot_ignition":
                 timeout_for_pos = MOONSHOT_TIMEOUT_SEC
+            elif pos.launchpad == "velocity_ignition":
+                timeout_for_pos = VELOCITY_TIMEOUT_SEC
             else:
                 timeout_for_pos = GRAD_TIMEOUT_SEC
 
@@ -1944,6 +1976,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             if not price_info:
                 await asyncio.sleep(poll_delay())
                 continue
+            if positions.get(pos.mint) is not pos or pos.remaining_pct <= 0.01:
+                return
             sol_per_unit, price_source = price_info
             pos.last_price = sol_per_unit
             multiplier = sol_per_unit / pos.entry_price if pos.entry_price else 1.0
@@ -1983,6 +2017,16 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     and pos.peak_price < MOONSHOT_FAST_KILL_PEAK):
                 if try_grad_sell(
                     f"MOONSHOT FAST-KILL {MOONSHOT_FAST_KILL_SEC:.1f}s "
+                    f"peak={pos.peak_price:.3f}x mult={multiplier:.3f}x",
+                    1.0, multiplier,
+                ):
+                    break
+            if (pos.launchpad == "velocity_ignition"
+                    and pos.signal_time_ms > 0
+                    and (now * 1000 - pos.signal_time_ms) > VELOCITY_FAST_KILL_SEC * 1000
+                    and pos.peak_price < VELOCITY_FAST_KILL_PEAK):
+                if try_grad_sell(
+                    f"VELOCITY FAST-KILL {VELOCITY_FAST_KILL_SEC:.1f}s "
                     f"peak={pos.peak_price:.3f}x mult={multiplier:.3f}x",
                     1.0, multiplier,
                 ):
@@ -2030,7 +2074,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             if (pos.launchpad in ("copy_fast", "copy_fast_swarm", "pump", "bonk",
                                   "grad_imminent", "momentum", "st_pump", "market_tape",
                                   "market_tape_scout", "moonshot_ignition",
-                                  "copy_fast_solo", "copy_fast_alpha")
+                                  "velocity_ignition", "copy_fast_solo", "copy_fast_alpha")
                     and pos.signal_time_ms > 0
                     and pos.peak_price < DEAD_PEAK_THRESHOLD):
                 age_s = (now * 1000 - pos.signal_time_ms) / 1000
@@ -2081,6 +2125,29 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                 elif multiplier <= MOONSHOT_DROP_EXIT_MULT:
                     if try_grad_sell(f"MOONSHOT DROP EXIT mult={multiplier:.3f}x", 1.0, multiplier):
                         break
+            if pos.launchpad == "velocity_ignition":
+                if pos.rung_hit == 0 and multiplier >= VELOCITY_TP1_MULT:
+                    sell_frac = max(0.0, min(1.0, VELOCITY_TP1_FRACTION))
+                    log(f"  VELOCITY TP1 mult={multiplier:.3f}x: selling {sell_frac*100:.0f}%")
+                    if try_grad_sell(f"VELOCITY TP1 {VELOCITY_TP1_MULT:.3f}x mult={multiplier:.3f}x",
+                                     sell_frac, multiplier):
+                        pos.rung_hit = 1
+                        rung_hit = max(rung_hit, 1)
+                        _persist_positions()
+                        if pos.remaining_pct <= 0.01:
+                            break
+                if pos.peak_price >= VELOCITY_TRAIL_ACTIVATION:
+                    trail_floor = max(1.035, pos.peak_price * VELOCITY_TRAIL_DISTANCE)
+                    if multiplier <= trail_floor:
+                        if try_grad_sell(
+                            f"VELOCITY TRAIL exit floor={trail_floor:.3f}x "
+                            f"peak={pos.peak_price:.3f}x mult={multiplier:.3f}x",
+                            1.0, multiplier,
+                        ):
+                            break
+                elif multiplier <= VELOCITY_DROP_EXIT_MULT:
+                    if try_grad_sell(f"VELOCITY DROP EXIT mult={multiplier:.3f}x", 1.0, multiplier):
+                        break
             if pos.launchpad in ("market_tape", "market_tape_scout"):
                 tape_tp_mult = (
                     MARKET_TAPE_SCOUT_TP_MULT if pos.launchpad == "market_tape_scout"
@@ -2103,7 +2170,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     1.0, multiplier,
                 ):
                     break
-            if pos.launchpad != "moonshot_ignition" and pos.peak_price >= GRAD_TRAILING_ACTIVATION:
+            if pos.launchpad not in ("moonshot_ignition", "velocity_ignition") and pos.peak_price >= GRAD_TRAILING_ACTIVATION:
                 trail_floor = pos.peak_price * GRAD_TRAILING_DISTANCE
                 # Only honor trail exit if lock >= 4% (covers round-trip slippage)
                 min_lock = 1.04
@@ -2114,7 +2181,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
                     win_pct = (trail_floor - 1.0) * 100
                     if try_grad_sell(f"GRAD TRAIL exit at {trail_floor:.2f}x (peak={pos.peak_price:.2f}x, locked {win_pct:+.1f}%)", 1.0, trail_floor):
                         break
-            elif pos.launchpad != "moonshot_ignition" and change <= GRAD_SL_PCT:
+            elif pos.launchpad not in ("moonshot_ignition", "velocity_ignition") and change <= GRAD_SL_PCT:
                 if try_grad_sell(f"GRAD SL hit {change*100:.1f}% mult={multiplier:.2f}x", 1.0, multiplier):
                     break
 
@@ -2122,7 +2189,7 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # V41.7/9: bonk launchpad uses 1% trade fee vs pump.fun 0.3%, so TP threshold
             # gets a +2% offset to net the same realised profit after fees.
             fee_offset = 0.02 if pos.launchpad in ("bonk", "bonk_pregrad") else 0.0
-            if pos.launchpad != "moonshot_ignition" and rung_hit < len(GRAD_TP_LADDER):
+            if pos.launchpad not in ("moonshot_ignition", "velocity_ignition") and rung_hit < len(GRAD_TP_LADDER):
                 trigger, sell_frac = GRAD_TP_LADDER[rung_hit]
                 effective_trigger = trigger + fee_offset
                 if multiplier >= effective_trigger:
@@ -2140,6 +2207,8 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             await asyncio.sleep(5)
 
     pnl = pos.realized_sol - pos.entry_amount_sol
+    if positions.get(pos.mint) is not pos:
+        return
     _record_trade_close(pnl)
     log(f"  CLOSED GRAD {pos.mint[:8]} peak={pos.peak_price:.2f}x recv={pos.realized_sol:.4f} cost={pos.entry_amount_sol:.4f} "
         f"pnl={pnl:+.4f} SOL | session={session_pnl_sol:+.4f} W={session_wins} L={session_losses} reason={close_reason}")
@@ -3551,6 +3620,8 @@ async def session_reporter():
                 f"mt_birth={s.get('market_tape_birth_triggers', 0)} "
                 f"moon_cand={s.get('moonshot_candidates', 0)} moon_trig={s.get('moonshot_triggers', 0)} "
                 f"moon_blk={s.get('moonshot_blocked', 0)} "
+                f"vel_cand={s.get('velocity_candidates', 0)} vel_trig={s.get('velocity_triggers', 0)} "
+                f"vel_blk={s.get('velocity_blocked', 0)} "
                 f"cf_ign={s.get('copy_fast_ignition', 0)} "
                 f"mt_blk={s.get('market_tape_blocked', 0)} ===")
             log(f"=== MARKET-TAPE-GATES: pos={s.get('mt_pos', 0)} cd={s.get('mt_cooldown', 0)} "
@@ -5261,6 +5332,7 @@ _copy_trade_stats = {
     "market_tape_seen": 0, "market_tape_triggers": 0, "market_tape_entered": 0,
     "market_tape_blocked": 0, "market_tape_birth_triggers": 0,
     "moonshot_candidates": 0, "moonshot_triggers": 0, "moonshot_blocked": 0,
+    "velocity_candidates": 0, "velocity_triggers": 0, "velocity_blocked": 0,
     "copy_fast_ignition": 0,
     # V41.20 executable-alpha learner
     "alpha_shadow": 0, "alpha_outcomes": 0, "alpha_no_price": 0,
@@ -5618,6 +5690,69 @@ def _moonshot_context_key(observed_age_ms: int, tracked_count: int,
     move_b = _alpha_bucket(move_mult, (1.12, 1.25, 1.50, 1.90), ("m_lt12", "m12_25", "m25_50", "m50_90", "m90p"))
     buy_b = _alpha_bucket(buy_sol, (2.0, 4.0, 7.0, 12.0), ("b_lt2", "b2_4", "b4_7", "b7_12", "b12p"))
     return f"moonshot|{age_b}|{tr_b}|{move_b}|{buy_b}"
+
+
+def _velocity_ignition_plan(mint: str, unique_count: int, tracked_count: int,
+                            buy_sol: float, sell_sol: float) -> Optional[dict]:
+    if not VELOCITY_IGNITION_ENABLED:
+        return None
+    if buy_sol < VELOCITY_MIN_BUY_SOL or unique_count < VELOCITY_MIN_UNIQUE:
+        return None
+    sell_ratio = sell_sol / buy_sol if buy_sol > 0 else 1.0
+    if sell_sol > VELOCITY_MAX_SELL_SOL or sell_ratio > VELOCITY_MAX_SELL_BUY_RATIO:
+        _mt_gate("vel_sell")
+        return None
+    tracked_flow = tracked_count >= VELOCITY_MIN_TRACKED
+    operator_flow = buy_sol >= VELOCITY_STRONG_BUY_SOL and unique_count >= VELOCITY_STRONG_UNIQUE
+    if not (tracked_flow or operator_flow):
+        _mt_gate("vel_flow")
+        return None
+    stats = _bc_cache_window_stats_for_mint(
+        mint,
+        VELOCITY_WINDOW_MS,
+        VELOCITY_MAX_CACHE_AGE_MS,
+    )
+    if not stats:
+        _mt_gate("vel_no_bc")
+        return None
+    if stats["complete"]:
+        _mt_gate("vel_complete")
+        return None
+    move_mult = float(stats["move"])
+    if move_mult < VELOCITY_MIN_MOVE_MULT:
+        _mt_gate("vel_move_low")
+        return None
+    if move_mult > VELOCITY_MAX_CHASE_MULT:
+        _mt_gate("vel_chase")
+        return None
+    off_peak = float(stats["off_peak"])
+    if off_peak > VELOCITY_MAX_OFF_PEAK:
+        _mt_gate("vel_off_peak")
+        return None
+    if int(stats.get("down_ticks") or 0) > int(stats.get("up_ticks") or 0) + 1:
+        _mt_gate("vel_down_ticks")
+        return None
+
+    strong = (
+        move_mult >= VELOCITY_STRONG_MOVE_MULT
+        and (unique_count >= VELOCITY_STRONG_UNIQUE
+             or tracked_count >= max(2, VELOCITY_MIN_TRACKED + 1)
+             or buy_sol >= VELOCITY_STRONG_BUY_SOL)
+    )
+    amount = VELOCITY_STRONG_AMOUNT_SOL if strong else VELOCITY_AMOUNT_SOL
+    quality = 9 if strong else 7
+    return {
+        "amount": amount,
+        "quality": quality,
+        "trigger_price": float(stats["last"]),
+        "reason": (
+            f"velocity unique={unique_count} tracked={tracked_count} "
+            f"buy={buy_sol:.3f} sell={sell_sol:.3f}/{sell_ratio:.1%} "
+            f"move={move_mult:.3f}x off_peak={off_peak:.1%} "
+            f"up/down={stats['up_ticks']}/{stats['down_ticks']} "
+            f"cache={stats['age_ms']}ms amount={amount:.4f} SOL"
+        ),
+    }
 
 
 def _moonshot_ignition_plan(mint: str, signer: str, trader_price: float,
@@ -7192,6 +7327,8 @@ async def _close_grad_position_from_market_tape(client: Client, kp: Optional[Key
         if sol_recv is None:
             log(f"  MARKET-TAPE EXIT FAILED {pos.mint[:8]} ({reason}) — keeping position")
             return False
+        if positions.get(pos.mint) is not pos:
+            return False
         pos.realized_sol += sol_recv
         pos.remaining_pct = 0.0
         _persist_positions()
@@ -7218,8 +7355,9 @@ async def _maybe_market_tape_exit(client: Client, kp: Optional[Keypair],
     pos = positions.get(mint)
     if not pos or pos.mint in _positions_closing:
         return False
-    if pos.launchpad not in ("market_tape", "market_tape_scout", "moonshot_ignition", "copy_fast",
-                             "copy_fast_swarm", "copy_fast_solo", "copy_fast_alpha"):
+    if pos.launchpad not in ("market_tape", "market_tape_scout", "moonshot_ignition",
+                             "velocity_ignition", "copy_fast", "copy_fast_swarm",
+                             "copy_fast_solo", "copy_fast_alpha"):
         return False
 
     tape = list(_market_tape_per_mint.get(mint, ()))
@@ -7269,6 +7407,22 @@ async def _maybe_market_tape_exit(client: Client, kp: Optional[Keypair],
                     f"peak={pos.peak_price:.3f}x src={price_source}",
                     multiplier,
                 )
+    if pos.launchpad == "velocity_ignition":
+        if multiplier <= VELOCITY_DROP_EXIT_MULT:
+            return await _close_grad_position_from_market_tape(
+                client, kp, pos,
+                f"VELOCITY DROP EXIT mult={multiplier:.3f}x peak={pos.peak_price:.3f}x src={price_source}",
+                multiplier,
+            )
+        if pos.peak_price >= VELOCITY_TRAIL_ACTIVATION:
+            trail_floor = max(1.035, pos.peak_price * VELOCITY_TRAIL_DISTANCE)
+            if multiplier <= trail_floor:
+                return await _close_grad_position_from_market_tape(
+                    client, kp, pos,
+                    f"VELOCITY TAPE-TRAIL mult={multiplier:.3f}x floor={trail_floor:.3f}x "
+                    f"peak={pos.peak_price:.3f}x src={price_source}",
+                    multiplier,
+                )
 
     if multiplier <= MARKET_TAPE_EXIT_DROP_MULT:
         return await _close_grad_position_from_market_tape(
@@ -7278,6 +7432,9 @@ async def _maybe_market_tape_exit(client: Client, kp: Optional[Keypair],
         )
 
     age_since_open = max(0.0, now_ms / 1000.0 - pos.open_time)
+    if (pos.launchpad in ("moonshot_ignition", "velocity_ignition")
+            and age_since_open < VELOCITY_SELL_PRESSURE_MIN_AGE_SEC):
+        return False
     single_tracked_sell = bool(
         event
         and not event.get("is_buy")
@@ -7308,7 +7465,9 @@ async def _enter_market_tape_position(client: Client, kp: Optional[Keypair], min
     claimed_entry = False
     label = (
         "MOONSHOT-IGNITION" if launchpad == "moonshot_ignition"
+        else ("VELOCITY-IGNITION" if launchpad == "velocity_ignition"
         else ("MARKET-TAPE-SCOUT" if launchpad == "market_tape_scout" else "MARKET-TAPE")
+              )
     )
     try:
         blocked, why = _entry_circuit_breakers_open()
@@ -7461,6 +7620,33 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             sig=f"{sig}:mt:{len(unique_buyers)}:{len(tracked_buyers)}",
         )
     trader_price = float(trade.get("trader_price") or 0.0)
+    if not _mint_recently_closed(mint, now_ms / 1000.0):
+        velocity_plan = _velocity_ignition_plan(
+            mint,
+            len(unique_buyers),
+            len(tracked_buyers),
+            buy_sol,
+            sell_sol,
+        )
+        if velocity_plan:
+            _copy_trade_stats["velocity_candidates"] = _copy_trade_stats.get("velocity_candidates", 0) + 1
+            graduated_seen.add(mint)
+            if len(graduated_seen) > 500:
+                graduated_seen.clear()
+                graduated_seen.add(mint)
+            _market_tape_entered_recent[mint] = now_ms
+            _market_tape_entry_times.append(now_ms)
+            _copy_trade_stats["market_tape_triggers"] = _copy_trade_stats.get("market_tape_triggers", 0) + 1
+            _copy_trade_stats["velocity_triggers"] = _copy_trade_stats.get("velocity_triggers", 0) + 1
+            reason = str(velocity_plan.get("reason") or "velocity ignition")
+            log(f"  *** VELOCITY-IGNITION TRIGGER *** {mint[:8]}: {reason}")
+            asyncio.create_task(_enter_market_tape_position(
+                client, kp, mint, now_ms, reason,
+                amount_sol=float(velocity_plan.get("amount") or VELOCITY_AMOUNT_SOL),
+                launchpad="velocity_ignition",
+                quality_score=int(velocity_plan.get("quality") or 7),
+            ))
+            return
     moonshot_plan = None
     if _market_tape_ratio_violation_until.get(mint, 0) <= now_ms:
         moonshot_plan = _moonshot_ignition_plan(
@@ -8510,6 +8696,13 @@ async def main():
             f"{COPY_FAST_IGNITION_MIN_MULT:.2f}x with swarm>={COPY_FAST_IGNITION_MIN_SWARM}, "
             f"or >={COPY_FAST_IGNITION_FAST_MULT:.2f}x with swarm>={COPY_FAST_IGNITION_FAST_SWARM}, "
             f"cache<={COPY_FAST_IGNITION_MAX_CACHE_AGE_MS}ms; managed as moonshot.")
+    if VELOCITY_IGNITION_ENABLED:
+        log(f"  Velocity ignition: {VELOCITY_AMOUNT_SOL:.4f}/"
+            f"{VELOCITY_STRONG_AMOUNT_SOL:.4f} SOL on rolling {VELOCITY_WINDOW_MS}ms tape "
+            f"with {VELOCITY_MIN_UNIQUE}+ unique, tracked>={VELOCITY_MIN_TRACKED} or "
+            f"buy>={VELOCITY_STRONG_BUY_SOL:.1f} SOL, move>={VELOCITY_MIN_MOVE_MULT:.3f}x, "
+            f"off_peak<={VELOCITY_MAX_OFF_PEAK:.1%}; exits fast-kill "
+            f"{VELOCITY_FAST_KILL_SEC:.1f}s/{VELOCITY_FAST_KILL_PEAK:.3f}x.")
     if COPY_FAST_CONFIRMED_ENTRY_ENABLED:
         log(f"  Confirmed raw copy_fast size: {COPY_FAST_CONFIRMED_AMOUNT_SOL:.4f} SOL "
             f"(alpha core remains {COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL).")
