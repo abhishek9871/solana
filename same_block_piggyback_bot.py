@@ -66,12 +66,12 @@ def piggy_config(args: argparse.Namespace) -> BaseConfig:
         heartbeat_sec=env_float("PIGGY_HEARTBEAT_SEC", 0.020),
         curve_max_age_ms=env_int("PIGGY_CURVE_MAX_AGE_MS", 650),
         max_tape_age_sec=env_int("PIGGY_MAX_TAPE_AGE_SEC", 90),
-        scout_sol=env_float("PIGGY_SCOUT_SOL", 0.0120),
-        max_position_sol=env_float("PIGGY_MAX_POSITION_SOL", 0.1600),
-        max_open_positions=env_int("PIGGY_MAX_OPEN_POSITIONS", 4),
-        max_pending_strikes=env_int("PIGGY_MAX_PENDING_STRIKES", 10),
-        min_seconds_between_strikes=env_float("PIGGY_MIN_SECONDS_BETWEEN_STRIKES", 0.015),
-        cooldown_sec=env_float("PIGGY_COOLDOWN_SEC", 3.0),
+        scout_sol=env_float("PIGGY_SCOUT_SOL", 0.0040),
+        max_position_sol=env_float("PIGGY_MAX_POSITION_SOL", 0.0800),
+        max_open_positions=env_int("PIGGY_MAX_OPEN_POSITIONS", 3),
+        max_pending_strikes=env_int("PIGGY_MAX_PENDING_STRIKES", 6),
+        min_seconds_between_strikes=env_float("PIGGY_MIN_SECONDS_BETWEEN_STRIKES", 0.04),
+        cooldown_sec=env_float("PIGGY_COOLDOWN_SEC", 8.0),
         paper_drag_bps=env_float("PIGGY_PAPER_DRAG_BPS", 280.0),
         birth_max_age_ms=env_int("PIGGY_MAX_AGE_MS", 1350),
         first_buy_max_age_ms=env_int("PIGGY_FIRST_BUY_MAX_AGE_MS", 900),
@@ -250,90 +250,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             out["fresh_top_share"] = out["fresh_max_buy"] / max(out["fresh_buy_sol"], 0.001)
         return out
 
-    def ignition_ready(self, event: PumpEvent, features: dict[str, Any]) -> tuple[Optional[StrikePlan], str]:
-        if not env_bool("PIGGY_IGNITION_ENABLED", True):
-            return None, "ignition_disabled"
-        if not event.is_buy:
-            return None, "not_buy"
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None, "already_active"
-        if features["complete"]:
-            return None, "complete"
-        if not features["has_curve"] or features["price"] <= 0:
-            return None, "no_curve"
-
-        age_ms = int(features["age_ms"])
-        if age_ms > env_int("PIGGY_IGNITION_MAX_AGE_MS", 2600):
-            return None, "too_old"
-        if features["last_buy_age_ms"] > env_int("PIGGY_IGNITION_MAX_LAST_BUY_AGE_MS", 180):
-            return None, "buy_not_fresh"
-        if not (self.config.first_buy_min_sol <= features["first_buy_sol"] <= self.config.first_buy_max_sol):
-            return None, "first_buy_size"
-
-        s700 = features["s700"]
-        s1500 = features["s1500"]
-        sell_ratio = s1500["sell_sol"] / max(s1500["buy_sol"], 0.001)
-        if s1500["sell_sol"] > max(0.006, s1500["buy_sol"] * env_float("PIGGY_IGNITION_MAX_SELL_RATIO", 0.035)):
-            return None, "early_sell"
-        if features["off_peak"] < env_float("PIGGY_IGNITION_MIN_OFF_PEAK", 0.94):
-            return None, "off_peak"
-        if features["s8000"].get("max_buy_sol", 0.0) > env_float("PIGGY_IGNITION_MAX_SINGLE_BUY_SOL", 12.0):
-            return None, "absurd_trade_size"
-
-        slot_ok = (
-            features["slot_buyers"] >= env_int("PIGGY_IGNITION_MIN_SLOT_BUYERS", 10)
-            and features["slot_buy_sol"] >= env_float("PIGGY_IGNITION_MIN_SLOT_SOL", 10.0)
-            and features["slot_top_share"] <= env_float("PIGGY_IGNITION_MAX_SLOT_TOP_SHARE", 0.30)
-        )
-        broad_ok = (
-            s700["unique_buyers"] >= env_int("PIGGY_IGNITION_MIN_BUYERS_700", 99)
-            and s700["buy_sol"] >= env_float("PIGGY_IGNITION_MIN_BUY_SOL_700", 999.0)
-            and s700["top_buy_share"] <= env_float("PIGGY_IGNITION_MAX_TOP_SHARE_700", 0.68)
-        )
-        heavy_ok = (
-            s700["unique_buyers"] >= 3
-            and s700["buy_sol"] >= env_float("PIGGY_IGNITION_HEAVY_BUY_SOL_700", 999.0)
-            and s700["top_buy_share"] <= env_float("PIGGY_IGNITION_HEAVY_TOP_SHARE_700", 0.62)
-        )
-        if not (slot_ok or broad_ok or heavy_ok):
-            return None, "cluster_not_hot"
-
-        score = 95.0
-        score += min(40.0, s700["buy_sol"] * 6.0)
-        score += min(30.0, s700["unique_buyers"] * 6.0)
-        score += min(26.0, features["slot_buy_sol"] * 5.0)
-        score += max(0.0, features["move700"] - 1.0) * 420.0
-        score -= max(0.0, s700["top_buy_share"] - 0.58) * 70.0
-        score -= max(0.0, sell_ratio - 0.015) * 180.0
-
-        scout = min(
-            self.config.max_position_sol,
-            max(
-                self.config.scout_sol,
-                env_float("PIGGY_IGNITION_ENTRY_SOL", self.config.max_position_sol * 0.42),
-            ),
-        )
-        quality = max(0.0, min(1.0, (score - 115.0) / 70.0))
-        target = scout + (self.config.max_position_sol - scout) * max(0.35, quality)
-        target = min(self.config.max_position_sol, max(scout, target))
-        reason = (
-            f"ignition slot={features['slot_buy_sol']:.3f}/{features['slot_buyers']} "
-            f"u700={s700['unique_buyers']} b700={s700['buy_sol']:.3f} "
-            f"top={s700['top_buy_share']:.2f} sell={sell_ratio:.2f}"
-        )
-        return StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="same_block_ignition",
-            reason=reason,
-            score=score,
-            scout_sol=scout,
-            target_sol=target,
-            price=float(features["price"]),
-            needs_curve_fill=False,
-            features=self.slim_features(features),
-        ), "ready"
-
     def prior_peak_price(self, mint: str, ts_ms: int, before_ms: int = 0) -> float:
         tape = self.tapes.get(mint)
         if not tape:
@@ -473,7 +389,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             self.config.max_position_sol,
             max(
                 self.config.scout_sol,
-                env_float("PIGGY_SECOND_ENTRY_SOL", self.config.max_position_sol * 0.50),
+                env_float("PIGGY_SECOND_ENTRY_SOL", self.config.max_position_sol * 0.25),
             ),
         )
         quality = max(0.0, min(1.0, (score - 90.0) / 55.0))
@@ -567,9 +483,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
 
     def build_strike_plan(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
         self.maybe_arm_first_burst(event, features)
-        ignition, _ = self.ignition_ready(event, features)
-        if ignition:
-            return ignition
         plan, _ = self.second_wave_ready(event, features)
         return plan
 
@@ -579,9 +492,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if not features:
             return
         self.maybe_arm_first_burst(event, features)
-        plan, why = self.ignition_ready(event, features)
-        if not plan:
-            plan, why = self.second_wave_ready(event, features)
+        plan, why = self.second_wave_ready(event, features)
         if not plan:
             if why in {"arm_expired", "initial_cluster_sold"}:
                 self.logger.decision("wave_disarm", event.mint, {"reason": why, "features": self.slim_features(features)})
@@ -644,31 +555,16 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return
 
         if pos.state == "SCOUT":
-            if pos.lane in self.moonshot_lanes():
+            if pos.lane in {"second_wave_after_cluster", "reclaim_wave"}:
                 sell_pressure = features["s700"]["sell_sol"] > 0 or features["s1500"]["sell_sol"] / max(features["s1500"]["buy_sol"], 0.001) >= 0.10
-                if self.moonshot_scale_reason(pos, features):
-                    add_sol = max(0.0, pos.target_sol - pos.cost_sol)
-                    if self.broker.scale(mint, add_sol, price, "RUNNER_FULL", "moonshot_flow_scale"):
-                        self.logger.decision("moonshot_scale", mint, {"add_sol": add_sol, "features": self.slim_features(features)})
-                    return
                 if pos.peak_mult >= 1.55 and mult <= pos.peak_mult * 0.84:
                     self.close_position(mint, ts_ms, price, "moonshot_decay_55", features, killed=False)
                     return
                 if pos.peak_mult >= 1.32 and sell_pressure and mult >= 1.12:
-                    if env_bool("PIGGY_MOON_HOLD_RUNNER", True):
-                        fraction = env_float("PIGGY_MOON_POP_DERISK_FRACTION", 0.38)
-                        self.broker.partial(mint, fraction, price, "moonshot_pop_derisk")
-                        self.logger.decision("moonshot_runner", mint, {"reason": "pop_derisk", "fraction": fraction, "features": self.slim_features(features)})
-                    else:
-                        self.close_position(mint, ts_ms, price, "moonshot_pop_after_sell", features, killed=False)
+                    self.close_position(mint, ts_ms, price, "moonshot_pop_after_sell", features, killed=False)
                     return
                 if pos.peak_mult >= 1.08 and sell_pressure and mult >= 1.02:
-                    if env_bool("PIGGY_MOON_HOLD_RUNNER", True):
-                        fraction = env_float("PIGGY_MOON_FIRST_POP_DERISK_FRACTION", 0.42)
-                        self.broker.partial(mint, fraction, price, "moonshot_first_pop_derisk")
-                        self.logger.decision("moonshot_runner", mint, {"reason": "first_pop_derisk", "fraction": fraction, "features": self.slim_features(features)})
-                    else:
-                        self.close_position(mint, ts_ms, price, "first_pop_sell_exit", features, killed=False)
+                    self.close_position(mint, ts_ms, price, "first_pop_sell_exit", features, killed=False)
                     return
                 if pos.age_sec(ts_ms) >= env_float("PIGGY_MOON_FAIL_SEC", 18.0) and pos.peak_mult < 1.18:
                     self.close_position(mint, ts_ms, price, "moonshot_failed_no_pop", features, killed=True)
@@ -709,9 +605,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 return
 
         if pos.state in {"RUNNER", "RUNNER_FULL"}:
-            if pos.lane in self.moonshot_lanes() and pos.derisk_done and mult <= env_float("PIGGY_MOON_RUNNER_FLOOR_MULT", 0.98):
-                self.close_position(mint, ts_ms, price, "moonshot_runner_floor", features, killed=False)
-                return
             if pos.peak_mult >= 3.0 and mult <= pos.peak_mult * 0.76:
                 self.close_position(mint, ts_ms, price, "runner_3x_decay", features, killed=False)
                 return
@@ -729,30 +622,10 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             self.close_position(mint, ts_ms, price, "hard_75s_time_stop", features, killed=False)
 
     @staticmethod
-    def moonshot_lanes() -> set[str]:
-        return {"same_block_ignition", "second_wave_after_cluster", "reclaim_wave"}
-
-    @staticmethod
-    def moonshot_scale_reason(pos: Any, features: dict[str, Any]) -> Optional[str]:
-        if pos.scale2_done or pos.cost_sol >= pos.target_sol:
-            return None
-        if pos.peak_mult < env_float("PIGGY_MOON_SCALE_MIN_PEAK", 1.16):
-            return None
-        if features["s700"]["sell_sol"] > max(0.006, features["s700"]["buy_sol"] * 0.035):
-            return None
-        if features["last_buy_age_ms"] > env_int("PIGGY_MOON_SCALE_MAX_LAST_BUY_AGE_MS", 220):
-            return None
-        if features["s700"]["unique_buyers"] < env_int("PIGGY_MOON_SCALE_MIN_BUYERS_700", 4):
-            return None
-        if features["s700"]["buy_sol"] < env_float("PIGGY_MOON_SCALE_MIN_BUY_SOL_700", 2.80):
-            return None
-        return "moonshot_flow_scale"
-
-    @staticmethod
     def piggy_kill_reason(pos: Any, features: dict[str, Any]) -> Optional[str]:
         s250 = features["s250"]
         s700 = features["s700"]
-        if pos.lane in SameBlockPiggybackBot.moonshot_lanes():
+        if pos.lane in {"second_wave_after_cluster", "reclaim_wave"}:
             if pos.last_mult <= env_float("PIGGY_MOON_HARD_BREAK_MULT", 0.68):
                 return "kill_moon_hard_break"
             return None
