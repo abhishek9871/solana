@@ -1367,6 +1367,10 @@ COPY_FAST_CONFIRMED_AMOUNT_SOL = float(os.environ.get("COPY_FAST_CONFIRMED_AMOUN
 COPY_FAST_ALPHA_MIN_ENTRY_MULT = float(os.environ.get("COPY_FAST_ALPHA_MIN_ENTRY_MULT", "1.060"))
 COPY_FAST_ALPHA_EXPLORATION_MIN_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MIN_MULT", "1.22"))
 COPY_FAST_ALPHA_EXPLORATION_MAX_MULT = float(os.environ.get("COPY_FAST_ALPHA_EXPLORATION_MAX_MULT", "1.55"))
+COPY_FAST_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("COPY_FAST_ALPHA_MIN_AVG_EXIT_NET", "0.020"))
+COPY_FAST_ALPHA_CORE_MIN_SAMPLES = int(os.environ.get("COPY_FAST_ALPHA_CORE_MIN_SAMPLES", "6"))
+COPY_FAST_ALPHA_CORE_MIN_WR = float(os.environ.get("COPY_FAST_ALPHA_CORE_MIN_WR", "0.70"))
+COPY_FAST_ALPHA_CORE_MIN_AVG_EXIT_NET = float(os.environ.get("COPY_FAST_ALPHA_CORE_MIN_AVG_EXIT_NET", "0.040"))
 COPY_FAST_ALPHA_TP_MULT = float(os.environ.get("COPY_FAST_ALPHA_TP_MULT", "1.045"))
 COPY_FAST_ALPHA_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_SEC", "2.0"))
 COPY_FAST_ALPHA_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_PEAK", "1.012"))
@@ -5575,21 +5579,32 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
         return None
 
     if _alpha_promoted(pair_stat):
+        n, wr, avg_best, avg_exit = _alpha_stat_view(pair_stat)
+        if avg_exit < COPY_FAST_ALPHA_MIN_AVG_EXIT_NET:
+            return None
+        core_ok = (
+            n >= COPY_FAST_ALPHA_CORE_MIN_SAMPLES
+            and wr >= COPY_FAST_ALPHA_CORE_MIN_WR
+            and avg_exit >= COPY_FAST_ALPHA_CORE_MIN_AVG_EXIT_NET
+        )
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
-        n, wr, avg_best, _avg_exit = _alpha_stat_view(pair_stat)
         return {
             "launchpad": "copy_fast_alpha",
-            "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL,
-            "reason": f"promoted n={n} wr={wr:.0%} avg_best={avg_best:+.1%}",
+            "amount": COPY_FAST_ALPHA_CORE_AMOUNT_SOL if core_ok else COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "reason": (f"{'core' if core_ok else 'scout'} pair n={n} wr={wr:.0%} "
+                       f"avg_best={avg_best:+.1%} avg_exit={avg_exit:+.1%}"),
         }
     if _alpha_promoted(wallet_stat, ALPHA_MIN_SAMPLES * 2) and _alpha_promoted(context_stat):
+        wn, wwr, wavg, wexit = _alpha_stat_view(wallet_stat)
+        cn, cwr, cavg, cexit = _alpha_stat_view(context_stat)
+        if min(wexit, cexit) < COPY_FAST_ALPHA_MIN_AVG_EXIT_NET:
+            return None
         _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
-        wn, wwr, wavg, _wexit = _alpha_stat_view(wallet_stat)
-        cn, cwr, cavg, _cexit = _alpha_stat_view(context_stat)
         return {
             "launchpad": "copy_fast_alpha",
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
-            "reason": f"wallet_context scout w={wn}/{wwr:.0%}/{wavg:+.1%} c={cn}/{cwr:.0%}/{cavg:+.1%}",
+            "reason": (f"wallet_context scout w={wn}/{wwr:.0%}/{wavg:+.1%}/{wexit:+.1%} "
+                       f"c={cn}/{cwr:.0%}/{cavg:+.1%}/{cexit:+.1%}"),
         }
 
     if (ALPHA_EXPLORATION_ENABLED
@@ -8813,9 +8828,11 @@ async def main():
         log(f"  Shadows copy/tape signals for 1/2/5/10s outcomes, persists to {ALPHA_STATE_FILE}.")
         log(f"  Adaptive copy_fast_alpha: scout={COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL:.4f} SOL "
             f"{'spends on exploration' if ALPHA_EXPLORATION_ENABLED else 'exploration is shadow-only'}; "
-            f"core={COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL after "
-            f"{ALPHA_MIN_SAMPLES}+ samples, WR>={ALPHA_PROMOTE_MIN_WR:.0%}, "
-            f"avg_best>={ALPHA_PROMOTE_MIN_AVG_BEST_NET:+.1%}; live mult must be "
+            f"core={COPY_FAST_ALPHA_CORE_AMOUNT_SOL:.4f} SOL only after "
+            f"{COPY_FAST_ALPHA_CORE_MIN_SAMPLES}+ pair samples, "
+            f"WR>={COPY_FAST_ALPHA_CORE_MIN_WR:.0%}, "
+            f"avg_exit>={COPY_FAST_ALPHA_CORE_MIN_AVG_EXIT_NET:+.1%}; scout requires "
+            f"avg_exit>={COPY_FAST_ALPHA_MIN_AVG_EXIT_NET:+.1%}; live mult must be "
             f">={COPY_FAST_ALPHA_MIN_ENTRY_MULT:.3f}x and near peak.")
         log(f"  Context-only market alpha requires {ALPHA_CONTEXT_ONLY_MIN_SAMPLES}+ samples, "
             f"WR>={ALPHA_CONTEXT_ONLY_MIN_WR:.0%}, avg_best>={ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET:+.1%}.")
