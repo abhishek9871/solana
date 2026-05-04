@@ -1361,6 +1361,9 @@ ALPHA_BLOCK_MAX_AVG_BEST_NET = float(os.environ.get("ALPHA_BLOCK_MAX_AVG_BEST_NE
 ALPHA_CONTEXT_ONLY_MIN_SAMPLES = int(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_SAMPLES", "5"))
 ALPHA_CONTEXT_ONLY_MIN_WR = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_WR", "0.60"))
 ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET", "0.050"))
+ALPHA_WALLET_ONLY_MIN_SAMPLES = int(os.environ.get("ALPHA_WALLET_ONLY_MIN_SAMPLES", "20"))
+ALPHA_WALLET_ONLY_MIN_WR = float(os.environ.get("ALPHA_WALLET_ONLY_MIN_WR", "0.70"))
+ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET = float(os.environ.get("ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET", "0.080"))
 COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL", "0.003125"))
 COPY_FAST_ALPHA_CORE_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_CORE_AMOUNT_SOL", "0.0125"))
 COPY_FAST_CONFIRMED_AMOUNT_SOL = float(os.environ.get("COPY_FAST_CONFIRMED_AMOUNT_SOL", str(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)))
@@ -1376,7 +1379,7 @@ COPY_FAST_ALPHA_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_
 COPY_FAST_ALPHA_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_PEAK", "1.012"))
 COPY_FAST_ALPHA_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_ALPHA_TIMEOUT_SEC", "8.0"))
 MARKET_TAPE_ALPHA_ENABLED = os.environ.get("MARKET_TAPE_ALPHA_ENABLED", "1") == "1"
-MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_SEC", "30.0"))
+MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_SEC", "90.0"))
 MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SELL_SOL", "0.004"))
 MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
@@ -5459,6 +5462,15 @@ def _alpha_context_only_promoted(stat: Optional[dict]) -> bool:
     )
 
 
+def _alpha_wallet_only_promoted(stat: Optional[dict]) -> bool:
+    n, wr, _avg_best, avg_exit = _alpha_stat_view(stat)
+    return (
+        n >= ALPHA_WALLET_ONLY_MIN_SAMPLES
+        and wr >= ALPHA_WALLET_ONLY_MIN_WR
+        and avg_exit >= ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET
+    )
+
+
 def _alpha_toxic(stat: Optional[dict]) -> bool:
     n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
     return n >= ALPHA_BLOCK_MIN_SAMPLES and wr <= ALPHA_BLOCK_MAX_WR and avg_best <= ALPHA_BLOCK_MAX_AVG_BEST_NET
@@ -5574,7 +5586,7 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
     wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
     context_stat = _alpha_stats.get("contexts", {}).get(context)
     pair_stat = _alpha_stats.get("pairs", {}).get(f"{signer}|{context}")
-    if _alpha_toxic(pair_stat) or _alpha_toxic(wallet_stat):
+    if _alpha_toxic(pair_stat) or _alpha_toxic(context_stat) or _alpha_toxic(wallet_stat):
         _copy_trade_stats["alpha_toxic"] = _copy_trade_stats.get("alpha_toxic", 0) + 1
         return None
 
@@ -5605,6 +5617,14 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
             "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
             "reason": (f"wallet_context scout w={wn}/{wwr:.0%}/{wavg:+.1%}/{wexit:+.1%} "
                        f"c={cn}/{cwr:.0%}/{cavg:+.1%}/{cexit:+.1%}"),
+        }
+    if _alpha_wallet_only_promoted(wallet_stat):
+        n, wr, avg_best, avg_exit = _alpha_stat_view(wallet_stat)
+        _copy_trade_stats["alpha_promoted"] = _copy_trade_stats.get("alpha_promoted", 0) + 1
+        return {
+            "launchpad": "copy_fast_alpha",
+            "amount": COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL,
+            "reason": f"wallet_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} avg_exit={avg_exit:+.1%}",
         }
 
     if (ALPHA_EXPLORATION_ENABLED
@@ -5703,9 +5723,18 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         }
     if _alpha_context_only_promoted(context_stat):
         n, wr, avg_best, avg_exit = _alpha_stat_view(context_stat)
-        return _plan_from_stat(
+        context_plan = _plan_from_stat(
             n, wr, avg_best, avg_exit,
             f"alpha_context n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
+            f"avg_exit={avg_exit:+.1%} ctx={context}",
+        )
+        if context_plan:
+            return context_plan
+    if _alpha_wallet_only_promoted(wallet_stat):
+        n, wr, avg_best, avg_exit = _alpha_stat_view(wallet_stat)
+        return _plan_from_stat(
+            n, wr, avg_best, avg_exit,
+            f"alpha_wallet_scout n={n} wr={wr:.0%} avg_best={avg_best:+.1%} "
             f"avg_exit={avg_exit:+.1%} ctx={context}",
         )
     return None
@@ -8836,6 +8865,9 @@ async def main():
             f">={COPY_FAST_ALPHA_MIN_ENTRY_MULT:.3f}x and near peak.")
         log(f"  Context-only market alpha requires {ALPHA_CONTEXT_ONLY_MIN_SAMPLES}+ samples, "
             f"WR>={ALPHA_CONTEXT_ONLY_MIN_WR:.0%}, avg_best>={ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET:+.1%}.")
+        log(f"  Wallet-only alpha scout requires {ALPHA_WALLET_ONLY_MIN_SAMPLES}+ samples, "
+            f"WR>={ALPHA_WALLET_ONLY_MIN_WR:.0%}, "
+            f"avg_exit>={ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET:+.1%}.")
         log(f"  Alpha exits: TP={COPY_FAST_ALPHA_TP_MULT:.3f}x fast-kill "
             f"{COPY_FAST_ALPHA_FAST_KILL_SEC:.1f}s/{COPY_FAST_ALPHA_FAST_KILL_PEAK:.3f}x; "
             f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
