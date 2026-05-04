@@ -1612,6 +1612,10 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                         ratio = our_price / trader_price
                         if ratio > COPY_FAST_MAX_PRICE_RATIO:
                             _copy_trade_stats["price_blocked"] += 1
+                            _market_tape_ratio_violation_until[mint] = (
+                                int(time.time() * 1000)
+                                + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+                            )
                             log(f"  GRAD ABORT {mint[:8]} (copy_fast): our_px={our_price:.4e} "
                                 f"trader_px={trader_price:.4e} ratio={ratio:.3f}x > "
                                 f"{COPY_FAST_MAX_PRICE_RATIO:.2f}x — curve already moved past us")
@@ -1620,6 +1624,10 @@ async def graduation_snipe(client: Client, kp: Optional[Keypair], mint: str,
                         # CsZiG33J was 0.473x; would have caught it.
                         if ratio < COPY_FAST_MIN_PRICE_RATIO:
                             _copy_trade_stats["price_blocked"] += 1
+                            _market_tape_ratio_violation_until[mint] = (
+                                int(time.time() * 1000)
+                                + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+                            )
                             log(f"  GRAD ABORT {mint[:8]} (copy_fast): our_px={our_price:.4e} "
                                 f"trader_px={trader_price:.4e} ratio={ratio:.3f}x < "
                                 f"{COPY_FAST_MIN_PRICE_RATIO:.2f}x — token dumped after trader, momentum broken")
@@ -7513,6 +7521,13 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             launchpad="moonshot_ignition",
             quality_score=int(moonshot_plan.get("quality") or 9),
         ))
+        return
+    ratio_block_until = _market_tape_ratio_violation_until.get(mint, 0)
+    if ratio_block_until > now_ms:
+        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        _mt_gate("mt_ratio")
+        log(f"  MARKET-TAPE BLOCK {mint[:8]}: recent price_ratio violation "
+            f"cooldown {(ratio_block_until - now_ms) / 1000:.1f}s")
         return
     alpha_cached_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
     alpha_price_ratio = None
