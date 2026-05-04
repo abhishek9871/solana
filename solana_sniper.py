@@ -1386,7 +1386,7 @@ COPY_FAST_ALPHA_FAST_KILL_SEC = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_
 COPY_FAST_ALPHA_FAST_KILL_PEAK = float(os.environ.get("COPY_FAST_ALPHA_FAST_KILL_PEAK", "1.012"))
 COPY_FAST_ALPHA_TIMEOUT_SEC = float(os.environ.get("COPY_FAST_ALPHA_TIMEOUT_SEC", "8.0"))
 MARKET_TAPE_ALPHA_ENABLED = os.environ.get("MARKET_TAPE_ALPHA_ENABLED", "1") == "1"
-MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_SEC", "90.0"))
+MARKET_TAPE_ALPHA_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_AGE_SEC", "12.0"))
 MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SELL_SOL", "0.004"))
 MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
@@ -1394,6 +1394,7 @@ MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_
 MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO", "0.700"))
 MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO", "1.750"))
 MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
+MARKET_TAPE_ALPHA_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BUY_SOL", "3.0"))
 MARKET_TAPE_ALPHA_MIN_MOVE_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_MOVE_MULT", "1.040"))
 MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.050"))
 MARKET_TAPE_ALPHA_MIN_WR = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_WR", "0.70"))
@@ -5774,7 +5775,9 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return None
     if sell_sol > MARKET_TAPE_ALPHA_MAX_SELL_SOL:
         return None
-    if tracked_count < MARKET_TAPE_ALPHA_MIN_TRACKED or unique_count < 3 or buy_sol < 0.50:
+    if (tracked_count < MARKET_TAPE_ALPHA_MIN_TRACKED
+            or unique_count < 3
+            or buy_sol < MARKET_TAPE_ALPHA_MIN_BUY_SOL):
         return None
     move_stats = _bc_cache_window_stats_for_mint(
         mint,
@@ -9058,6 +9061,7 @@ async def main():
         if MARKET_TAPE_ALPHA_ENABLED:
             log(f"  Market-tape alpha: context-promoted tape enters scout/strong size before static gates "
                 f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s, tracked>={MARKET_TAPE_ALPHA_MIN_TRACKED}, "
+                f"buy>={MARKET_TAPE_ALPHA_MIN_BUY_SOL:.1f} SOL, "
                 f"sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, move>={MARKET_TAPE_ALPHA_MIN_MOVE_MULT:.3f}x, "
                 f"WR>={MARKET_TAPE_ALPHA_MIN_WR:.0%}, avg_exit>={MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:+.1%}, "
                 f"low-sample n<{MARKET_TAPE_ALPHA_LOW_SAMPLE_N} requires "
