@@ -1484,6 +1484,27 @@ MARKET_TAPE_BIRTH_MIN_BC_MOVE = float(os.environ.get("MARKET_TAPE_BIRTH_MIN_BC_M
 MARKET_TAPE_BIRTH_MAX_BC_MOVE = float(os.environ.get("MARKET_TAPE_BIRTH_MAX_BC_MOVE", "1.080"))
 MARKET_TAPE_BIRTH_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_BIRTH_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_BIRTH_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_BIRTH_CONFIRM_MIN_MULT", "1.001"))
+BIRTH_BREAKOUT_ENABLED = os.environ.get("BIRTH_BREAKOUT_ENABLED", "1") == "1"
+BIRTH_BREAKOUT_AMOUNT_SOL = float(os.environ.get("BIRTH_BREAKOUT_AMOUNT_SOL", "0.00625"))
+BIRTH_BREAKOUT_STRONG_AMOUNT_SOL = float(os.environ.get("BIRTH_BREAKOUT_STRONG_AMOUNT_SOL", "0.009375"))
+BIRTH_BREAKOUT_MAX_AMOUNT_SOL = float(os.environ.get("BIRTH_BREAKOUT_MAX_AMOUNT_SOL", "0.0125"))
+BIRTH_BREAKOUT_MAX_AGE_SEC = float(os.environ.get("BIRTH_BREAKOUT_MAX_AGE_SEC", "2.8"))
+BIRTH_BREAKOUT_WINDOW_MS = int(os.environ.get("BIRTH_BREAKOUT_WINDOW_MS", "1600"))
+BIRTH_BREAKOUT_MAX_CACHE_AGE_MS = int(os.environ.get("BIRTH_BREAKOUT_MAX_CACHE_AGE_MS", "450"))
+BIRTH_BREAKOUT_MIN_MOVE_MULT = float(os.environ.get("BIRTH_BREAKOUT_MIN_MOVE_MULT", "1.180"))
+BIRTH_BREAKOUT_STRONG_MOVE_MULT = float(os.environ.get("BIRTH_BREAKOUT_STRONG_MOVE_MULT", "1.350"))
+BIRTH_BREAKOUT_MAX_CHASE_MULT = float(os.environ.get("BIRTH_BREAKOUT_MAX_CHASE_MULT", "1.750"))
+BIRTH_BREAKOUT_MAX_OFF_PEAK = float(os.environ.get("BIRTH_BREAKOUT_MAX_OFF_PEAK", "0.080"))
+BIRTH_BREAKOUT_MIN_UNIQUE = int(os.environ.get("BIRTH_BREAKOUT_MIN_UNIQUE", "6"))
+BIRTH_BREAKOUT_MIN_TRACKED = int(os.environ.get("BIRTH_BREAKOUT_MIN_TRACKED", "4"))
+BIRTH_BREAKOUT_MIN_BUY_SOL = float(os.environ.get("BIRTH_BREAKOUT_MIN_BUY_SOL", "5.0"))
+BIRTH_BREAKOUT_STRONG_BUY_SOL = float(os.environ.get("BIRTH_BREAKOUT_STRONG_BUY_SOL", "8.0"))
+BIRTH_BREAKOUT_MAX_SELL_SOL = float(os.environ.get("BIRTH_BREAKOUT_MAX_SELL_SOL", "0.006"))
+BIRTH_BREAKOUT_MAX_SELL_BUY_RATIO = float(os.environ.get("BIRTH_BREAKOUT_MAX_SELL_BUY_RATIO", "0.025"))
+BIRTH_BREAKOUT_MIN_PRICE_RATIO = float(os.environ.get("BIRTH_BREAKOUT_MIN_PRICE_RATIO", "0.80"))
+BIRTH_BREAKOUT_MAX_PRICE_RATIO = float(os.environ.get("BIRTH_BREAKOUT_MAX_PRICE_RATIO", "1.60"))
+BIRTH_BREAKOUT_CONFIRM_DELAY_SEC = float(os.environ.get("BIRTH_BREAKOUT_CONFIRM_DELAY_SEC", "0.05"))
+BIRTH_BREAKOUT_CONFIRM_RETAIN_MULT = float(os.environ.get("BIRTH_BREAKOUT_CONFIRM_RETAIN_MULT", "0.996"))
 MOONSHOT_IGNITION_ENABLED = os.environ.get("MOONSHOT_IGNITION_ENABLED", "1") == "1"
 MOONSHOT_IGNITION_AMOUNT_SOL = float(os.environ.get("MOONSHOT_IGNITION_AMOUNT_SOL", "0.01875"))
 MOONSHOT_IGNITION_STRONG_AMOUNT_SOL = float(os.environ.get("MOONSHOT_IGNITION_STRONG_AMOUNT_SOL", "0.03125"))
@@ -3669,6 +3690,9 @@ async def session_reporter():
                 f"mt_birth={s.get('market_tape_birth_triggers', 0)} "
                 f"moon_cand={s.get('moonshot_candidates', 0)} moon_trig={s.get('moonshot_triggers', 0)} "
                 f"moon_blk={s.get('moonshot_blocked', 0)} "
+                f"bb_cand={s.get('birth_breakout_candidates', 0)} "
+                f"bb_trig={s.get('birth_breakout_triggers', 0)} "
+                f"bb_blk={s.get('birth_breakout_blocked', 0)} "
                 f"vel_cand={s.get('velocity_candidates', 0)} vel_trig={s.get('velocity_triggers', 0)} "
                 f"vel_blk={s.get('velocity_blocked', 0)} "
                 f"cf_ign={s.get('copy_fast_ignition', 0)} "
@@ -3690,6 +3714,14 @@ async def session_reporter():
                 f"chase={s.get('moon_chase', 0)} off_peak={s.get('moon_off_peak', 0)} "
                 f"ratio={s.get('moon_ratio', 0)} score={s.get('moon_score', 0)} "
                 f"confirm={s.get('moon_confirm', 0)} ctx_cd={s.get('moon_context_cd', 0)} ===")
+            log(f"=== BIRTH-BREAKOUT: age={s.get('birth_breakout_age', 0)} "
+                f"flow={s.get('birth_breakout_flow', 0)} sell={s.get('birth_breakout_sell', 0)} "
+                f"no_bc={s.get('birth_breakout_no_bc', 0)} complete={s.get('birth_breakout_complete', 0)} "
+                f"move_lo={s.get('birth_breakout_move_low', 0)} chase={s.get('birth_breakout_chase', 0)} "
+                f"off_peak={s.get('birth_breakout_off_peak', 0)} "
+                f"down={s.get('birth_breakout_down_ticks', 0)} "
+                f"ratio={s.get('birth_breakout_ratio', 0)} "
+                f"confirm={s.get('birth_breakout_confirm', 0)} ===")
             log(f"=== SWARM-SCOUT: cand={s.get('swarm_scout_candidates', 0)} "
                 f"trig={s.get('swarm_scout_triggers', 0)} "
                 f"no_px={s.get('swarm_scout_no_price', 0)} "
@@ -6088,6 +6120,89 @@ def _moonshot_ignition_plan(mint: str, signer: str, trader_price: float,
     }
 
 
+def _birth_breakout_plan(mint: str, signer: str, trader_price: float,
+                         unique_count: int, tracked_count: int,
+                         buy_sol: float, sell_sol: float,
+                         observed_age_ms: int) -> Optional[dict]:
+    """Catch the early curve-breakout shape that the low-band birth scout rejects.
+
+    This is still a fast tape lane, but it is deliberately not a raw scalp: it
+    requires active sniper clustering, real SOL pressure, almost no sell tape,
+    fresh programSubscribe price shape, and a no-fade micro-confirm.
+    """
+    if not BIRTH_BREAKOUT_ENABLED:
+        return None
+    if observed_age_ms > BIRTH_BREAKOUT_MAX_AGE_SEC * 1000:
+        _mt_gate("birth_breakout_age")
+        return None
+    if unique_count < BIRTH_BREAKOUT_MIN_UNIQUE or tracked_count < BIRTH_BREAKOUT_MIN_TRACKED:
+        _mt_gate("birth_breakout_flow")
+        return None
+    if buy_sol < BIRTH_BREAKOUT_MIN_BUY_SOL:
+        _mt_gate("birth_breakout_flow")
+        return None
+    sell_ratio = sell_sol / buy_sol if buy_sol > 0 else 1.0
+    if sell_sol > BIRTH_BREAKOUT_MAX_SELL_SOL or sell_ratio > BIRTH_BREAKOUT_MAX_SELL_BUY_RATIO:
+        _mt_gate("birth_breakout_sell")
+        return None
+
+    stats = _bc_cache_window_stats_for_mint(
+        mint,
+        BIRTH_BREAKOUT_WINDOW_MS,
+        max(BIRTH_BREAKOUT_MAX_CACHE_AGE_MS, MARKET_TAPE_BC_CACHE_MAX_AGE_MS),
+    )
+    if not stats or int(stats.get("samples") or 0) < 2:
+        _mt_gate("birth_breakout_no_bc")
+        return None
+    if stats["complete"]:
+        _mt_gate("birth_breakout_complete")
+        return None
+    move_mult = float(stats["move"])
+    if move_mult < BIRTH_BREAKOUT_MIN_MOVE_MULT:
+        _mt_gate("birth_breakout_move_low")
+        return None
+    if move_mult > BIRTH_BREAKOUT_MAX_CHASE_MULT:
+        _mt_gate("birth_breakout_chase")
+        return None
+    off_peak = float(stats["off_peak"])
+    if off_peak > BIRTH_BREAKOUT_MAX_OFF_PEAK:
+        _mt_gate("birth_breakout_off_peak")
+        return None
+    if int(stats.get("down_ticks") or 0) > int(stats.get("up_ticks") or 0) + 1:
+        _mt_gate("birth_breakout_down_ticks")
+        return None
+
+    price_ratio = None
+    if trader_price > 0:
+        price_ratio = float(stats["last"]) / trader_price
+        if price_ratio < BIRTH_BREAKOUT_MIN_PRICE_RATIO or price_ratio > BIRTH_BREAKOUT_MAX_PRICE_RATIO:
+            _mt_gate("birth_breakout_ratio")
+            return None
+
+    strong = (
+        move_mult >= BIRTH_BREAKOUT_STRONG_MOVE_MULT
+        or buy_sol >= BIRTH_BREAKOUT_STRONG_BUY_SOL
+        or tracked_count >= BIRTH_BREAKOUT_MIN_TRACKED + 2
+    )
+    amount = BIRTH_BREAKOUT_STRONG_AMOUNT_SOL if strong else BIRTH_BREAKOUT_AMOUNT_SOL
+    amount = min(amount, BIRTH_BREAKOUT_MAX_AMOUNT_SOL)
+    return {
+        "amount": amount,
+        "quality": 6,
+        "trigger_price": float(stats["last"]),
+        "score": 10 if strong else 8,
+        "reason": (
+            f"birth_breakout unique={unique_count} tracked={tracked_count} "
+            f"buy={buy_sol:.3f} sell={sell_sol:.3f}/{sell_ratio:.1%} "
+            f"move={move_mult:.3f}x off_peak={off_peak:.1%} "
+            f"up/down={stats['up_ticks']}/{stats['down_ticks']} "
+            f"age={observed_age_ms/1000:.1f}s cache={stats['age_ms']}ms "
+            f"samples={int(stats.get('samples') or 0)} amount={amount:.4f} SOL"
+            + (f" ratio={price_ratio:.3f}x" if price_ratio is not None else "")
+        ),
+    }
+
+
 def _evaluate_risk(snap: dict) -> tuple[bool, str]:
     """V41.17: apply rejection rules to a risk snapshot. Used by both cached
     and live paths. Empirically-tuned thresholds (V41.16b research):
@@ -7983,6 +8098,72 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             quality_score=int(moonshot_plan.get("quality") or 9),
         ))
         return
+    birth_breakout_plan = None
+    if _market_tape_ratio_violation_until.get(mint, 0) <= now_ms:
+        birth_breakout_plan = _birth_breakout_plan(
+            mint, signer, trader_price,
+            len(unique_buyers), effective_tracked_count, buy_sol, sell_sol, observed_age_ms,
+        )
+    if birth_breakout_plan:
+        _copy_trade_stats["birth_breakout_candidates"] = _copy_trade_stats.get("birth_breakout_candidates", 0) + 1
+        trigger_price = float(birth_breakout_plan.get("trigger_price") or 0.0)
+        if trigger_price <= 0:
+            _copy_trade_stats["birth_breakout_blocked"] = _copy_trade_stats.get("birth_breakout_blocked", 0) + 1
+            _mt_gate("birth_breakout_no_price")
+            return
+        if BIRTH_BREAKOUT_CONFIRM_DELAY_SEC > 0:
+            await asyncio.sleep(BIRTH_BREAKOUT_CONFIRM_DELAY_SEC)
+            confirm_price = _bc_cache_price_for_mint(
+                mint,
+                max(BIRTH_BREAKOUT_MAX_CACHE_AGE_MS, MARKET_TAPE_BC_CACHE_MAX_AGE_MS),
+            )
+            if not confirm_price or confirm_price[1] or confirm_price[0] <= 0:
+                _copy_trade_stats["birth_breakout_blocked"] = _copy_trade_stats.get("birth_breakout_blocked", 0) + 1
+                _mt_gate("birth_breakout_confirm")
+                log(f"  BIRTH-BREAKOUT BLOCK {mint[:8]}: no fresh confirm price after "
+                    f"{BIRTH_BREAKOUT_CONFIRM_DELAY_SEC:.2f}s")
+                return
+            retain_mult = float(confirm_price[0]) / trigger_price
+            if retain_mult < BIRTH_BREAKOUT_CONFIRM_RETAIN_MULT:
+                _copy_trade_stats["birth_breakout_blocked"] = _copy_trade_stats.get("birth_breakout_blocked", 0) + 1
+                _mt_gate("birth_breakout_confirm")
+                log(f"  BIRTH-BREAKOUT BLOCK {mint[:8]}: retain={retain_mult:.3f}x "
+                    f"< {BIRTH_BREAKOUT_CONFIRM_RETAIN_MULT:.3f}x after "
+                    f"{BIRTH_BREAKOUT_CONFIRM_DELAY_SEC:.2f}s")
+                return
+            if trader_price > 0:
+                confirm_ratio = float(confirm_price[0]) / trader_price
+                if (confirm_ratio < BIRTH_BREAKOUT_MIN_PRICE_RATIO
+                        or confirm_ratio > BIRTH_BREAKOUT_MAX_PRICE_RATIO):
+                    _copy_trade_stats["birth_breakout_blocked"] = _copy_trade_stats.get("birth_breakout_blocked", 0) + 1
+                    _mt_gate("birth_breakout_ratio")
+                    log(f"  BIRTH-BREAKOUT BLOCK {mint[:8]}: confirm_ratio={confirm_ratio:.3f}x "
+                        f"outside {BIRTH_BREAKOUT_MIN_PRICE_RATIO:.2f}-"
+                        f"{BIRTH_BREAKOUT_MAX_PRICE_RATIO:.2f}x")
+                    return
+            birth_breakout_plan["reason"] = (
+                f"{birth_breakout_plan.get('reason', 'birth_breakout')} "
+                f"retain={retain_mult:.3f}x/{BIRTH_BREAKOUT_CONFIRM_DELAY_SEC:.2f}s"
+            )
+        entry_ms = int(time.time() * 1000)
+        graduated_seen.add(mint)
+        if len(graduated_seen) > 500:
+            graduated_seen.clear()
+            graduated_seen.add(mint)
+        _market_tape_entered_recent[mint] = entry_ms
+        _market_tape_entry_times.append(entry_ms)
+        _copy_trade_stats["market_tape_triggers"] = _copy_trade_stats.get("market_tape_triggers", 0) + 1
+        _copy_trade_stats["moonshot_triggers"] = _copy_trade_stats.get("moonshot_triggers", 0) + 1
+        _copy_trade_stats["birth_breakout_triggers"] = _copy_trade_stats.get("birth_breakout_triggers", 0) + 1
+        reason = str(birth_breakout_plan.get("reason") or "birth breakout")
+        log(f"  *** BIRTH-BREAKOUT TRIGGER *** {mint[:8]}: {reason}")
+        asyncio.create_task(_enter_market_tape_position(
+            client, kp, mint, entry_ms, reason,
+            amount_sol=float(birth_breakout_plan.get("amount") or BIRTH_BREAKOUT_AMOUNT_SOL),
+            launchpad="moonshot_ignition",
+            quality_score=int(birth_breakout_plan.get("quality") or 6),
+        ))
+        return
     alpha_cached_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
     alpha_price_ratio = None
     if trader_price > 0 and alpha_cached_price and not alpha_cached_price[1] and alpha_cached_price[0] > 0:
@@ -9123,6 +9304,16 @@ async def main():
             f"in {MARKET_TAPE_BIRTH_WINDOW_MS}ms, bc={MARKET_TAPE_BIRTH_MIN_BC_MOVE:.3f}-"
             f"{MARKET_TAPE_BIRTH_MAX_BC_MOVE:.3f}x, confirm {MARKET_TAPE_BIRTH_CONFIRM_MIN_MULT:.3f}x/"
             f"{MARKET_TAPE_BIRTH_CONFIRM_DELAY_SEC:.2f}s.")
+    if BIRTH_BREAKOUT_ENABLED:
+        log(f"  Birth breakout runner: {BIRTH_BREAKOUT_AMOUNT_SOL:.4f}-"
+            f"{BIRTH_BREAKOUT_STRONG_AMOUNT_SOL:.4f} SOL in first "
+            f"{BIRTH_BREAKOUT_MAX_AGE_SEC:.1f}s when bc={BIRTH_BREAKOUT_MIN_MOVE_MULT:.3f}-"
+            f"{BIRTH_BREAKOUT_MAX_CHASE_MULT:.3f}x, unique>={BIRTH_BREAKOUT_MIN_UNIQUE}, "
+            f"tracked>={BIRTH_BREAKOUT_MIN_TRACKED}, buy>={BIRTH_BREAKOUT_MIN_BUY_SOL:.1f} SOL, "
+            f"sell<={BIRTH_BREAKOUT_MAX_SELL_SOL:.3f} SOL/{BIRTH_BREAKOUT_MAX_SELL_BUY_RATIO:.1%}, "
+            f"off_peak<={BIRTH_BREAKOUT_MAX_OFF_PEAK:.1%}, retain>="
+            f"{BIRTH_BREAKOUT_CONFIRM_RETAIN_MULT:.3f}x/"
+            f"{BIRTH_BREAKOUT_CONFIRM_DELAY_SEC:.2f}s; managed as moonshot runner.")
     if MOONSHOT_IGNITION_ENABLED:
         log(f"  Moonshot ignition: {MOONSHOT_IGNITION_AMOUNT_SOL:.4f}-"
             f"{MOONSHOT_IGNITION_STRONG_AMOUNT_SOL:.4f} SOL when age<={MOONSHOT_MAX_AGE_SEC:.1f}s, "
