@@ -889,19 +889,8 @@ class FlowFollowerBot:
         if event.ts_ms <= pending.created_ts_ms:
             return False
         stats2 = tape.stats(2_000, event.ts_ms)
-        friction_mult = 1.0 + (2.0 * self.broker.drag) + 0.01
-        target_price = pending.base_price * friction_mult
-        if event.price >= target_price and stats2.sell_sol <= max(0.02, stats2.buy_sol * 0.50):
-            self.pending.pop(event.mint, None)
-            strike_signal = EntrySignal(
-                phase=pending.signal.phase,
-                context=pending.signal.context,
-                reason=f"{pending.signal.reason}; strike_continue={event.price / pending.base_price:.4f}x",
-                amount_sol=pending.signal.amount_sol,
-                score=pending.signal.score,
-                stats6=pending.signal.stats6,
-            )
-            self.broker.open(strike_signal, event)
+        if self.strike_ready(pending, event.price, stats2):
+            self.activate_strike(pending, event.price, event.ts_ms, "trade")
             return True
         if event.ts_ms >= pending.expires_ts_ms:
             self.pending.pop(event.mint, None)
@@ -912,6 +901,34 @@ class FlowFollowerBot:
             log(f"FLOW-STRIKE-CANCEL {short_mint(event.mint)} reason=failed mult={event.price / pending.base_price:.4f}x")
             return False
         return False
+
+    def strike_ready(self, pending: PendingStrike, price: float, stats2: WindowStats) -> bool:
+        friction_mult = 1.0 + (2.0 * self.broker.drag) + 0.01
+        target_price = pending.base_price * friction_mult
+        return price >= target_price and stats2.sell_sol <= max(0.02, stats2.buy_sol * 0.50)
+
+    def activate_strike(self, pending: PendingStrike, price: float, ts_ms: int, source: str) -> None:
+        self.pending.pop(pending.mint, None)
+        strike_signal = EntrySignal(
+            phase=pending.signal.phase,
+            context=pending.signal.context,
+            reason=f"{pending.signal.reason}; strike_continue={price / pending.base_price:.4f}x src={source}",
+            amount_sol=pending.signal.amount_sol,
+            score=pending.signal.score,
+            stats6=pending.signal.stats6,
+        )
+        event = FlowEvent(
+            ts_ms=ts_ms,
+            sig=f"strike-{source}",
+            signer="curve-strike",
+            mint=pending.mint,
+            is_buy=True,
+            sol=0.0,
+            price=price,
+            tracked=False,
+            program=PUMP_PROGRAM,
+        )
+        self.broker.open(strike_signal, event)
 
     def detect_entry(self, tape: MintTape, event: FlowEvent) -> Optional[EntrySignal]:
         ts_ms = event.ts_ms
@@ -1142,8 +1159,14 @@ class FlowFollowerBot:
         while not self.stop_event.is_set():
             ts_ms = now_ms()
             for mint, pending in list(self.pending.items()):
+                curve = self.bc.price_for_mint(mint, self.config.curve_max_age_ms, ts_ms)
+                tape = self.tapes.get(mint)
+                if curve and tape:
+                    stats2 = tape.stats(2_000, ts_ms)
+                    if self.strike_ready(pending, curve[0], stats2):
+                        self.activate_strike(pending, curve[0], ts_ms, "heartbeat")
+                        continue
                 if ts_ms >= pending.expires_ts_ms:
-                    curve = self.bc.price_for_mint(mint, self.config.curve_max_age_ms, ts_ms)
                     mult = (curve[0] / pending.base_price) if curve and pending.base_price > 0 else 1.0
                     self.pending.pop(mint, None)
                     log(f"FLOW-STRIKE-CANCEL {short_mint(mint)} reason=heartbeat_expired mult={mult:.4f}x")
