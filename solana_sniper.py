@@ -1503,6 +1503,12 @@ MOONSHOT_MAX_SELL_SOL = float(os.environ.get("MOONSHOT_MAX_SELL_SOL", "0.080"))
 MOONSHOT_MAX_SELL_BUY_RATIO = float(os.environ.get("MOONSHOT_MAX_SELL_BUY_RATIO", "0.10"))
 MOONSHOT_MIN_SCORE = int(os.environ.get("MOONSHOT_MIN_SCORE", "8"))
 MOONSHOT_STRONG_SCORE = int(os.environ.get("MOONSHOT_STRONG_SCORE", "11"))
+MOONSHOT_TAPE_PRICE_FALLBACK_ENABLED = os.environ.get("MOONSHOT_TAPE_PRICE_FALLBACK_ENABLED", "1") == "1"
+MOONSHOT_TAPE_MIN_PRICE_SAMPLES = int(os.environ.get("MOONSHOT_TAPE_MIN_PRICE_SAMPLES", "4"))
+MOONSHOT_TAPE_MIN_MOVE_MULT = float(os.environ.get("MOONSHOT_TAPE_MIN_MOVE_MULT", "1.180"))
+MOONSHOT_TAPE_MIN_TRACKED = int(os.environ.get("MOONSHOT_TAPE_MIN_TRACKED", "3"))
+MOONSHOT_TAPE_MIN_BUY_SOL = float(os.environ.get("MOONSHOT_TAPE_MIN_BUY_SOL", "4.0"))
+MOONSHOT_TAPE_MAX_PRICE_AGE_MS = int(os.environ.get("MOONSHOT_TAPE_MAX_PRICE_AGE_MS", "700"))
 MOONSHOT_CONFIRM_DELAY_SEC = float(os.environ.get("MOONSHOT_CONFIRM_DELAY_SEC", "0.12"))
 MOONSHOT_CONFIRM_MIN_MULT = float(os.environ.get("MOONSHOT_CONFIRM_MIN_MULT", "1.006"))
 MOONSHOT_MIN_PRICE_RATIO = float(os.environ.get("MOONSHOT_MIN_PRICE_RATIO", "0.82"))
@@ -5516,6 +5522,51 @@ def _alpha_market_tape_amount(n: int, wr: float, avg_exit: float,
     return COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL
 
 
+def _market_tape_price_window_stats_for_mint(mint: str, window_ms: int) -> Optional[dict]:
+    now_ms = int(time.time() * 1000)
+    samples: list[tuple[int, float]] = []
+    for event in _market_tape_per_mint.get(mint, ()):
+        if not event.get("is_buy"):
+            continue
+        ts = int(event.get("ts") or 0)
+        if ts < now_ms - window_ms:
+            continue
+        price = float(event.get("price") or 0.0)
+        if price > 0:
+            samples.append((ts, price))
+    if len(samples) < MOONSHOT_TAPE_MIN_PRICE_SAMPLES:
+        return None
+    samples.sort(key=lambda x: x[0])
+    prices = [p for _ts, p in samples]
+    first = prices[0]
+    last = prices[-1]
+    if first <= 0 or last <= 0:
+        return None
+    peak = max(prices)
+    move = last / first
+    off_peak = 0.0 if peak <= 0 else max(0.0, (peak - last) / peak)
+    up_ticks = 0
+    down_ticks = 0
+    for prev, cur in zip(prices, prices[1:]):
+        if cur > prev:
+            up_ticks += 1
+        elif cur < prev:
+            down_ticks += 1
+    return {
+        "source": "tape_price",
+        "first": first,
+        "last": last,
+        "peak": peak,
+        "move": move,
+        "off_peak": off_peak,
+        "up_ticks": up_ticks,
+        "down_ticks": down_ticks,
+        "samples": len(samples),
+        "age_ms": max(0, now_ms - samples[-1][0]),
+        "complete": False,
+    }
+
+
 def _alpha_promoted(stat: Optional[dict], min_samples: int = ALPHA_MIN_SAMPLES) -> bool:
     n, wr, avg_best, _avg_exit = _alpha_stat_view(stat)
     return n >= min_samples and wr >= ALPHA_PROMOTE_MIN_WR and avg_best >= ALPHA_PROMOTE_MIN_AVG_BEST_NET
@@ -5912,13 +5963,24 @@ def _moonshot_ignition_plan(mint: str, signer: str, trader_price: float,
         max(MOONSHOT_MAX_CACHE_AGE_MS, MARKET_TAPE_BC_CACHE_MAX_AGE_MS),
     )
     if not stats:
-        _mt_gate("moon_no_bc")
-        return None
+        if not MOONSHOT_TAPE_PRICE_FALLBACK_ENABLED:
+            _mt_gate("moon_no_bc")
+            return None
+        stats = _market_tape_price_window_stats_for_mint(mint, MOONSHOT_WINDOW_MS)
+        if not stats:
+            _mt_gate("moon_no_bc")
+            return None
+        if int(stats.get("age_ms") or 999999) > MOONSHOT_TAPE_MAX_PRICE_AGE_MS:
+            _mt_gate("moon_no_bc")
+            return None
     if stats["complete"]:
         _mt_gate("moon_complete")
         return None
+    stats_source = str(stats.get("source") or "bc_cache")
+    tape_price_source = stats_source == "tape_price"
     move_mult = float(stats["move"])
-    if move_mult < MOONSHOT_MIN_MOVE_MULT:
+    min_move_required = max(MOONSHOT_MIN_MOVE_MULT, MOONSHOT_TAPE_MIN_MOVE_MULT) if tape_price_source else MOONSHOT_MIN_MOVE_MULT
+    if move_mult < min_move_required:
         _mt_gate("moon_move_low")
         return None
     if move_mult > MOONSHOT_MAX_CHASE_MULT:
@@ -5942,6 +6004,17 @@ def _moonshot_ignition_plan(mint: str, signer: str, trader_price: float,
     if not (tracked_flow_ok or untracked_operator_ok):
         _mt_gate("moon_flow")
         return None
+    if tape_price_source:
+        tape_flow_ok = (
+            tracked_count >= MOONSHOT_TAPE_MIN_TRACKED
+            and buy_sol >= MOONSHOT_TAPE_MIN_BUY_SOL
+            and unique_count >= MOONSHOT_MIN_UNIQUE
+            and int(stats.get("samples") or 0) >= MOONSHOT_TAPE_MIN_PRICE_SAMPLES
+            and int(stats.get("up_ticks") or 0) > int(stats.get("down_ticks") or 0)
+        )
+        if not tape_flow_ok:
+            _mt_gate("moon_flow")
+            return None
 
     price_ratio = None
     if trader_price > 0:
@@ -5973,6 +6046,8 @@ def _moonshot_ignition_plan(mint: str, signer: str, trader_price: float,
         score += 1
     if stats["up_ticks"] > stats["down_ticks"]:
         score += 1
+    if tape_price_source and int(stats.get("samples") or 0) >= MOONSHOT_TAPE_MIN_PRICE_SAMPLES + 2:
+        score += 1
     if off_peak <= MOONSHOT_MAX_OFF_PEAK * 0.5:
         score += 1
     if untracked_operator_ok:
@@ -6003,7 +6078,8 @@ def _moonshot_ignition_plan(mint: str, signer: str, trader_price: float,
             f"buy={buy_sol:.3f} sell={sell_sol:.3f}/{sell_ratio:.1%} "
             f"move={move_mult:.3f}x off_peak={off_peak:.1%} "
             f"up/down={stats['up_ticks']}/{stats['down_ticks']} "
-            f"age={observed_age_ms/1000:.1f}s cache={stats['age_ms']}ms"
+            f"age={observed_age_ms/1000:.1f}s {stats_source}={stats['age_ms']}ms"
+            + (f" samples={int(stats.get('samples') or 0)}" if tape_price_source else "")
             + (f" ratio={price_ratio:.3f}x" if price_ratio is not None else "")
         ),
     }
@@ -7720,6 +7796,7 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         "signer": signer,
         "is_buy": bool(trade.get("is_buy")),
         "sol": float(trade.get("sol_lamports") or 0) / 1e9,
+        "price": float(trade.get("trader_price") or 0.0),
         "tracked": signer in trader_set,
         "sig": sig,
     }
@@ -9048,6 +9125,12 @@ async def main():
             f"move>={MOONSHOT_MIN_MOVE_MULT:.3f}x, unique>={MOONSHOT_MIN_UNIQUE}, "
             f"tracked>={MOONSHOT_MIN_TRACKED} or operator-flow buy>={MOONSHOT_UNTRACKED_MIN_BUY_SOL:.1f} SOL; "
             f"confirm {MOONSHOT_CONFIRM_MIN_MULT:.3f}x/{MOONSHOT_CONFIRM_DELAY_SEC:.2f}s.")
+        if MOONSHOT_TAPE_PRICE_FALLBACK_ENABLED:
+            log(f"  Moonshot tape-price fallback: if bc-cache is missing, require "
+                f"{MOONSHOT_TAPE_MIN_PRICE_SAMPLES}+ buy-price samples, "
+                f"move>={MOONSHOT_TAPE_MIN_MOVE_MULT:.3f}x, tracked>={MOONSHOT_TAPE_MIN_TRACKED}, "
+                f"buy>={MOONSHOT_TAPE_MIN_BUY_SOL:.1f} SOL, "
+                f"latest price age<={MOONSHOT_TAPE_MAX_PRICE_AGE_MS}ms.")
         log(f"  Moonshot exits: fast-kill {MOONSHOT_FAST_KILL_SEC:.1f}s/"
             f"{MOONSHOT_FAST_KILL_PEAK:.3f}x, TP1={MOONSHOT_TP1_MULT:.3f}x "
             f"({MOONSHOT_TP1_FRACTION*100:.0f}%), TP2={MOONSHOT_TP2_MULT:.3f}x "
