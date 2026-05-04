@@ -1391,7 +1391,8 @@ MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SEL
 MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT", "0.998"))
-MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO", "0.700"))
+MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT = os.environ.get("MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT", "1") == "1"
+MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO", "0.820"))
 MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO", "1.750"))
 MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
 MARKET_TAPE_ALPHA_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BUY_SOL", "3.0"))
@@ -3733,7 +3734,8 @@ async def session_reporter():
                 f"busy={s.get('swarm_scout_busy', 0)} ===")
             log(f"=== ALPHA: shadow={s.get('alpha_shadow', 0)} outcomes={s.get('alpha_outcomes', 0)} "
                 f"no_px={s.get('alpha_no_price', 0)} promoted={s.get('alpha_promoted', 0)} "
-                f"toxic={s.get('alpha_toxic', 0)} scouts={s.get('alpha_scouts', 0)} "
+                f"toxic={s.get('alpha_toxic', 0)} dump_ctx={s.get('alpha_dump_context', 0)} "
+                f"scouts={s.get('alpha_scouts', 0)} "
                 f"pending={len(_alpha_pending_keys)} ===")
 
 
@@ -5505,6 +5507,11 @@ def _alpha_context_key(lane: str, mint: str, signer: str,
     return f"{lane}|{age_b}|{swarm_b}|{move_b}|{ratio_b}"
 
 
+def _alpha_context_is_dump(context: str) -> bool:
+    parts = context.split("|")
+    return len(parts) >= 5 and (parts[-2] == "dump" or parts[-1] == "dumped")
+
+
 def _alpha_stat_view(stat: Optional[dict]) -> tuple[int, float, float, float]:
     if not stat:
         return 0, 0.0, 0.0, 0.0
@@ -5735,6 +5742,9 @@ def _alpha_entry_plan(mint: str, signer: str, lane: str,
     if not off_peak_ok or last_mult < COPY_FAST_ALPHA_MIN_ENTRY_MULT:
         return None
     context = _alpha_context_key(lane, mint, signer, trader_price, trigger_price)
+    if MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT and _alpha_context_is_dump(context):
+        _copy_trade_stats["alpha_dump_context"] = _copy_trade_stats.get("alpha_dump_context", 0) + 1
+        return None
     wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
     context_stat = _alpha_stats.get("contexts", {}).get(context)
     pair_stat = _alpha_stats.get("pairs", {}).get(f"{signer}|{context}")
@@ -5820,6 +5830,9 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return None
     move_mult = float(move_stats["move"])
     context = _alpha_context_key("market_tape", mint, signer, trader_price, trigger_price)
+    if MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT and _alpha_context_is_dump(context):
+        _copy_trade_stats["alpha_dump_context"] = _copy_trade_stats.get("alpha_dump_context", 0) + 1
+        return None
     wallet_stat = _alpha_stats.get("wallets", {}).get(signer)
     context_stat = _alpha_stats.get("contexts", {}).get(context)
     pair_stat = _alpha_stats.get("pairs", {}).get(f"{signer}|{context}")
@@ -9250,6 +9263,7 @@ async def main():
                 f"avg_exit>={MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_AVG_EXIT:+.1%}, "
                 f"alpha ratio-bypass hard band {MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO:.2f}-"
                 f"{MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO:.2f}x, "
+                f"{'blocks dump/dumped contexts, ' if MARKET_TAPE_ALPHA_BLOCK_DUMP_CONTEXT else ''}"
                 f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
                 f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s; strong avg-exit buckets may retain "
                 f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x and bypass static ratio/move guards "
