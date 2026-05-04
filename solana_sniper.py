@@ -1364,6 +1364,8 @@ ALPHA_CONTEXT_ONLY_MIN_AVG_BEST_NET = float(os.environ.get("ALPHA_CONTEXT_ONLY_M
 ALPHA_WALLET_ONLY_MIN_SAMPLES = int(os.environ.get("ALPHA_WALLET_ONLY_MIN_SAMPLES", "20"))
 ALPHA_WALLET_ONLY_MIN_WR = float(os.environ.get("ALPHA_WALLET_ONLY_MIN_WR", "0.70"))
 ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET = float(os.environ.get("ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET", "0.080"))
+ALPHA_RUNNER_TP1_MULT = float(os.environ.get("ALPHA_RUNNER_TP1_MULT", "1.055"))
+ALPHA_RUNNER_TP1_FRACTION = float(os.environ.get("ALPHA_RUNNER_TP1_FRACTION", "0.70"))
 COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL", "0.003125"))
 COPY_FAST_ALPHA_CORE_AMOUNT_SOL = float(os.environ.get("COPY_FAST_ALPHA_CORE_AMOUNT_SOL", "0.0125"))
 COPY_FAST_CONFIRMED_AMOUNT_SOL = float(os.environ.get("COPY_FAST_CONFIRMED_AMOUNT_SOL", str(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)))
@@ -2099,6 +2101,20 @@ async def manage_graduation_position(client: Client, kp: Optional[Keypair], pos:
             # Require: trail_floor must be > 1 + GRAD_TRAILING_MIN_LOCK (clear slippage).
             change = (sol_per_unit - pos.entry_price) / pos.entry_price
             if pos.launchpad == "moonshot_ignition":
+                alpha_runner = (
+                    pos.entry_amount_sol <= COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL * 1.10
+                    and pos.quality_score <= 8
+                )
+                if alpha_runner and pos.rung_hit == 0 and multiplier >= ALPHA_RUNNER_TP1_MULT:
+                    sell_frac = max(0.0, min(1.0, ALPHA_RUNNER_TP1_FRACTION))
+                    log(f"  ALPHA-RUNNER TP1 mult={multiplier:.3f}x: selling {sell_frac*100:.0f}%")
+                    if try_grad_sell(f"ALPHA-RUNNER TP1 {ALPHA_RUNNER_TP1_MULT:.3f}x mult={multiplier:.3f}x",
+                                     sell_frac, multiplier):
+                        pos.rung_hit = 1
+                        rung_hit = max(rung_hit, 1)
+                        _persist_positions()
+                        if pos.remaining_pct <= 0.01:
+                            break
                 if pos.rung_hit == 0 and multiplier >= MOONSHOT_TP1_MULT:
                     sell_frac = max(0.0, min(1.0, MOONSHOT_TP1_FRACTION))
                     log(f"  MOONSHOT TP1 mult={multiplier:.3f}x: selling {sell_frac*100:.0f}%")
@@ -8872,7 +8888,8 @@ async def main():
         log(f"  Wallet-only alpha scout requires {ALPHA_WALLET_ONLY_MIN_SAMPLES}+ samples, "
             f"WR>={ALPHA_WALLET_ONLY_MIN_WR:.0%}, "
             f"avg_exit>={ALPHA_WALLET_ONLY_MIN_AVG_EXIT_NET:+.1%}.")
-        log(f"  Alpha exits: learned copy/tape alpha uses scout-sized moonshot runner exits; "
+        log(f"  Alpha exits: learned copy/tape alpha uses scout-sized moonshot runner exits, "
+            f"selling {ALPHA_RUNNER_TP1_FRACTION*100:.0f}% at {ALPHA_RUNNER_TP1_MULT:.3f}x; "
             f"toxic pairs stop adapting after {ALPHA_BLOCK_MIN_SAMPLES}+ bad samples.")
         if MARKET_TAPE_ALPHA_ENABLED:
             log(f"  Market-tape alpha: context-promoted tape enters scout size before static gates "
