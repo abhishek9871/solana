@@ -1046,8 +1046,7 @@ class FlowFollowerBot:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                msg = str(exc)
-                delay = 30 if ("Connection limit" in msg or "1008" in msg) else 2
+                delay = 2
                 log(f"FLOW: stream error, reconnecting in {delay}s: {type(exc).__name__}: {exc}")
                 await asyncio.sleep(delay)
 
