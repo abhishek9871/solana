@@ -1523,8 +1523,10 @@ COPY_FAST_IGNITION_FAST_MULT = float(os.environ.get("COPY_FAST_IGNITION_FAST_MUL
 COPY_FAST_IGNITION_FAST_SWARM = int(os.environ.get("COPY_FAST_IGNITION_FAST_SWARM", "4"))
 COPY_FAST_IGNITION_STRONG_SWARM = int(os.environ.get("COPY_FAST_IGNITION_STRONG_SWARM", "5"))
 COPY_FAST_IGNITION_MAX_CACHE_AGE_MS = int(os.environ.get("COPY_FAST_IGNITION_MAX_CACHE_AGE_MS", "250"))
-COPY_FAST_IGNITION_AMOUNT_SOL = float(os.environ.get("COPY_FAST_IGNITION_AMOUNT_SOL", "0.0125"))
-COPY_FAST_IGNITION_STRONG_AMOUNT_SOL = float(os.environ.get("COPY_FAST_IGNITION_STRONG_AMOUNT_SOL", "0.01875"))
+COPY_FAST_IGNITION_AMOUNT_SOL = float(os.environ.get("COPY_FAST_IGNITION_AMOUNT_SOL", "0.00625"))
+COPY_FAST_IGNITION_STRONG_AMOUNT_SOL = float(os.environ.get("COPY_FAST_IGNITION_STRONG_AMOUNT_SOL", "0.009375"))
+COPY_FAST_IGNITION_CONFIRM_DELAY_SEC = float(os.environ.get("COPY_FAST_IGNITION_CONFIRM_DELAY_SEC", "0.08"))
+COPY_FAST_IGNITION_CONFIRM_MIN_MULT = float(os.environ.get("COPY_FAST_IGNITION_CONFIRM_MIN_MULT", "1.003"))
 SWARM_SCOUT_ENABLED = os.environ.get("SWARM_SCOUT_ENABLED", "1") == "1"
 SWARM_SCOUT_MIN_SIGNERS = int(os.environ.get("SWARM_SCOUT_MIN_SIGNERS", "3"))
 SWARM_SCOUT_AMOUNT_SOL = float(os.environ.get("SWARM_SCOUT_AMOUNT_SOL", str(COPY_FAST_ALPHA_SCOUT_AMOUNT_SOL)))
@@ -6596,6 +6598,33 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
                         and launchpad == "copy_fast"
                         and (ignition_swarm_ok or ignition_fast_ok)
                         and last_age_ms <= COPY_FAST_IGNITION_MAX_CACHE_AGE_MS):
+                    if COPY_FAST_IGNITION_CONFIRM_DELAY_SEC > 0:
+                        await asyncio.sleep(COPY_FAST_IGNITION_CONFIRM_DELAY_SEC)
+                        confirm_price_info = _bc_cache_price_for_mint(
+                            mint,
+                            COPY_FAST_IGNITION_MAX_CACHE_AGE_MS,
+                        )
+                        if not confirm_price_info or confirm_price_info[1] or confirm_price_info[0] <= 0:
+                            reason = (f"copy_fast ignition no confirm price after "
+                                      f"{COPY_FAST_IGNITION_CONFIRM_DELAY_SEC:.2f}s")
+                            await asyncio.sleep(COPY_FAST_CONFIRM_POLL_SEC)
+                            continue
+                        confirm_price, _complete, last_age_ms = confirm_price_info
+                        retain_mult = confirm_price / price if price > 0 else 0.0
+                        if retain_mult < COPY_FAST_IGNITION_CONFIRM_MIN_MULT:
+                            reason = (f"copy_fast ignition fade retain={retain_mult:.3f}x "
+                                      f"need>={COPY_FAST_IGNITION_CONFIRM_MIN_MULT:.3f}x "
+                                      f"after {COPY_FAST_IGNITION_CONFIRM_DELAY_SEC:.2f}s")
+                            await asyncio.sleep(COPY_FAST_CONFIRM_POLL_SEC)
+                            continue
+                        price = confirm_price
+                        peak_price = max(peak_price, price)
+                        last_mult = price / baseline_price if baseline_price else last_mult
+                        off_peak_ok = price >= peak_price * (1.0 - COPY_FAST_CONFIRM_MAX_OFF_PEAK)
+                        if not off_peak_ok:
+                            reason = "copy_fast ignition confirm fell off peak"
+                            await asyncio.sleep(COPY_FAST_CONFIRM_POLL_SEC)
+                            continue
                     strong = (
                         last_mult >= COPY_FAST_IGNITION_STRONG_MULT
                         and len(recent) >= COPY_FAST_IGNITION_STRONG_SWARM
@@ -8726,7 +8755,9 @@ async def main():
             f"{COPY_FAST_IGNITION_STRONG_AMOUNT_SOL:.4f} SOL when confirm move>="
             f"{COPY_FAST_IGNITION_MIN_MULT:.2f}x with swarm>={COPY_FAST_IGNITION_MIN_SWARM}, "
             f"or >={COPY_FAST_IGNITION_FAST_MULT:.2f}x with swarm>={COPY_FAST_IGNITION_FAST_SWARM}, "
-            f"cache<={COPY_FAST_IGNITION_MAX_CACHE_AGE_MS}ms; managed as moonshot.")
+            f"cache<={COPY_FAST_IGNITION_MAX_CACHE_AGE_MS}ms and retain>="
+            f"{COPY_FAST_IGNITION_CONFIRM_MIN_MULT:.3f}x/"
+            f"{COPY_FAST_IGNITION_CONFIRM_DELAY_SEC:.2f}s; managed as moonshot.")
     if VELOCITY_IGNITION_ENABLED:
         log(f"  Velocity ignition: {VELOCITY_AMOUNT_SOL:.4f}/"
             f"{VELOCITY_STRONG_AMOUNT_SOL:.4f} SOL on rolling {VELOCITY_WINDOW_MS}ms tape "
