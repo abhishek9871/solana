@@ -1605,7 +1605,10 @@ ROCKET_TAPE_TAPE_PRICE_MIN_TRACKED = int(os.environ.get("ROCKET_TAPE_TAPE_PRICE_
 ROCKET_TAPE_TAPE_PRICE_MIN_BUY_SOL = float(os.environ.get("ROCKET_TAPE_TAPE_PRICE_MIN_BUY_SOL", "6.0"))
 ROCKET_TAPE_TAPE_PRICE_MIN_MOVE_MULT = float(os.environ.get("ROCKET_TAPE_TAPE_PRICE_MIN_MOVE_MULT", "1.250"))
 ROCKET_TAPE_CONFIRM_DELAY_SEC = float(os.environ.get("ROCKET_TAPE_CONFIRM_DELAY_SEC", "0.04"))
-ROCKET_TAPE_CONFIRM_RETAIN_MULT = float(os.environ.get("ROCKET_TAPE_CONFIRM_RETAIN_MULT", "0.992"))
+ROCKET_TAPE_CONFIRM_RETAIN_MULT = float(os.environ.get("ROCKET_TAPE_CONFIRM_RETAIN_MULT", "1.003"))
+ROCKET_TAPE_CHASE_MOVE_MULT = float(os.environ.get("ROCKET_TAPE_CHASE_MOVE_MULT", "1.180"))
+ROCKET_TAPE_CHASE_MIN_TRACKED = int(os.environ.get("ROCKET_TAPE_CHASE_MIN_TRACKED", "4"))
+ROCKET_TAPE_CHASE_MIN_BUY_SOL = float(os.environ.get("ROCKET_TAPE_CHASE_MIN_BUY_SOL", "2.0"))
 ROCKET_TAPE_AMOUNT_SOL = float(os.environ.get("ROCKET_TAPE_AMOUNT_SOL", "0.009375"))
 ROCKET_TAPE_STRONG_AMOUNT_SOL = float(os.environ.get("ROCKET_TAPE_STRONG_AMOUNT_SOL", "0.01875"))
 ROCKET_TAPE_MAX_AMOUNT_SOL = float(os.environ.get("ROCKET_TAPE_MAX_AMOUNT_SOL", "0.03125"))
@@ -6405,6 +6408,12 @@ def _rocket_tape_plan(mint: str, tape: deque, observed_age_ms: int,
     if tracked_count < ROCKET_TAPE_MIN_TRACKED and not operator_stampede:
         _mt_gate("rocket_no_edge")
         return None
+    if (move_mult >= ROCKET_TAPE_CHASE_MOVE_MULT
+            and not operator_stampede
+            and (tracked_count < ROCKET_TAPE_CHASE_MIN_TRACKED
+                 or buy_sol < ROCKET_TAPE_CHASE_MIN_BUY_SOL)):
+        _mt_gate("rocket_thin_chase")
+        return None
     if stats_source == "tape_price" and not ROCKET_TAPE_ALLOW_TAPE_PRICE_ENTRY:
         tape_price_strong_enough = (
             tracked_count >= ROCKET_TAPE_TAPE_PRICE_MIN_TRACKED
@@ -9672,6 +9681,8 @@ async def main():
             f"unique>={ROCKET_TAPE_MIN_UNIQUE}, tracked>={ROCKET_TAPE_MIN_TRACKED}, "
             f"buy>={ROCKET_TAPE_MIN_BUY_SOL:.2f} SOL, "
             f"move={ROCKET_TAPE_MIN_MOVE_MULT:.3f}-{ROCKET_TAPE_MAX_CHASE_MULT:.3f}x; "
+            f"chase>={ROCKET_TAPE_CHASE_MOVE_MULT:.3f}x needs "
+            f"tracked>={ROCKET_TAPE_CHASE_MIN_TRACKED}/buy>={ROCKET_TAPE_CHASE_MIN_BUY_SOL:.1f} SOL; "
             f"confirm retain>={ROCKET_TAPE_CONFIRM_RETAIN_MULT:.3f}x/"
             f"{ROCKET_TAPE_CONFIRM_DELAY_SEC:.2f}s; "
             f"tape-price-only {'allowed' if ROCKET_TAPE_ALLOW_TAPE_PRICE_ENTRY else 'requires strong tracked flow'}; "
