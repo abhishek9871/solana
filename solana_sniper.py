@@ -1482,6 +1482,18 @@ MARKET_TAPE_SCOUT_FAST_KILL_SEC = float(os.environ.get("MARKET_TAPE_SCOUT_FAST_K
 MARKET_TAPE_SCOUT_FAST_KILL_PEAK = float(os.environ.get("MARKET_TAPE_SCOUT_FAST_KILL_PEAK", "1.012"))
 MARKET_TAPE_SCOUT_TIMEOUT_SEC = float(os.environ.get("MARKET_TAPE_SCOUT_TIMEOUT_SEC", "8.0"))
 MARKET_TAPE_MAX_OBSERVED_AGE_SEC = float(os.environ.get("MARKET_TAPE_MAX_OBSERVED_AGE_SEC", "12.0"))
+MARKET_TAPE_REVIVAL_ENABLED = os.environ.get("MARKET_TAPE_REVIVAL_ENABLED", "1") == "1"
+MARKET_TAPE_REVIVAL_MIN_AGE_SEC = float(os.environ.get("MARKET_TAPE_REVIVAL_MIN_AGE_SEC", "12.0"))
+MARKET_TAPE_REVIVAL_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_REVIVAL_MAX_AGE_SEC", "90.0"))
+MARKET_TAPE_REVIVAL_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_REVIVAL_MIN_UNIQUE", "4"))
+MARKET_TAPE_REVIVAL_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_REVIVAL_MIN_TRACKED", "2"))
+MARKET_TAPE_REVIVAL_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_REVIVAL_MIN_BUY_SOL", "4.0"))
+MARKET_TAPE_REVIVAL_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_REVIVAL_MAX_SELL_SOL", "0.006"))
+MARKET_TAPE_REVIVAL_MIN_MOVE = float(os.environ.get("MARKET_TAPE_REVIVAL_MIN_MOVE", "1.040"))
+MARKET_TAPE_REVIVAL_MAX_MOVE = float(os.environ.get("MARKET_TAPE_REVIVAL_MAX_MOVE", "1.350"))
+MARKET_TAPE_REVIVAL_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_REVIVAL_CONFIRM_DELAY_SEC", "0.12"))
+MARKET_TAPE_REVIVAL_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_REVIVAL_CONFIRM_MIN_MULT", "1.006"))
+MARKET_TAPE_REVIVAL_AMOUNT_SOL = float(os.environ.get("MARKET_TAPE_REVIVAL_AMOUNT_SOL", "0.00625"))
 MARKET_TAPE_BIRTH_ENABLED = os.environ.get("MARKET_TAPE_BIRTH_ENABLED", "1") == "1"
 MARKET_TAPE_BIRTH_MAX_AGE_SEC = float(os.environ.get("MARKET_TAPE_BIRTH_MAX_AGE_SEC", "6.0"))
 MARKET_TAPE_BIRTH_WINDOW_MS = int(os.environ.get("MARKET_TAPE_BIRTH_WINDOW_MS", "900"))
@@ -8739,6 +8751,92 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
         log(f"  MARKET-TAPE BLOCK {mint[:8]}: recent price_ratio violation "
             f"cooldown {(ratio_block_until - now_ms) / 1000:.1f}s")
         return
+    revival_age_ok = (
+        MARKET_TAPE_REVIVAL_ENABLED
+        and observed_age_ms >= MARKET_TAPE_REVIVAL_MIN_AGE_SEC * 1000
+        and observed_age_ms <= MARKET_TAPE_REVIVAL_MAX_AGE_SEC * 1000
+    )
+    revival_flow_ok = (
+        len(unique_buyers) >= MARKET_TAPE_REVIVAL_MIN_UNIQUE
+        and effective_tracked_count >= MARKET_TAPE_REVIVAL_MIN_TRACKED
+        and buy_sol >= MARKET_TAPE_REVIVAL_MIN_BUY_SOL
+        and sell_sol <= MARKET_TAPE_REVIVAL_MAX_SELL_SOL
+    )
+    if revival_age_ok and revival_flow_ok and not _mint_recently_closed(mint, now_ms / 1000.0):
+        revival_move = _bc_cache_move_for_mint(
+            mint,
+            max(MARKET_TAPE_WINDOW_MS + 800, 1500),
+            MARKET_TAPE_BC_CACHE_MAX_AGE_MS,
+        )
+        if revival_move:
+            move_mult, age_ms, complete = revival_move
+            if (not complete
+                    and MARKET_TAPE_REVIVAL_MIN_MOVE <= move_mult <= MARKET_TAPE_REVIVAL_MAX_MOVE):
+                latest_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+                if latest_price and not latest_price[1] and latest_price[0] > 0:
+                    trigger_price = float(latest_price[0])
+                    if trader_price > 0:
+                        price_ratio = trigger_price / trader_price
+                        if (price_ratio < MARKET_TAPE_MIN_PRICE_RATIO
+                                or price_ratio > MARKET_TAPE_MAX_PRICE_RATIO):
+                            _market_tape_ratio_violation_until[mint] = (
+                                now_ms + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+                            )
+                            _copy_trade_stats["market_tape_blocked"] = (
+                                _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                            )
+                            _mt_gate("mt_revival_ratio")
+                            log(f"  MARKET-TAPE-REVIVAL BLOCK {mint[:8]}: "
+                                f"price_ratio={price_ratio:.3f}x outside "
+                                f"{MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
+                            return
+                    await asyncio.sleep(MARKET_TAPE_REVIVAL_CONFIRM_DELAY_SEC)
+                    confirm_price = _bc_cache_price_for_mint(mint, MARKET_TAPE_BC_CACHE_MAX_AGE_MS)
+                    if confirm_price and not confirm_price[1] and confirm_price[0] > 0:
+                        confirm_mult = float(confirm_price[0]) / trigger_price
+                        if confirm_mult >= MARKET_TAPE_REVIVAL_CONFIRM_MIN_MULT:
+                            entry_ms = int(time.time() * 1000)
+                            if (entry_ms - _market_tape_entered_recent.get(mint, 0)
+                                    >= MARKET_TAPE_COOLDOWN_SEC * 1000
+                                    and not _market_tape_rate_limited(entry_ms)):
+                                graduated_seen.add(mint)
+                                if len(graduated_seen) > 500:
+                                    graduated_seen.clear()
+                                    graduated_seen.add(mint)
+                                _market_tape_entered_recent[mint] = entry_ms
+                                _market_tape_entry_times.append(entry_ms)
+                                _copy_trade_stats["market_tape_triggers"] = (
+                                    _copy_trade_stats.get("market_tape_triggers", 0) + 1
+                                )
+                                _copy_trade_stats["moonshot_triggers"] = (
+                                    _copy_trade_stats.get("moonshot_triggers", 0) + 1
+                                )
+                                reason = (
+                                    f"revival_tape unique={len(unique_buyers)} "
+                                    f"tracked={effective_tracked_count} buy={buy_sol:.3f} "
+                                    f"sell={sell_sol:.3f} bc={move_mult:.3f}x age={age_ms}ms "
+                                    f"seen={observed_age_ms/1000:.1f}s "
+                                    f"confirm={confirm_mult:.3f}x/"
+                                    f"{MARKET_TAPE_REVIVAL_CONFIRM_DELAY_SEC:.2f}s"
+                                )
+                                log(f"  *** MARKET-TAPE-REVIVAL TRIGGER *** {mint[:8]}: {reason}")
+                                asyncio.create_task(_enter_market_tape_position(
+                                    client, kp, mint, entry_ms, reason,
+                                    amount_sol=MARKET_TAPE_REVIVAL_AMOUNT_SOL,
+                                    launchpad="moonshot_ignition",
+                                    quality_score=7,
+                                ))
+                                return
+                        else:
+                            _copy_trade_stats["market_tape_blocked"] = (
+                                _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                            )
+                            _mt_gate("mt_revival_confirm")
+                            log(f"  MARKET-TAPE-REVIVAL BLOCK {mint[:8]}: "
+                                f"confirm_mult={confirm_mult:.3f}x < "
+                                f"{MARKET_TAPE_REVIVAL_CONFIRM_MIN_MULT:.3f}x after "
+                                f"{MARKET_TAPE_REVIVAL_CONFIRM_DELAY_SEC:.2f}s")
+                            return
     if not birth_lane:
         if len(unique_buyers) < MARKET_TAPE_MIN_UNIQUE:
             _mt_gate("mt_no_unique")
@@ -9834,6 +9932,15 @@ async def main():
             f"after {MOONSHOT_TRAIL_ACTIVATION:.3f}x.")
     log(f"  Stale tape guard: block non-birth market-tape entries after "
         f"{MARKET_TAPE_MAX_OBSERVED_AGE_SEC:.1f}s from first observed mint trade.")
+    if MARKET_TAPE_REVIVAL_ENABLED:
+        log(f"  Revival tape: {MARKET_TAPE_REVIVAL_MIN_AGE_SEC:.0f}-"
+            f"{MARKET_TAPE_REVIVAL_MAX_AGE_SEC:.0f}s waves can enter "
+            f"{MARKET_TAPE_REVIVAL_AMOUNT_SOL:.4f} SOL when unique>="
+            f"{MARKET_TAPE_REVIVAL_MIN_UNIQUE}, tracked>={MARKET_TAPE_REVIVAL_MIN_TRACKED}, "
+            f"buy>={MARKET_TAPE_REVIVAL_MIN_BUY_SOL:.1f} SOL, "
+            f"bc={MARKET_TAPE_REVIVAL_MIN_MOVE:.3f}-{MARKET_TAPE_REVIVAL_MAX_MOVE:.3f}x, "
+            f"confirm>={MARKET_TAPE_REVIVAL_CONFIRM_MIN_MULT:.3f}x/"
+            f"{MARKET_TAPE_REVIVAL_CONFIRM_DELAY_SEC:.2f}s.")
     if SWARM_SCOUT_ENABLED:
         log(f"  Swarm scout: {SWARM_SCOUT_AMOUNT_SOL:.4f} SOL on SWARM-{SWARM_SCOUT_MIN_SIGNERS}+ "
             f"rug-block clusters if bc={SWARM_SCOUT_MIN_BC_MOVE:.3f}-{SWARM_SCOUT_MAX_BC_MOVE:.3f}x, "
