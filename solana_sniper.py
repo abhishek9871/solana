@@ -1406,6 +1406,8 @@ MARKET_TAPE_ALPHA_DUMP_CONTEXT_MIN_AVG_EXIT = float(os.environ.get("MARKET_TAPE_
 MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO", "0.820"))
 MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO", "1.750"))
 MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
+MARKET_TAPE_ALPHA_UNTRACKED_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_ALPHA_UNTRACKED_MIN_UNIQUE", "4"))
+MARKET_TAPE_ALPHA_UNTRACKED_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_UNTRACKED_MIN_BUY_SOL", "5.0"))
 MARKET_TAPE_ALPHA_MIN_BUY_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BUY_SOL", "3.0"))
 MARKET_TAPE_ALPHA_MIN_MOVE_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_MOVE_MULT", "1.040"))
 MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.050"))
@@ -5909,7 +5911,12 @@ def _alpha_market_tape_entry_plan(mint: str, signer: str,
         return None
     if sell_sol > MARKET_TAPE_ALPHA_MAX_SELL_SOL:
         return None
-    if (tracked_count < MARKET_TAPE_ALPHA_MIN_TRACKED
+    untracked_flow_ok = (
+        tracked_count < MARKET_TAPE_ALPHA_MIN_TRACKED
+        and unique_count >= MARKET_TAPE_ALPHA_UNTRACKED_MIN_UNIQUE
+        and buy_sol >= MARKET_TAPE_ALPHA_UNTRACKED_MIN_BUY_SOL
+    )
+    if ((tracked_count < MARKET_TAPE_ALPHA_MIN_TRACKED and not untracked_flow_ok)
             or unique_count < 3
             or buy_sol < MARKET_TAPE_ALPHA_MIN_BUY_SOL):
         return None
@@ -9850,6 +9857,8 @@ async def main():
         if MARKET_TAPE_ALPHA_ENABLED:
             log(f"  Market-tape alpha: context-promoted tape enters scout/strong size before static gates "
                 f"when age<={MARKET_TAPE_ALPHA_MAX_AGE_SEC:.1f}s, tracked>={MARKET_TAPE_ALPHA_MIN_TRACKED}, "
+                f"or untracked unique>={MARKET_TAPE_ALPHA_UNTRACKED_MIN_UNIQUE}/"
+                f"buy>={MARKET_TAPE_ALPHA_UNTRACKED_MIN_BUY_SOL:.1f} SOL, "
                 f"buy>={MARKET_TAPE_ALPHA_MIN_BUY_SOL:.1f} SOL, "
                 f"sell<={MARKET_TAPE_ALPHA_MAX_SELL_SOL:.3f} SOL, move>={MARKET_TAPE_ALPHA_MIN_MOVE_MULT:.3f}x, "
                 f"WR>={MARKET_TAPE_ALPHA_MIN_WR:.0%}, avg_exit>={MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET:+.1%}, "
