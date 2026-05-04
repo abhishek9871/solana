@@ -1489,9 +1489,11 @@ MOONSHOT_TP2_FRACTION = float(os.environ.get("MOONSHOT_TP2_FRACTION", "0.50"))
 MOONSHOT_TRAIL_ACTIVATION = float(os.environ.get("MOONSHOT_TRAIL_ACTIVATION", "1.180"))
 MOONSHOT_TRAIL_DISTANCE = float(os.environ.get("MOONSHOT_TRAIL_DISTANCE", "0.880"))
 COPY_FAST_IGNITION_ENABLED = os.environ.get("COPY_FAST_IGNITION_ENABLED", "1") == "1"
-COPY_FAST_IGNITION_MIN_MULT = float(os.environ.get("COPY_FAST_IGNITION_MIN_MULT", "1.450"))
+COPY_FAST_IGNITION_MIN_MULT = float(os.environ.get("COPY_FAST_IGNITION_MIN_MULT", "1.300"))
 COPY_FAST_IGNITION_STRONG_MULT = float(os.environ.get("COPY_FAST_IGNITION_STRONG_MULT", "1.550"))
-COPY_FAST_IGNITION_MIN_SWARM = int(os.environ.get("COPY_FAST_IGNITION_MIN_SWARM", "4"))
+COPY_FAST_IGNITION_MIN_SWARM = int(os.environ.get("COPY_FAST_IGNITION_MIN_SWARM", "6"))
+COPY_FAST_IGNITION_FAST_MULT = float(os.environ.get("COPY_FAST_IGNITION_FAST_MULT", "1.450"))
+COPY_FAST_IGNITION_FAST_SWARM = int(os.environ.get("COPY_FAST_IGNITION_FAST_SWARM", "4"))
 COPY_FAST_IGNITION_STRONG_SWARM = int(os.environ.get("COPY_FAST_IGNITION_STRONG_SWARM", "5"))
 COPY_FAST_IGNITION_MAX_CACHE_AGE_MS = int(os.environ.get("COPY_FAST_IGNITION_MAX_CACHE_AGE_MS", "250"))
 COPY_FAST_IGNITION_AMOUNT_SOL = float(os.environ.get("COPY_FAST_IGNITION_AMOUNT_SOL", "0.0125"))
@@ -6437,10 +6439,17 @@ async def _confirm_copy_fast_entry(mint: str, launchpad: str, signal_time_ms: in
 
             off_peak_ok = price >= peak_price * (1.0 - COPY_FAST_CONFIRM_MAX_OFF_PEAK)
             if last_mult >= COPY_FAST_CONFIRM_MIN_MULT and off_peak_ok and swarm_ok:
+                ignition_swarm_ok = (
+                    len(recent) >= COPY_FAST_IGNITION_MIN_SWARM
+                    and last_mult >= COPY_FAST_IGNITION_MIN_MULT
+                )
+                ignition_fast_ok = (
+                    len(recent) >= COPY_FAST_IGNITION_FAST_SWARM
+                    and last_mult >= COPY_FAST_IGNITION_FAST_MULT
+                )
                 if (COPY_FAST_IGNITION_ENABLED
                         and launchpad == "copy_fast"
-                        and len(recent) >= COPY_FAST_IGNITION_MIN_SWARM
-                        and last_mult >= COPY_FAST_IGNITION_MIN_MULT
+                        and (ignition_swarm_ok or ignition_fast_ok)
                         and last_age_ms <= COPY_FAST_IGNITION_MAX_CACHE_AGE_MS):
                     strong = (
                         last_mult >= COPY_FAST_IGNITION_STRONG_MULT
@@ -8483,7 +8492,8 @@ async def main():
     if COPY_FAST_IGNITION_ENABLED:
         log(f"  Copy-fast ignition: {COPY_FAST_IGNITION_AMOUNT_SOL:.4f}/"
             f"{COPY_FAST_IGNITION_STRONG_AMOUNT_SOL:.4f} SOL when confirm move>="
-            f"{COPY_FAST_IGNITION_MIN_MULT:.2f}x, swarm>={COPY_FAST_IGNITION_MIN_SWARM}, "
+            f"{COPY_FAST_IGNITION_MIN_MULT:.2f}x with swarm>={COPY_FAST_IGNITION_MIN_SWARM}, "
+            f"or >={COPY_FAST_IGNITION_FAST_MULT:.2f}x with swarm>={COPY_FAST_IGNITION_FAST_SWARM}, "
             f"cache<={COPY_FAST_IGNITION_MAX_CACHE_AGE_MS}ms; managed as moonshot.")
     if COPY_FAST_CONFIRMED_ENTRY_ENABLED:
         log(f"  Confirmed raw copy_fast size: {COPY_FAST_CONFIRMED_AMOUNT_SOL:.4f} SOL "
