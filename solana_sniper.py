@@ -1391,6 +1391,8 @@ MARKET_TAPE_ALPHA_MAX_SELL_SOL = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_SEL
 MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC", "0.12"))
 MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT", "1.006"))
 MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT", "0.998"))
+MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO", "0.600"))
+MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO = float(os.environ.get("MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO", "1.750"))
 MARKET_TAPE_ALPHA_MIN_TRACKED = int(os.environ.get("MARKET_TAPE_ALPHA_MIN_TRACKED", "2"))
 MARKET_TAPE_ALPHA_MIN_MOVE_MULT = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_MOVE_MULT", "1.040"))
 MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET = float(os.environ.get("MARKET_TAPE_ALPHA_MIN_AVG_EXIT_NET", "0.020"))
@@ -1412,6 +1414,7 @@ MARKET_TAPE_ALPHA_CONTEXT_COOLDOWN_SEC = float(os.environ.get("MARKET_TAPE_ALPHA
 COPY_TRADE_WS_IDLE_RECONNECT_SEC = float(os.environ.get("COPY_TRADE_WS_IDLE_RECONNECT_SEC", "45.0"))
 MARKET_TAPE_ENABLED = os.environ.get("MARKET_TAPE_ENABLED", "1") == "1"
 MARKET_TAPE_ALL_PUMP = os.environ.get("MARKET_TAPE_ALL_PUMP", "1") == "1"
+MARKET_TAPE_RAW_ENTRY_ENABLED = os.environ.get("MARKET_TAPE_RAW_ENTRY_ENABLED", "0") == "1"
 MARKET_TAPE_AMOUNT_SOL = float(os.environ.get("MARKET_TAPE_AMOUNT_SOL", "0.0125"))
 MARKET_TAPE_WINDOW_MS = int(os.environ.get("MARKET_TAPE_WINDOW_MS", "1200"))
 MARKET_TAPE_MIN_UNIQUE = int(os.environ.get("MARKET_TAPE_MIN_UNIQUE", "4"))
@@ -3672,7 +3675,8 @@ async def session_reporter():
                 f"no_px={s.get('mt_no_price', 0)} "
                 f"ratio={s.get('mt_ratio', 0)} stale={s.get('mt_stale', 0)} "
                 f"close={s.get('mt_recent_close', 0)} "
-                f"confirm={s.get('mt_confirm', 0)} trig={s.get('market_tape_triggers', 0)} ===")
+                f"confirm={s.get('mt_confirm', 0)} raw_off={s.get('mt_raw_off', 0)} "
+                f"trig={s.get('market_tape_triggers', 0)} ===")
             log(f"=== MOONSHOT-GATES: age={s.get('moon_age', 0)} flow={s.get('moon_flow', 0)} "
                 f"sell={s.get('moon_sell', 0)} no_bc={s.get('moon_no_bc', 0)} "
                 f"complete={s.get('moon_complete', 0)} move_lo={s.get('moon_move_low', 0)} "
@@ -7928,6 +7932,15 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
                 log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: price_ratio={alpha_price_ratio:.3f}x "
                     f"outside {MARKET_TAPE_MIN_PRICE_RATIO:.2f}-{MARKET_TAPE_MAX_PRICE_RATIO:.2f}x")
                 return
+            if (alpha_price_ratio < MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO
+                    or alpha_price_ratio > MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO):
+                _market_tape_ratio_violation_until[mint] = now_ms + int(MARKET_TAPE_RATIO_VIOLATION_COOLDOWN_SEC * 1000)
+                _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+                _mt_gate("mt_alpha_ratio")
+                log(f"  MARKET-TAPE-ALPHA BLOCK {mint[:8]}: hard price_ratio={alpha_price_ratio:.3f}x "
+                    f"outside alpha-bypass band {MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO:.2f}-"
+                    f"{MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO:.2f}x")
+                return
             log(f"  MARKET-TAPE-ALPHA RATIO-BYPASS {mint[:8]}: price_ratio={alpha_price_ratio:.3f}x "
                 f"ctx={alpha_plan.get('context', '')}")
         if not alpha_cached_price or alpha_cached_price[1] or alpha_cached_price[0] <= 0:
@@ -8228,6 +8241,17 @@ async def _handle_market_tape_trade(client: Client, kp: Optional[Keypair], sig: 
             log(f"  MARKET-TAPE BLOCK {mint[:8]}: concurrent price_ratio violation "
                 f"cooldown {(ratio_block_until - post_confirm_ms) / 1000:.1f}s")
             return
+
+    if not MARKET_TAPE_RAW_ENTRY_ENABLED:
+        _copy_trade_stats["market_tape_blocked"] = _copy_trade_stats.get("market_tape_blocked", 0) + 1
+        _mt_gate("mt_raw_off")
+        label = "MARKET-TAPE-BIRTH" if birth_lane else (
+            "MARKET-TAPE-SCOUT" if entry_launchpad == "market_tape_scout" else "MARKET-TAPE"
+        )
+        log(f"  {label} BLOCK {mint[:8]}: raw tape entry disabled; alpha/moonshot lanes only "
+            f"unique={len(unique_buyers)} tracked={effective_tracked_count} "
+            f"buy={buy_sol:.3f} bc={move_mult:.3f}x")
+        return
 
     graduated_seen.add(mint)
     if len(graduated_seen) > 500:
@@ -8962,6 +8986,8 @@ async def main():
                 f"low-sample n<{MARKET_TAPE_ALPHA_LOW_SAMPLE_N} requires "
                 f"WR>={MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_WR:.0%}/"
                 f"avg_exit>={MARKET_TAPE_ALPHA_LOW_SAMPLE_MIN_AVG_EXIT:+.1%}, "
+                f"alpha ratio-bypass hard band {MARKET_TAPE_ALPHA_MIN_BYPASS_PRICE_RATIO:.2f}-"
+                f"{MARKET_TAPE_ALPHA_MAX_BYPASS_PRICE_RATIO:.2f}x, "
                 f"and confirm>={MARKET_TAPE_ALPHA_CONFIRM_MIN_MULT:.3f}x/"
                 f"{MARKET_TAPE_ALPHA_CONFIRM_DELAY_SEC:.2f}s; strong avg-exit buckets may retain "
                 f"{MARKET_TAPE_ALPHA_RETAIN_CONFIRM_MULT:.3f}x and bypass static ratio/move guards "
@@ -8973,9 +8999,12 @@ async def main():
     log(f"=== V41.19 MARKET-WIDE TAPE SCALPER ===")
     log(f"  {'ENABLED' if MARKET_TAPE_ENABLED else 'DISABLED'}: parse "
         f"{'ALL pump.fun shreds' if MARKET_TAPE_ALL_PUMP else 'tracked-wallet shreds'} into sub-second per-mint buy/sell tape.")
-    log(f"  Entry: {MARKET_TAPE_AMOUNT_SOL:.4f} SOL when {MARKET_TAPE_MIN_UNIQUE}+ unique buyers, "
-        f"{MARKET_TAPE_MIN_TRACKED}+ active sniper, buy>={MARKET_TAPE_MIN_BUY_SOL:.3f} SOL, "
-        f"sell<={MARKET_TAPE_MAX_SELL_SOL:.3f} SOL in {MARKET_TAPE_WINDOW_MS}ms.")
+    if MARKET_TAPE_RAW_ENTRY_ENABLED:
+        log(f"  Raw tape entry: {MARKET_TAPE_AMOUNT_SOL:.4f} SOL when {MARKET_TAPE_MIN_UNIQUE}+ unique buyers, "
+            f"{MARKET_TAPE_MIN_TRACKED}+ active sniper, buy>={MARKET_TAPE_MIN_BUY_SOL:.3f} SOL, "
+            f"sell<={MARKET_TAPE_MAX_SELL_SOL:.3f} SOL in {MARKET_TAPE_WINDOW_MS}ms.")
+    else:
+        log("  Raw tape entries: DISABLED; tape now feeds learned alpha and moonshot ignition only.")
     log(f"  Curve gate: bc-cache move {MARKET_TAPE_MIN_BC_MOVE:.3f}x-{MARKET_TAPE_MAX_BC_MOVE:.3f}x, "
         f"cache <= {MARKET_TAPE_BC_CACHE_MAX_AGE_MS}ms. TP={MARKET_TAPE_TP_MULT:.3f}x, "
         f"fast-kill {MARKET_TAPE_FAST_KILL_SEC:.1f}s if peak<{MARKET_TAPE_FAST_KILL_PEAK:.3f}x.")
