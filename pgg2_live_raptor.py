@@ -99,6 +99,7 @@ class RaptorLiveBroker(PaperBroker):
         self.quote_simulate = env_bool("PGG2_QUOTE_SIMULATE", True)
         self.quote_shadow_positions = env_bool("PGG2_QUOTE_SHADOW_POSITIONS", False)
         self.quote_roundtrip_overhead_sol = env_float("PGG2_QUOTE_ROUNDTRIP_OVERHEAD_SOL", 0.00235)
+        self.quote_shadow_tokens: dict[str, float] = {}
         self.fast_paper_accounting = env_bool("PGG2_LIVE_FAST_PAPER_ACCOUNTING", False)
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
@@ -343,17 +344,18 @@ class RaptorLiveBroker(PaperBroker):
                     signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
                     self.simulate_signed(signed_b64)
                 if self.quote_shadow_positions:
-                    tokens = self.rate_amount_out(quote)
-                    if tokens <= 0:
+                    quote_tokens = self.rate_amount_out(quote)
+                    if quote_tokens <= 0:
                         raise RuntimeError("quote shadow buy missing positive amountOut")
                     fill_price = price * (1.0 + self.drag)
+                    paper_tokens = amount / max(fill_price, 1e-18)
                     pos = Position(
                         mint=plan.mint,
                         state="SCOUT",
                         opened_ts_ms=ts_ms,
                         avg_price=fill_price,
-                        tokens_bought=tokens,
-                        remaining_tokens=tokens,
+                        tokens_bought=paper_tokens,
+                        remaining_tokens=paper_tokens,
                         cost_sol=amount,
                         scout_sol=amount,
                         target_sol=min(plan.target_sol, self.max_trade_sol),
@@ -363,10 +365,11 @@ class RaptorLiveBroker(PaperBroker):
                         last_price=fill_price,
                     )
                     self.positions[plan.mint] = pos
+                    self.quote_shadow_tokens[plan.mint] = quote_tokens
                     self.stats.scouts += 1
                     log(
                         f"PGG2-QUOTE-SHADOW-BUY {short_addr(plan.mint)} lane={plan.lane} "
-                        f"cost={amount:.6f} tokens={tokens:.6f} fill={fill_price:.9e} "
+                        f"cost={amount:.6f} quote_tokens={quote_tokens:.6f} fill={fill_price:.9e} "
                         f"score={plan.score:.1f}"
                     )
                     self.save_state()
@@ -436,7 +439,9 @@ class RaptorLiveBroker(PaperBroker):
         try:
             sell_amount: Any = "auto"
             if self.quote_only and self.quote_shadow_positions:
-                sell_amount = round(pos.remaining_tokens, 9)
+                quote_tokens = self.quote_shadow_tokens.get(mint, pos.remaining_tokens)
+                remaining_fraction = pos.remaining_tokens / max(pos.tokens_bought, 1e-18)
+                sell_amount = round(quote_tokens * remaining_fraction, 9)
             quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
             expected_out = self.rate_amount_out(quote)
             if (
@@ -456,6 +461,7 @@ class RaptorLiveBroker(PaperBroker):
                     self.simulate_signed(signed_b64)
                 if self.quote_shadow_positions:
                     self.positions.pop(mint, None)
+                    self.quote_shadow_tokens.pop(mint, None)
                     overhead = self.quote_roundtrip_overhead_sol
                     proceeds = max(0.0, expected_out - overhead)
                     pnl = pos.realized_sol + proceeds - pos.cost_sol
