@@ -397,6 +397,22 @@ class RaptorLiveBroker(PaperBroker):
             pos.update(price)
         try:
             quote = self.build_swap(mint, SOL_MINT, "auto", self.sell_slippage)
+            expected_out = 0.0
+            try:
+                expected_out = float((quote.get("rate") or {}).get("amountOut") or 0.0)
+            except Exception:
+                expected_out = 0.0
+            if (
+                self.mode == "live"
+                and not killed
+                and expected_out > 0.0
+                and expected_out < pos.cost_sol + env_float("PGG2_LIVE_MIN_PROFIT_EXIT_SOL", 0.0)
+            ):
+                log(
+                    f"PGG2-LIVE-SELL-HOLD {short_addr(mint)} reason={reason} "
+                    f"quote_out={expected_out:.6f} cost={pos.cost_sol:.6f}"
+                )
+                return None
             if self.quote_only:
                 if self.quote_simulate and self.keypair:
                     signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
@@ -407,15 +423,10 @@ class RaptorLiveBroker(PaperBroker):
             if not self.simulate_signed(signed_b64):
                 return None
             sig = self.send_signed(signed_b64)
-            if self.fast_paper_accounting:
-                wallet_delta = 0.0
-                fill_price = max(price, 0.0) * (1.0 - self.drag)
-                proceeds = pos.remaining_tokens * fill_price
-            else:
-                if not self.wait_confirmed(sig):
-                    return None
-                wallet_delta = self.transaction_wallet_delta_sol(sig)
-                proceeds = max(0.0, wallet_delta)
+            if not self.wait_confirmed(sig):
+                return None
+            wallet_delta = self.transaction_wallet_delta_sol(sig)
+            proceeds = max(0.0, wallet_delta)
             self.positions.pop(mint, None)
             pnl = pos.realized_sol + proceeds - pos.cost_sol
             self.stats.realized_pnl_sol += pnl
