@@ -50,6 +50,9 @@ export PGG2_LIVE_TX_VERSION=legacy
 # Paper did not do an extra RPC simulation before entry. Keep live execution fast
 # and let sendTransaction's normal preflight handle invalid transactions.
 export PGG2_LIVE_SIMULATE_BEFORE_SEND=0
+# Make strategy accounting match paper mode immediately after sendTransaction,
+# instead of waiting on confirmation/metadata and changing the bot's timing.
+export PGG2_LIVE_FAST_PAPER_ACCOUNTING=1
 export PGG2_LIVE_RPC_URL="${PGG2_LIVE_RPC_URL:-https://api.mainnet-beta.solana.com}"
 
 export PIGGY_STATE_FILE="/root/piggy/data/${RUNID}_state.json"

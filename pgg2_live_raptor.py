@@ -97,6 +97,7 @@ class RaptorLiveBroker(PaperBroker):
         self.tx_version = env_str("PGG2_LIVE_TX_VERSION", "legacy")
         self.simulate_before_send = env_bool("PGG2_LIVE_SIMULATE_BEFORE_SEND", True)
         self.quote_simulate = env_bool("PGG2_QUOTE_SIMULATE", True)
+        self.fast_paper_accounting = env_bool("PGG2_LIVE_FAST_PAPER_ACCOUNTING", False)
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
             f"PGG2-LIVE: mode={self.mode.upper()} wallet={short_addr(self.public_key)} "
@@ -340,17 +341,22 @@ class RaptorLiveBroker(PaperBroker):
                 self.closed_recent[plan.mint] = ts_ms
                 return None
             sig = self.send_signed(signed_b64)
-            if not self.wait_confirmed(sig):
-                self.closed_recent[plan.mint] = ts_ms
-                return None
-            wallet_delta = self.transaction_wallet_delta_sol(sig)
-            actual_cost = max(amount, -wallet_delta)
-            tokens = actual_cost / max(price, 1e-18)
+            if self.fast_paper_accounting:
+                wallet_delta = -amount
+                actual_cost = amount
+            else:
+                if not self.wait_confirmed(sig):
+                    self.closed_recent[plan.mint] = ts_ms
+                    return None
+                wallet_delta = self.transaction_wallet_delta_sol(sig)
+                actual_cost = max(amount, -wallet_delta)
+            fill_price = price * (1.0 + self.drag)
+            tokens = actual_cost / max(fill_price, 1e-18)
             pos = Position(
                 mint=plan.mint,
                 state="SCOUT",
                 opened_ts_ms=ts_ms,
-                avg_price=price,
+                avg_price=fill_price,
                 tokens_bought=tokens,
                 remaining_tokens=tokens,
                 cost_sol=actual_cost,
@@ -358,8 +364,8 @@ class RaptorLiveBroker(PaperBroker):
                 target_sol=min(plan.target_sol, self.max_trade_sol),
                 lane=plan.lane,
                 reason=plan.reason,
-                peak_price=price,
-                last_price=price,
+                peak_price=fill_price,
+                last_price=fill_price,
             )
             self.positions[plan.mint] = pos
             self.stats.scouts += 1
@@ -401,10 +407,15 @@ class RaptorLiveBroker(PaperBroker):
             if not self.simulate_signed(signed_b64):
                 return None
             sig = self.send_signed(signed_b64)
-            if not self.wait_confirmed(sig):
-                return None
-            wallet_delta = self.transaction_wallet_delta_sol(sig)
-            proceeds = max(0.0, wallet_delta)
+            if self.fast_paper_accounting:
+                wallet_delta = 0.0
+                fill_price = max(price, 0.0) * (1.0 - self.drag)
+                proceeds = pos.remaining_tokens * fill_price
+            else:
+                if not self.wait_confirmed(sig):
+                    return None
+                wallet_delta = self.transaction_wallet_delta_sol(sig)
+                proceeds = max(0.0, wallet_delta)
             self.positions.pop(mint, None)
             pnl = pos.realized_sol + proceeds - pos.cost_sol
             self.stats.realized_pnl_sol += pnl
