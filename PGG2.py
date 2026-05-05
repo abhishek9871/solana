@@ -64,9 +64,12 @@ class WaveArm:
 def piggy_config(args: argparse.Namespace) -> BaseConfig:
     load_dotenv()
     base = BaseConfig.from_env(args)
+    execution_mode = env_str("PGG2_EXECUTION_MODE", "paper").lower()
+    paper_mode = execution_mode == "paper" and env_bool("PIGGY_PAPER_TRADING", True)
     return replace(
         base,
-        paper_trading=env_bool("PIGGY_PAPER_TRADING", True),
+        paper_trading=paper_mode,
+        live_enabled=execution_mode in {"quote", "live"} and env_bool("PGG2_ENABLE_LIVE", False),
         report_sec=env_float("PIGGY_REPORT_SEC", 3.0),
         heartbeat_sec=env_float("PIGGY_HEARTBEAT_SEC", 0.020),
         curve_max_age_ms=env_int("PIGGY_CURVE_MAX_AGE_MS", 650),
@@ -95,6 +98,10 @@ def piggy_config(args: argparse.Namespace) -> BaseConfig:
 class SameBlockPiggybackBot(BirthFirstSniper):
     def __init__(self, config: BaseConfig) -> None:
         super().__init__(config)
+        if not config.paper_trading:
+            from pgg2_live_raptor import RaptorLiveBroker
+
+            self.broker = RaptorLiveBroker(config)
         self.wave_arms: dict[str, WaveArm] = {}
         self.position_follow: dict[str, dict[str, Any]] = {}
         self.profitable_closes: dict[str, dict[str, float]] = {}
@@ -1878,10 +1885,11 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             self.broker.save_state()
 
     async def run(self) -> None:
-        if not self.config.paper_trading:
-            raise RuntimeError("Live execution is gated. Validate paper/replay first, then wire the Raptor executor.")
+        if not self.config.paper_trading and not self.config.live_enabled:
+            raise RuntimeError("Live execution is gated. Set PGG2_EXECUTION_MODE=quote first, then explicit live gates.")
+        mode = "PAPER" if self.config.paper_trading else env_str("PGG2_EXECUTION_MODE", "quote").upper()
         log(
-            f"PIGGY: starting PAPER scout={self.config.scout_sol:.4f} max_pos={self.config.max_position_sol:.4f} "
+            f"PIGGY: starting {mode} scout={self.config.scout_sol:.4f} max_pos={self.config.max_position_sol:.4f} "
             f"cluster_age={self.config.birth_max_age_ms}ms max_open={self.config.max_open_positions}"
         )
         await super().run()
