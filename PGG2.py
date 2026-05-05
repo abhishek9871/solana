@@ -855,6 +855,16 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         ):
             return None
 
+        # Live tape filter: birth-fanout winners had sustained 700ms breadth at
+        # entry, while most losses were thin or top-heavy in the immediate tape.
+        s700_live = features.get("s700") or {}
+        live_unique700 = int(s700_live.get("unique_buyers") or 0)
+        live_top700 = float(s700_live.get("top_buy_share") or 1.0)
+        if live_unique700 < env_int("PGG2_BIRTH_FANOUT_MIN_LIVE_BUYERS700", 7):
+            return None
+        if live_top700 > env_float("PGG2_BIRTH_FANOUT_MAX_LIVE_TOP700", 0.62):
+            return None
+
         scout = env_float("PGG2_BIRTH_FANOUT_SOL", max(0.0005, self.config.scout_sol * 0.50))
         scout = min(self.config.max_position_sol, max(0.0005, scout))
         score = (
@@ -867,7 +877,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         reason = (
             f"birth_fanout first_age={ctx['first_price_age_ms']}ms "
             f"b1500={ctx['post1500_buy_sol']:.3f}/{ctx['post1500_unique_buyers']} "
-            f"top={ctx['post1500_top_share']:.2f} move={ctx['entry_move_from_first']:.2f}x"
+            f"top={ctx['post1500_top_share']:.2f} live700={live_unique700} top={live_top700:.2f} "
+            f"move={ctx['entry_move_from_first']:.2f}x"
         )
         plan = StrikePlan(
             mint=event.mint,
@@ -884,6 +895,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         plan.features.update(
             {
                 "birth_fanout": ctx,
+                "birth_fanout_live_unique700": live_unique700,
+                "birth_fanout_live_top700": live_top700,
                 "entry_size_reason": "birth_fanout_probe",
                 "entry_probe_sol": scout,
             }
