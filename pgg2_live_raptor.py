@@ -97,6 +97,8 @@ class RaptorLiveBroker(PaperBroker):
         self.tx_version = env_str("PGG2_LIVE_TX_VERSION", "legacy")
         self.simulate_before_send = env_bool("PGG2_LIVE_SIMULATE_BEFORE_SEND", True)
         self.quote_simulate = env_bool("PGG2_QUOTE_SIMULATE", True)
+        self.quote_shadow_positions = env_bool("PGG2_QUOTE_SHADOW_POSITIONS", False)
+        self.quote_roundtrip_overhead_sol = env_float("PGG2_QUOTE_ROUNDTRIP_OVERHEAD_SOL", 0.00235)
         self.fast_paper_accounting = env_bool("PGG2_LIVE_FAST_PAPER_ACCOUNTING", False)
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
@@ -231,6 +233,13 @@ class RaptorLiveBroker(PaperBroker):
         )
         return out
 
+    @staticmethod
+    def rate_amount_out(quote: dict[str, Any]) -> float:
+        try:
+            return float((quote.get("rate") or {}).get("amountOut") or 0.0)
+        except Exception:
+            return 0.0
+
     def sign_transaction(self, txn_b64: str) -> tuple[str, str]:
         if not self.keypair:
             raise RuntimeError("cannot sign without keypair")
@@ -333,6 +342,35 @@ class RaptorLiveBroker(PaperBroker):
                 if self.quote_simulate and self.keypair:
                     signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
                     self.simulate_signed(signed_b64)
+                if self.quote_shadow_positions:
+                    tokens = self.rate_amount_out(quote)
+                    if tokens <= 0:
+                        raise RuntimeError("quote shadow buy missing positive amountOut")
+                    fill_price = price * (1.0 + self.drag)
+                    pos = Position(
+                        mint=plan.mint,
+                        state="SCOUT",
+                        opened_ts_ms=ts_ms,
+                        avg_price=fill_price,
+                        tokens_bought=tokens,
+                        remaining_tokens=tokens,
+                        cost_sol=amount,
+                        scout_sol=amount,
+                        target_sol=min(plan.target_sol, self.max_trade_sol),
+                        lane=plan.lane,
+                        reason=plan.reason,
+                        peak_price=fill_price,
+                        last_price=fill_price,
+                    )
+                    self.positions[plan.mint] = pos
+                    self.stats.scouts += 1
+                    log(
+                        f"PGG2-QUOTE-SHADOW-BUY {short_addr(plan.mint)} lane={plan.lane} "
+                        f"cost={amount:.6f} tokens={tokens:.6f} fill={fill_price:.9e} "
+                        f"score={plan.score:.1f}"
+                    )
+                    self.save_state()
+                    return pos
                 log(f"PGG2-LIVE-QUOTE-ONLY-BUY {short_addr(plan.mint)} lane={plan.lane} amount={amount:.6f}")
                 self.closed_recent[plan.mint] = ts_ms
                 return None
@@ -396,12 +434,11 @@ class RaptorLiveBroker(PaperBroker):
         if price > 0:
             pos.update(price)
         try:
-            quote = self.build_swap(mint, SOL_MINT, "auto", self.sell_slippage)
-            expected_out = 0.0
-            try:
-                expected_out = float((quote.get("rate") or {}).get("amountOut") or 0.0)
-            except Exception:
-                expected_out = 0.0
+            sell_amount: Any = "auto"
+            if self.quote_only and self.quote_shadow_positions:
+                sell_amount = round(pos.remaining_tokens, 9)
+            quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
+            expected_out = self.rate_amount_out(quote)
             if (
                 self.mode == "live"
                 and not killed
@@ -417,6 +454,31 @@ class RaptorLiveBroker(PaperBroker):
                 if self.quote_simulate and self.keypair:
                     signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
                     self.simulate_signed(signed_b64)
+                if self.quote_shadow_positions:
+                    self.positions.pop(mint, None)
+                    overhead = self.quote_roundtrip_overhead_sol
+                    proceeds = max(0.0, expected_out - overhead)
+                    pnl = pos.realized_sol + proceeds - pos.cost_sol
+                    self.stats.realized_pnl_sol += pnl
+                    self.stats.closes += 1
+                    if killed:
+                        self.stats.kills += 1
+                    if pnl >= 0:
+                        self.stats.wins += 1
+                        self.consecutive_losses = 0
+                    else:
+                        self.stats.losses += 1
+                        self.consecutive_losses += 1
+                    self.stats.best_mult = max(self.stats.best_mult, pos.peak_mult)
+                    self.closed_recent[mint] = ts_ms
+                    log(
+                        f"PGG2-QUOTE-SHADOW-SELL {short_addr(mint)} reason={reason} "
+                        f"quote_out={expected_out:.6f} overhead={overhead:.6f} "
+                        f"proceeds={proceeds:.6f} pnl={pnl:+.6f} "
+                        f"session={self.stats.realized_pnl_sol:+.6f}"
+                    )
+                    self.save_state()
+                    return pnl
                 log(f"PGG2-LIVE-QUOTE-ONLY-SELL {short_addr(mint)} reason={reason}")
                 return None
             signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
