@@ -114,6 +114,26 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             "curve_lag_reveal",
         }
 
+    def recent_profit_reentry_locked(self, mint: str, ts_ms: int) -> bool:
+        prior = self.profitable_closes.get(mint)
+        if not prior:
+            return False
+        block_ms = env_int(
+            "PGG2_PROFIT_REENTRY_BLOCK_MS",
+            env_int("PIGGY_PROFIT_REENTRY_BLOCK_MS", 900000),
+        )
+        if ts_ms - int(prior["ts_ms"]) > block_ms:
+            return False
+        if not env_bool(
+            "PGG2_PROFIT_REENTRY_LOCK_AFTER_WIN",
+            env_bool("PIGGY_PROFIT_REENTRY_LOCK_AFTER_WIN", True),
+        ):
+            return False
+        return float(prior.get("pnl_sol") or 0.0) >= env_float(
+            "PGG2_PROFIT_REENTRY_LOCK_MIN_PNL_SOL",
+            0.001,
+        )
+
     def profit_reentry_blocked(
         self,
         mint: str,
@@ -126,13 +146,10 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         prior = self.profitable_closes.get(mint)
         if not prior:
             return False
+        if self.recent_profit_reentry_locked(mint, ts_ms):
+            return True
         if ts_ms - int(prior["ts_ms"]) > env_int("PIGGY_PROFIT_REENTRY_BLOCK_MS", 900000):
             return False
-        if (
-            env_bool("PIGGY_PROFIT_REENTRY_LOCK_AFTER_WIN", True)
-            and float(prior.get("pnl_sol") or 0.0) >= env_float("PIGGY_PROFIT_REENTRY_LOCK_MIN_PNL_SOL", 0.025)
-        ):
-            return True
         overextended = base_move >= env_float("PIGGY_PROFIT_REENTRY_BLOCK_BASE_MOVE", 3.0)
         reclaim_like = reclaim_strength or late_reclaim_trigger or age_ms > env_int("PIGGY_SECOND_MAX_REGULAR_AGE_MS", 15000)
         return overextended and reclaim_like
@@ -808,6 +825,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return None
         if not event.is_buy or event.mint in self.birth_fanout_seen:
             return None
+        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
+            return None
         if event.mint in self.broker.positions or event.mint in self.broker.pending:
             return None
         if features.get("complete"):
@@ -887,6 +906,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return None
         if not event.is_buy or event.mint in self.curve_lag_reveal_seen:
             return None
+        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
+            return None
         if event.mint in self.broker.positions or event.mint in self.broker.pending:
             return None
         if features.get("complete") or not features.get("has_curve"):
@@ -932,8 +953,22 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if follow_sell_sol > max(0.010, follow_buy_sol * env_float("PGG2_CURVE_LAG_MAX_FOLLOW_SELL_RATIO", 0.15)):
             return None
 
+        # The live tape showed curve-lag losses clustered in weak current 700ms
+        # breadth. Keep the lane fast, but require the reveal to still have
+        # real live buy pressure at the decision moment.
+        s700_live = features.get("s700") or {}
+        live_buy700 = float(s700_live.get("buy_sol") or 0.0)
+        live_unique700 = int(s700_live.get("unique_buyers") or 0)
+        live_top700 = float(s700_live.get("top_buy_share") or 1.0)
+        if live_buy700 < env_float("PGG2_CURVE_LAG_MIN_LIVE_BUY700_SOL", 5.0):
+            return None
+        if live_unique700 < env_int("PGG2_CURVE_LAG_MIN_LIVE_BUYERS700", 5):
+            return None
+        if live_top700 > env_float("PGG2_CURVE_LAG_MAX_LIVE_TOP700", 0.70):
+            return None
+
         entry_move_from_first = price / max(arm.first_price, 1e-18)
-        if entry_move_from_first > env_float("PGG2_CURVE_LAG_MAX_ENTRY_MOVE", 2.75):
+        if entry_move_from_first > env_float("PGG2_CURVE_LAG_MAX_ENTRY_MOVE", 1.25):
             return None
 
         scout = min(
@@ -944,13 +979,16 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             120.0
             + min(55.0, follow_buy_sol * 6.0)
             + min(35.0, follow_unique * 4.0)
+            + min(40.0, live_buy700 * 4.0)
             + max(0.0, entry_move_from_first - 1.0) * 70.0
             - max(0.0, follow_top - 0.45) * 45.0
         )
         reason = (
             f"curve_lag_reveal arm={arm_age_ms}ms first_age={first_price_age_ms}ms "
             f"init={arm.initial_slot_buy_sol:.2f}/{arm.initial_slot_buyers} top={arm.initial_slot_top_share:.2f} "
-            f"follow={follow_buy_sol:.2f}/{follow_unique} top={follow_top:.2f} move={entry_move_from_first:.2f}x"
+            f"follow={follow_buy_sol:.2f}/{follow_unique} top={follow_top:.2f} "
+            f"live700={live_buy700:.2f}/{live_unique700} top={live_top700:.2f} "
+            f"move={entry_move_from_first:.2f}x"
         )
         plan = StrikePlan(
             mint=event.mint,
@@ -970,6 +1008,9 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 "arm_first_price_ts_ms": arm.first_price_ts_ms,
                 "entry_move_from_first": entry_move_from_first,
                 "curve_lag_follow": follow,
+                "curve_lag_live_buy700": live_buy700,
+                "curve_lag_live_unique700": live_unique700,
+                "curve_lag_live_top700": live_top700,
                 "entry_size_reason": "curve_lag_reveal_probe",
                 "entry_probe_sol": scout,
             }
