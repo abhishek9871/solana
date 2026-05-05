@@ -94,6 +94,7 @@ class RaptorLiveBroker(PaperBroker):
         self.priority_level = env_str("PGG2_LIVE_PRIORITY_LEVEL", "high")
         self.tx_version = env_str("PGG2_LIVE_TX_VERSION", "legacy")
         self.simulate_before_send = env_bool("PGG2_LIVE_SIMULATE_BEFORE_SEND", True)
+        self.quote_simulate = env_bool("PGG2_QUOTE_SIMULATE", True)
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
             f"PGG2-LIVE: mode={self.mode.upper()} wallet={short_addr(self.public_key)} "
@@ -284,6 +285,9 @@ class RaptorLiveBroker(PaperBroker):
             balance_before = self.balance_sol() if not self.quote_only else 0.0
             quote = self.build_swap(SOL_MINT, plan.mint, round(amount, 9), self.buy_slippage)
             if self.quote_only:
+                if self.quote_simulate and self.keypair:
+                    signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
+                    self.simulate_signed(signed_b64)
                 log(f"PGG2-LIVE-QUOTE-ONLY-BUY {short_addr(plan.mint)} lane={plan.lane} amount={amount:.6f}")
                 self.closed_recent[plan.mint] = ts_ms
                 return None
@@ -345,6 +349,9 @@ class RaptorLiveBroker(PaperBroker):
             balance_before = self.balance_sol()
             quote = self.build_swap(mint, SOL_MINT, "auto", self.sell_slippage)
             if self.quote_only:
+                if self.quote_simulate and self.keypair:
+                    signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
+                    self.simulate_signed(signed_b64)
                 log(f"PGG2-LIVE-QUOTE-ONLY-SELL {short_addr(mint)} reason={reason}")
                 return None
             signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
