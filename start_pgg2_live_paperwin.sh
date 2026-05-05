@@ -53,7 +53,7 @@ export PGG2_LIVE_SIMULATE_BEFORE_SEND=0
 # Enter management immediately after buy sendTransaction, matching paper timing.
 # Sells still use exact wallet delta and refuse false profit exits.
 export PGG2_LIVE_FAST_PAPER_ACCOUNTING=1
-export PGG2_LIVE_MIN_PROFIT_EXIT_SOL=0.0000
+export PGG2_LIVE_MIN_PROFIT_EXIT_SOL=0.00235
 export PGG2_LIVE_RPC_URL="${PGG2_LIVE_RPC_URL:-https://api.mainnet-beta.solana.com}"
 
 export PIGGY_STATE_FILE="/root/piggy/data/${RUNID}_state.json"

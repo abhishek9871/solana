@@ -241,6 +241,18 @@ class RaptorLiveBroker(PaperBroker):
         except Exception:
             return 0.0
 
+    @staticmethod
+    def profit_exit_reason(reason: str) -> bool:
+        return reason in {
+            "first_pop_sell_exit",
+            "moonshot_pop_after_sell",
+            "moonshot_decay_55",
+            "late_reclaim_probe_pop_bank",
+            "runner_3x_decay",
+            "runner_flow_decay",
+            "runner_stalled_after_sell",
+        }
+
     def sign_transaction(self, txn_b64: str) -> tuple[str, str]:
         if not self.keypair:
             raise RuntimeError("cannot sign without keypair")
@@ -445,14 +457,20 @@ class RaptorLiveBroker(PaperBroker):
             quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
             expected_out = self.rate_amount_out(quote)
             if (
-                self.mode == "live"
-                and not killed
+                (self.mode == "live" or self.quote_shadow_positions)
+                and self.profit_exit_reason(reason)
                 and expected_out > 0.0
-                and expected_out < pos.cost_sol + env_float("PGG2_LIVE_MIN_PROFIT_EXIT_SOL", 0.0)
+                and expected_out
+                < pos.cost_sol
+                + env_float(
+                    "PGG2_LIVE_MIN_PROFIT_EXIT_SOL",
+                    self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0,
+                )
             ):
                 log(
                     f"PGG2-LIVE-SELL-HOLD {short_addr(mint)} reason={reason} "
-                    f"quote_out={expected_out:.6f} cost={pos.cost_sol:.6f}"
+                    f"quote_out={expected_out:.6f} cost={pos.cost_sol:.6f} "
+                    f"need={pos.cost_sol + env_float('PGG2_LIVE_MIN_PROFIT_EXIT_SOL', self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0):.6f}"
                 )
                 return None
             if self.quote_only:
