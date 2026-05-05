@@ -30,6 +30,7 @@ from birth_first_sniper import (
 
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+LAMPORTS_PER_SOL = 1_000_000_000
 
 
 def b58encode(raw: bytes) -> str:
@@ -84,6 +85,7 @@ class RaptorLiveBroker(PaperBroker):
             if not self.keypair:
                 raise RuntimeError("PGG2 live mode needs a keypair file; pubkey alone is quote-only")
         self.max_trade_sol = env_float("PGG2_LIVE_MAX_TRADE_SOL", 0.005)
+        self.min_trade_sol = min(self.max_trade_sol, env_float("PGG2_LIVE_MIN_TRADE_SOL", self.max_trade_sol))
         self.min_wallet_reserve_sol = env_float("PGG2_LIVE_MIN_WALLET_RESERVE_SOL", 0.040)
         self.max_session_loss_sol = env_float("PGG2_LIVE_MAX_SESSION_LOSS_SOL", 0.020)
         self.max_consecutive_losses = env_int("PGG2_LIVE_MAX_CONSECUTIVE_LOSSES", 2)
@@ -98,7 +100,8 @@ class RaptorLiveBroker(PaperBroker):
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
             f"PGG2-LIVE: mode={self.mode.upper()} wallet={short_addr(self.public_key)} "
-            f"max_trade={self.max_trade_sol:.4f} reserve={self.min_wallet_reserve_sol:.4f} "
+            f"min_trade={self.min_trade_sol:.4f} max_trade={self.max_trade_sol:.4f} "
+            f"reserve={self.min_wallet_reserve_sol:.4f} "
             f"session_loss_cap={self.max_session_loss_sol:.4f}"
         )
 
@@ -164,7 +167,42 @@ class RaptorLiveBroker(PaperBroker):
 
     def balance_sol(self) -> float:
         lamports = int(self.rpc("getBalance", [self.public_key]).get("value") or 0)
-        return lamports / 1_000_000_000
+        return lamports / LAMPORTS_PER_SOL
+
+    def transaction_wallet_delta_sol(self, sig: str) -> float:
+        deadline = time.time() + env_float("PGG2_LIVE_TX_META_TIMEOUT_SEC", 15.0)
+        while time.time() < deadline:
+            result = self.rpc(
+                "getTransaction",
+                [
+                    sig,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            )
+            if result:
+                meta = result.get("meta") or {}
+                tx = result.get("transaction") or {}
+                message = tx.get("message") or {}
+                keys = message.get("accountKeys") or []
+                wallet_idx = None
+                for idx, key in enumerate(keys):
+                    pubkey = key.get("pubkey") if isinstance(key, dict) else str(key)
+                    if pubkey == self.public_key:
+                        wallet_idx = idx
+                        break
+                if wallet_idx is None:
+                    raise RuntimeError(f"tx {sig} missing wallet account {short_addr(self.public_key)}")
+                pre = meta.get("preBalances") or []
+                post = meta.get("postBalances") or []
+                if wallet_idx >= len(pre) or wallet_idx >= len(post):
+                    raise RuntimeError(f"tx {sig} missing wallet balance index {wallet_idx}")
+                return (int(post[wallet_idx]) - int(pre[wallet_idx])) / LAMPORTS_PER_SOL
+            time.sleep(0.35)
+        raise RuntimeError(f"tx {sig} metadata unavailable after confirmation")
 
     def build_swap(self, from_mint: str, to_mint: str, amount: Any, slippage: float) -> dict[str, Any]:
         params: dict[str, Any] = {
@@ -261,7 +299,14 @@ class RaptorLiveBroker(PaperBroker):
         if self.consecutive_losses >= self.max_consecutive_losses:
             log(f"PGG2-LIVE-BLOCK consecutive_losses={self.consecutive_losses}")
             return None
-        amount = max(0.0005, min(float(requested_sol), self.max_trade_sol))
+        requested = max(0.0, float(requested_sol))
+        amount = min(requested, self.max_trade_sol)
+        if amount < self.min_trade_sol:
+            log(
+                f"PGG2-LIVE-BLOCK requested_below_min requested={requested:.6f} "
+                f"min_trade={self.min_trade_sol:.6f}"
+            )
+            return None
         try:
             bal = self.balance_sol()
             if bal - amount < self.min_wallet_reserve_sol:
@@ -282,7 +327,6 @@ class RaptorLiveBroker(PaperBroker):
             self.closed_recent[plan.mint] = ts_ms
             return None
         try:
-            balance_before = self.balance_sol() if not self.quote_only else 0.0
             quote = self.build_swap(SOL_MINT, plan.mint, round(amount, 9), self.buy_slippage)
             if self.quote_only:
                 if self.quote_simulate and self.keypair:
@@ -299,8 +343,8 @@ class RaptorLiveBroker(PaperBroker):
             if not self.wait_confirmed(sig):
                 self.closed_recent[plan.mint] = ts_ms
                 return None
-            balance_after = self.balance_sol()
-            actual_cost = max(amount, balance_before - balance_after)
+            wallet_delta = self.transaction_wallet_delta_sol(sig)
+            actual_cost = max(amount, -wallet_delta)
             tokens = actual_cost / max(price, 1e-18)
             pos = Position(
                 mint=plan.mint,
@@ -321,7 +365,7 @@ class RaptorLiveBroker(PaperBroker):
             self.stats.scouts += 1
             log(
                 f"PGG2-LIVE-BUY {short_addr(plan.mint)} lane={plan.lane} cost={actual_cost:.6f} "
-                f"sig={sig} score={plan.score:.1f}"
+                f"wallet_delta={wallet_delta:+.6f} sig={sig} score={plan.score:.1f}"
             )
             self.save_state()
             return pos
@@ -346,7 +390,6 @@ class RaptorLiveBroker(PaperBroker):
         if price > 0:
             pos.update(price)
         try:
-            balance_before = self.balance_sol()
             quote = self.build_swap(mint, SOL_MINT, "auto", self.sell_slippage)
             if self.quote_only:
                 if self.quote_simulate and self.keypair:
@@ -360,8 +403,8 @@ class RaptorLiveBroker(PaperBroker):
             sig = self.send_signed(signed_b64)
             if not self.wait_confirmed(sig):
                 return None
-            balance_after = self.balance_sol()
-            proceeds = max(0.0, balance_after - balance_before)
+            wallet_delta = self.transaction_wallet_delta_sol(sig)
+            proceeds = max(0.0, wallet_delta)
             self.positions.pop(mint, None)
             pnl = pos.realized_sol + proceeds - pos.cost_sol
             self.stats.realized_pnl_sol += pnl
@@ -378,7 +421,8 @@ class RaptorLiveBroker(PaperBroker):
             self.closed_recent[mint] = ts_ms
             log(
                 f"PGG2-LIVE-SELL {short_addr(mint)} reason={reason} sig={sig} "
-                f"proceeds={proceeds:.6f} pnl={pnl:+.6f} session={self.stats.realized_pnl_sol:+.6f}"
+                f"proceeds={proceeds:.6f} wallet_delta={wallet_delta:+.6f} "
+                f"pnl={pnl:+.6f} session={self.stats.realized_pnl_sol:+.6f}"
             )
             self.save_state()
             return pnl
