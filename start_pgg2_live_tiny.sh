@@ -41,6 +41,8 @@ export PGG2_LIVE_PRIORITY_FEE=auto
 export PGG2_LIVE_PRIORITY_LEVEL=high
 export PGG2_LIVE_BUY_SLIPPAGE_PCT=18
 export PGG2_LIVE_SELL_SLIPPAGE_PCT=22
+export PGG2_LIVE_TX_VERSION=legacy
+export PGG2_LIVE_SIMULATE_BEFORE_SEND=1
 export PGG2_LIVE_RPC_URL="${PGG2_LIVE_RPC_URL:-https://api.mainnet-beta.solana.com}"
 
 export PIGGY_STATE_FILE="/root/piggy/data/${RUNID}_state.json"

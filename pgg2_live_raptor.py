@@ -7,6 +7,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -91,7 +92,8 @@ class RaptorLiveBroker(PaperBroker):
         self.sell_slippage = env_float("PGG2_LIVE_SELL_SLIPPAGE_PCT", 22.0)
         self.priority_fee = env_str("PGG2_LIVE_PRIORITY_FEE", "auto")
         self.priority_level = env_str("PGG2_LIVE_PRIORITY_LEVEL", "high")
-        self.tx_version = env_str("PGG2_LIVE_TX_VERSION", "v0")
+        self.tx_version = env_str("PGG2_LIVE_TX_VERSION", "legacy")
+        self.simulate_before_send = env_bool("PGG2_LIVE_SIMULATE_BEFORE_SEND", True)
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
             f"PGG2-LIVE: mode={self.mode.upper()} wallet={short_addr(self.public_key)} "
@@ -144,8 +146,12 @@ class RaptorLiveBroker(PaperBroker):
             data = json.dumps(body, separators=(",", ":")).encode("utf-8")
             merged_headers.setdefault("content-type", "application/json")
         req = Request(url, data=data, headers=merged_headers, method=method.upper())
-        with urlopen(req, timeout=self.timeout_sec) as resp:
-            raw = resp.read().decode("utf-8")
+        try:
+            with urlopen(req, timeout=self.timeout_sec) as resp:
+                raw = resp.read().decode("utf-8")
+        except HTTPError as exc:
+            body_text = exc.read().decode("utf-8", "replace")[:500]
+            raise RuntimeError(f"http {exc.code} {exc.reason}: {body_text}") from exc
         return json.loads(raw) if raw else {}
 
     def rpc(self, method: str, params: list[Any]) -> Any:
@@ -181,19 +187,53 @@ class RaptorLiveBroker(PaperBroker):
         log(
             f"PGG2-LIVE-QUOTE {short_addr(from_mint)}->{short_addr(to_mint)} amount={amount} "
             f"out={rate.get('amountOut')} min={rate.get('minAmountOut')} "
-            f"impact={rate.get('priceImpact')} fee={rate.get('fee')} ms={elapsed:.0f}"
+            f"impact={rate.get('priceImpact')} fee={rate.get('fee')} tx={self.tx_version} ms={elapsed:.0f}"
         )
         return out
 
-    def sign_to_base58(self, txn_b64: str) -> str:
+    def sign_transaction(self, txn_b64: str) -> tuple[str, str]:
         if not self.keypair:
             raise RuntimeError("cannot sign without keypair")
         tx = VersionedTransaction.from_bytes(base64.b64decode(txn_b64))
         signed = VersionedTransaction(tx.message, [self.keypair])
-        return b58encode(bytes(signed))
+        raw = bytes(signed)
+        return base64.b64encode(raw).decode("ascii"), b58encode(raw)
 
-    def send_signed(self, signed_b58: str) -> str:
-        return str(self.rpc("sendTransaction", [signed_b58]))
+    def simulate_signed(self, signed_b64: str) -> bool:
+        if not self.simulate_before_send:
+            return True
+        result = self.rpc(
+            "simulateTransaction",
+            [
+                signed_b64,
+                {
+                    "commitment": "confirmed",
+                    "encoding": "base64",
+                    "replaceRecentBlockhash": True,
+                    "sigVerify": False,
+                },
+            ],
+        )
+        value = (result or {}).get("value") or {}
+        if value.get("err"):
+            logs = value.get("logs") or []
+            tail = " | ".join(str(x) for x in logs[-6:])
+            log(f"PGG2-LIVE-SIM-FAIL err={value.get('err')} logs={tail[:500]}")
+            return False
+        log(f"PGG2-LIVE-SIM-OK units={value.get('unitsConsumed')} fee={value.get('fee')}")
+        return True
+
+    def send_signed(self, signed_b64: str) -> str:
+        params = [
+            signed_b64,
+            {
+                "encoding": "base64",
+                "skipPreflight": False,
+                "preflightCommitment": "confirmed",
+                "maxRetries": env_int("PGG2_LIVE_MAX_RETRIES", 3),
+            },
+        ]
+        return str(self.rpc("sendTransaction", params))
 
     def wait_confirmed(self, sig: str) -> bool:
         deadline = time.time() + self.confirm_timeout_sec
@@ -247,8 +287,11 @@ class RaptorLiveBroker(PaperBroker):
                 log(f"PGG2-LIVE-QUOTE-ONLY-BUY {short_addr(plan.mint)} lane={plan.lane} amount={amount:.6f}")
                 self.closed_recent[plan.mint] = ts_ms
                 return None
-            signed = self.sign_to_base58(str(quote["txn"]))
-            sig = self.send_signed(signed)
+            signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
+            if not self.simulate_signed(signed_b64):
+                self.closed_recent[plan.mint] = ts_ms
+                return None
+            sig = self.send_signed(signed_b64)
             if not self.wait_confirmed(sig):
                 self.closed_recent[plan.mint] = ts_ms
                 return None
@@ -304,8 +347,10 @@ class RaptorLiveBroker(PaperBroker):
             if self.quote_only:
                 log(f"PGG2-LIVE-QUOTE-ONLY-SELL {short_addr(mint)} reason={reason}")
                 return None
-            signed = self.sign_to_base58(str(quote["txn"]))
-            sig = self.send_signed(signed)
+            signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
+            if not self.simulate_signed(signed_b64):
+                return None
+            sig = self.send_signed(signed_b64)
             if not self.wait_confirmed(sig):
                 return None
             balance_after = self.balance_sol()
