@@ -62,7 +62,7 @@ class RaptorLiveBroker(PaperBroker):
         self.quote_only = self.mode != "live"
         self.api_key = env_str("SOLANATRACKER_API_KEY") or env_str("SOLANATRACKER_RPC_KEY")
         self.swap_url = env_str("PGG2_RAPTOR_SWAP_URL", "https://swap-v2.solanatracker.io/swap")
-        self.rpc_url = env_str("SOLANATRACKER_RPC_HTTP")
+        self.rpc_url = env_str("PGG2_LIVE_RPC_URL") or env_str("SOLANATRACKER_RPC_HTTP")
         if not self.rpc_url:
             self.rpc_url = "https://rpc-mainnet.solanatracker.io/"
             if self.api_key:

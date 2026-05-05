@@ -39,6 +39,7 @@ export PGG2_LIVE_MAX_SESSION_LOSS_SOL=0.020
 export PGG2_LIVE_MAX_CONSECUTIVE_LOSSES=2
 export PGG2_LIVE_PRIORITY_FEE=auto
 export PGG2_LIVE_PRIORITY_LEVEL=high
+export PGG2_LIVE_RPC_URL="${PGG2_LIVE_RPC_URL:-https://api.mainnet-beta.solana.com}"
 
 export PIGGY_STATE_FILE="/root/piggy/data/${RUNID}_state.json"
 export PIGGY_RAW_EVENTS_FILE="/root/piggy/data/${RUNID}_raw.jsonl"
