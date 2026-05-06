@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
-from birth_first_sniper import (
+from birth_first_sniper_og_drylive import (
     BASE_DIR,
     DATA_DIR,
     BotConfig as BaseConfig,
@@ -63,13 +63,12 @@ class WaveArm:
 
 def piggy_config(args: argparse.Namespace) -> BaseConfig:
     load_dotenv()
-    base = BaseConfig.from_env(args)
     execution_mode = env_str("PGG2_EXECUTION_MODE", "paper").lower()
     paper_mode = execution_mode in {"paper", "dry_live"} and env_bool("PIGGY_PAPER_TRADING", True)
+    base = BaseConfig.from_env(args)
     return replace(
         base,
         paper_trading=paper_mode,
-        live_enabled=execution_mode in {"quote", "live"} and env_bool("PGG2_ENABLE_LIVE", False),
         report_sec=env_float("PIGGY_REPORT_SEC", 3.0),
         heartbeat_sec=env_float("PIGGY_HEARTBEAT_SEC", 0.020),
         curve_max_age_ms=env_int("PIGGY_CURVE_MAX_AGE_MS", 650),
@@ -98,31 +97,12 @@ def piggy_config(args: argparse.Namespace) -> BaseConfig:
 class SameBlockPiggybackBot(BirthFirstSniper):
     def __init__(self, config: BaseConfig) -> None:
         super().__init__(config)
-        if not config.paper_trading:
-            from pgg2_live_raptor import RaptorLiveBroker
-
-            self.broker = RaptorLiveBroker(config)
         self.wave_arms: dict[str, WaveArm] = {}
         self.position_follow: dict[str, dict[str, Any]] = {}
         self.profitable_closes: dict[str, dict[str, float]] = {}
         self.breadth_ignition_seen: set[str] = set()
         self.birth_fanout_seen: set[str] = set()
-        self.birth_fanout_watch: dict[str, dict[str, Any]] = {}
-        self.stealth_arm_seen: set[str] = set()
-        self.spark3_arm_seen: set[str] = set()
-        self.spark3_arms: dict[str, dict[str, Any]] = {}
-        self.spark3_breakout_watch: dict[str, dict[str, Any]] = {}
-        self.spark3_breakout_seen: set[str] = set()
         self.curve_lag_reveal_seen: set[str] = set()
-        self.preprice_reveal_seen: set[str] = set()
-        self.priced_snap_seen: set[str] = set()
-        self.priced_breakout_watch: dict[str, dict[str, Any]] = {}
-        self.priced_breakout_seen: set[str] = set()
-        self.late_swarm_seen: set[str] = set()
-        self.curve_arm_scout_seen: set[str] = set()
-        self.raw_momentum_seen: set[str] = set()
-        self.raw_momentum_arms: dict[str, dict[str, Any]] = {}
-        self.whale_spark_seen: set[str] = set()
 
     @staticmethod
     def moonshot_lane(lane: str) -> bool:
@@ -133,17 +113,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             "late_ignition",
             "breadth_ignition",
             "birth_fanout",
-            "stealth_arm",
-            "spark3_arm",
-            "spark3_breakout",
             "curve_lag_reveal",
-            "preprice_reveal",
-            "priced_snap",
-            "priced_breakout",
-            "late_swarm",
-            "curve_arm_scout",
-            "raw_momentum",
-            "whale_spark",
         }
 
     def recent_profit_reentry_locked(self, mint: str, ts_ms: int) -> bool:
@@ -363,8 +333,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         anchor_ts = tape.first_create_ms or tape.first_seen_ms or first_price_ts
         first_price_delay_ms = max(0, first_price_ts - anchor_ts)
         first_price_age_ms = max(0, ts_ms - first_price_ts)
-        birth1500 = self.event_window_stats(mint, anchor_ts, min(ts_ms, anchor_ts + 1500))
-        pre_price = self.event_window_stats(mint, anchor_ts, first_price_ts)
         post1500 = self.event_window_stats(mint, first_price_ts, min(ts_ms, first_price_ts + 1500))
         return {
             "first_price_ts": first_price_ts,
@@ -372,14 +340,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             "first_price_delay_ms": first_price_delay_ms,
             "first_price_age_ms": first_price_age_ms,
             "entry_move_from_first": price / max(first_price, 1e-18),
-            "birth1500_buy_sol": birth1500["buy_sol"],
-            "birth1500_sell_sol": birth1500["sell_sol"],
-            "birth1500_unique_buyers": birth1500["unique_buyers"],
-            "birth1500_top_share": birth1500["top_buy_share"],
-            "pre_price_buy_sol": pre_price["buy_sol"],
-            "pre_price_sell_sol": pre_price["sell_sol"],
-            "pre_price_unique_buyers": pre_price["unique_buyers"],
-            "pre_price_top_share": pre_price["top_buy_share"],
             "post1500_buy_sol": post1500["buy_sol"],
             "post1500_sell_sol": post1500["sell_sol"],
             "post1500_unique_buyers": post1500["unique_buyers"],
@@ -543,8 +503,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         return max(prior) if prior else 0.0
 
     def second_wave_ready(self, event: PumpEvent, features: dict[str, Any]) -> tuple[Optional[StrikePlan], str]:
-        if env_bool("PGG2_DISABLE_LEGACY_WAVE_LANES", False):
-            return None, "legacy_wave_disabled"
         pre_wave_peak = self.prior_peak_price(
             event.mint,
             event.ts_ms,
@@ -642,15 +600,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             and features["move700"] >= env_float("PIGGY_EXHAUSTED_RECLAIM_MIN_MOVE700", 1.55)
         ):
             return None, "exhausted_reclaim_no_headroom"
-        if (
-            env_bool("PGG2_REJECT_MIDAGE_VERTICAL_RECLAIM", True)
-            and reclaim_strength
-            and age_ms >= env_int("PGG2_MIDAGE_VERTICAL_RECLAIM_MIN_AGE_MS", 12000)
-            and age_ms <= env_int("PGG2_MIDAGE_VERTICAL_RECLAIM_MAX_AGE_MS", 30000)
-            and base_move >= env_float("PGG2_MIDAGE_VERTICAL_RECLAIM_MIN_BASE_MOVE", 1.75)
-            and features["move700"] >= env_float("PGG2_MIDAGE_VERTICAL_RECLAIM_MIN_MOVE700", 1.75)
-        ):
-            return None, "midage_vertical_reclaim_no_headroom"
         if (
             not reclaim_strength
             and features["move700"] < env_float("PIGGY_SECOND_MIN_NON_RECLAIM_MOVE700", 1.0)
@@ -806,17 +755,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         features.update(self.last_trade_ages(mint, ts_ms))
         s700 = features["s700"]
         s1500 = features["s1500"]
-        for label, stats in (
-            ("250", features["s250"]),
-            ("700", s700),
-            ("1500", s1500),
-            ("3000", features["s3000"]),
-            ("8000", features["s8000"]),
-        ):
-            features[f"buy{label}"] = float(stats.get("buy_sol") or 0.0)
-            features[f"sell{label}"] = float(stats.get("sell_sol") or 0.0)
-            features[f"uniq{label}"] = int(stats.get("unique_buyers") or 0)
-            features[f"top_share{label}"] = float(stats.get("top_buy_share") or 1.0)
         features["cluster_score"] = self.cluster_score(features)
         features["cluster_width_ok"] = (
             s700["unique_buyers"] >= 3
@@ -837,16 +775,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             features["wave_arm_age_ms"] = 0
             features["wave_base_move"] = 1.0
         return features
-
-    async def on_event(self, event: PumpEvent) -> None:
-        if event.kind == "trade" and event.price_hint > 0 and env_bool("PGG2_USE_PRICE_HINTS", False):
-            # Off by default. buy_exact_sol_in carries a min-out style token
-            # field on many pump.fun transactions, so treating it as executed
-            # token amount creates fake trillion-x price moves. Only enable this
-            # manually for controlled parser tests.
-            tape = self.tape_for(event.mint)
-            tape.add_price(event.ts_ms, event.price_hint, self.config.max_tape_age_sec)
-        await super().on_event(event)
 
     @staticmethod
     def cluster_score(features: dict[str, Any]) -> float:
@@ -875,25 +803,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
 
     def build_strike_plan(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
         self.maybe_arm_first_burst(event, features)
-        plan = self.spark3_arm_ready(event, features)
-        if plan:
-            return plan
-        plan = self.spark3_breakout_ready(event, features)
-        if plan:
-            return plan
-        plan = self.preprice_reveal_ready(event, features)
-        if plan:
-            return plan
-        plan = self.priced_snap_ready(event, features)
-        if plan:
-            return plan
-        plan = self.priced_breakout_ready(event, features)
-        if plan:
-            return plan
         plan = self.birth_fanout_ready(event, features)
-        if plan:
-            return plan
-        plan = self.stealth_arm_ready(event, features)
         if plan:
             return plan
         plan = self.curve_lag_reveal_ready(event, features)
@@ -908,10 +818,10 @@ class SameBlockPiggybackBot(BirthFirstSniper):
     def birth_fanout_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
         """PGG2 birth_fanout lane.
 
-        Birth-ledger lane: watch from the first real curve price, require broad
-        launch buying, then wait a tiny confirmation window for fresh follow-on
-        buy flow. This targets the actual blind spot without chasing late 2x
-        breakouts or using fake transaction price hints.
+        This is not a second-wave parameter tweak. It targets the blind spot
+        found in raw tapes: first usable price appears after launch-bundle
+        activity, then many distinct buyers fan out inside the first ~1.5s.
+        The existing wave/reclaim logic often never strikes these mints.
         """
         if not env_bool("PGG2_BIRTH_FANOUT_ENABLED", True):
             return None
@@ -929,182 +839,47 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         ctx = self.birth_price_context(event.mint, event.ts_ms, price)
         if not ctx:
             return None
-        watch = self.birth_fanout_watch.get(event.mint)
-        confirm_ms = env_int("PGG2_BIRTH_FANOUT_CONFIRM_MS", 250)
-        max_confirm_ms = env_int("PGG2_BIRTH_FANOUT_CONFIRM_MAX_MS", 850)
-        if watch:
-            watch_age_ms = event.ts_ms - int(watch.get("ts_ms") or 0)
-            if watch_age_ms > max_confirm_ms:
-                self.birth_fanout_seen.add(event.mint)
-                self.birth_fanout_watch.pop(event.mint, None)
-                self.logger.decision(
-                    "birth_fanout_reject",
-                    event.mint,
-                    {
-                        "lane": "birth_fanout",
-                        "reason": f"confirm_timeout age={watch_age_ms}ms",
-                        "features": self.slim_features(features),
-                    },
-                )
-                return None
-            if watch_age_ms < confirm_ms:
-                return None
-            if ctx["first_price_age_ms"] > env_int("PGG2_BIRTH_FANOUT_CONFIRM_MAX_FIRST_PRICE_AGE_MS", 1500):
-                self.birth_fanout_seen.add(event.mint)
-                self.birth_fanout_watch.pop(event.mint, None)
-                self.logger.decision(
-                    "birth_fanout_reject",
-                    event.mint,
-                    {
-                        "lane": "birth_fanout",
-                        "reason": f"confirm_stale_first_price age={ctx['first_price_age_ms']}ms",
-                        "features": self.slim_features(features),
-                    },
-                )
-                return None
-            confirm = self.event_window_stats(event.mint, int(watch["ts_ms"]), event.ts_ms)
-            confirm_buy = float(confirm.get("buy_sol") or 0.0)
-            confirm_sell = float(confirm.get("sell_sol") or 0.0)
-            confirm_unique = int(confirm.get("unique_buyers") or 0)
-            confirm_top = float(confirm.get("top_buy_share") or 0.0)
-            if (
-                confirm_buy < env_float("PGG2_BIRTH_FANOUT_CONFIRM_MIN_BUY_SOL", 0.50)
-                or confirm_unique < env_int("PGG2_BIRTH_FANOUT_CONFIRM_MIN_BUYERS", 1)
-                or confirm_top > env_float("PGG2_BIRTH_FANOUT_CONFIRM_MAX_TOP_SHARE", 1.0)
-                or confirm_sell > max(
-                    env_float("PGG2_BIRTH_FANOUT_CONFIRM_MAX_SELL_SOL", 0.075),
-                    confirm_buy * env_float("PGG2_BIRTH_FANOUT_CONFIRM_MAX_SELL_RATIO", 0.08),
-                )
-            ):
-                self.birth_fanout_seen.add(event.mint)
-                self.birth_fanout_watch.pop(event.mint, None)
-                self.logger.decision(
-                    "birth_fanout_reject",
-                    event.mint,
-                    {
-                        "lane": "birth_fanout",
-                        "reason": (
-                            f"confirm_failed age={watch_age_ms}ms "
-                            f"b={confirm_buy:.3f}/{confirm_unique} s={confirm_sell:.3f}"
-                        ),
-                        "features": self.slim_features(features),
-                    },
-                )
-                return None
-            if ctx["entry_move_from_first"] > env_float("PGG2_BIRTH_FANOUT_CONFIRM_MAX_ENTRY_MOVE", 1.70):
-                self.birth_fanout_seen.add(event.mint)
-                self.birth_fanout_watch.pop(event.mint, None)
-                self.logger.decision(
-                    "birth_fanout_reject",
-                    event.mint,
-                    {
-                        "lane": "birth_fanout",
-                        "reason": f"confirm_overextended move={ctx['entry_move_from_first']:.3f}x",
-                        "features": self.slim_features(features),
-                    },
-                )
-                return None
-            watch_ctx = dict(watch.get("ctx") or ctx)
-            ctx["confirm_buy_sol"] = confirm_buy
-            ctx["confirm_sell_sol"] = confirm_sell
-            ctx["confirm_unique_buyers"] = confirm_unique
-            ctx["confirm_top_share"] = confirm_top
-            ctx["confirm_ms"] = watch_age_ms
-        else:
-            if ctx["first_price_delay_ms"] > env_int("PGG2_BIRTH_FANOUT_MAX_FIRST_PRICE_DELAY_MS", 5000):
-                return None
-            if ctx["first_price_age_ms"] > env_int("PGG2_BIRTH_FANOUT_MAX_FIRST_PRICE_AGE_MS", 2000):
-                return None
-            if ctx["entry_move_from_first"] < env_float("PGG2_BIRTH_FANOUT_MIN_ENTRY_MOVE", 0.45):
-                return None
-            if ctx["entry_move_from_first"] > env_float("PGG2_BIRTH_FANOUT_MAX_ENTRY_MOVE", 1.50):
-                return None
-            wave_base_move = float(features.get("wave_base_move") or 1.0)
-            if wave_base_move < env_float("PGG2_BIRTH_FANOUT_MIN_WAVE_BASE_MOVE", 0.45):
-                return None
-            birth_buy = float(ctx.get("birth1500_buy_sol") or ctx["post1500_buy_sol"])
-            birth_unique = int(ctx.get("birth1500_unique_buyers") or ctx["post1500_unique_buyers"])
-            birth_top = float(ctx.get("birth1500_top_share") or ctx["post1500_top_share"])
-            birth_sell = float(ctx.get("birth1500_sell_sol") or ctx["post1500_sell_sol"])
-            if birth_buy < env_float("PGG2_BIRTH_FANOUT_MIN_BUY_SOL", 9.0):
-                return None
-            if birth_unique < env_int("PGG2_BIRTH_FANOUT_MIN_BUYERS", 11):
-                return None
-            if birth_top > env_float("PGG2_BIRTH_FANOUT_MAX_TOP_SHARE", 0.32):
-                return None
-            if birth_sell > max(
-                0.010,
-                birth_buy * env_float("PGG2_BIRTH_FANOUT_MAX_SELL_RATIO", 0.08),
-            ):
-                return None
-            elite_nofollow = (
-                env_bool("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_ENABLED", False)
-                and birth_buy >= env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_MIN_BUY_SOL", 11.0)
-                and birth_unique >= env_int("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_MIN_BUYERS", 11)
-                and birth_top <= env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_MAX_TOP_SHARE", 0.30)
-                and ctx["first_price_age_ms"] <= env_int("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_MAX_FIRST_PRICE_AGE_MS", 1300)
-                and ctx["entry_move_from_first"] <= env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_MAX_ENTRY_MOVE", 1.12)
-                and ctx.get("pre_price_buy_sol", 0.0) >= env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_MIN_PRE_PRICE_BUY_SOL", 8.0)
-                and ctx.get("pre_price_unique_buyers", 0) >= env_int("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_MIN_PRE_PRICE_BUYERS", 4)
-                and ctx.get("pre_price_top_share", 1.0) <= env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_MAX_PRE_PRICE_TOP", 0.36)
-            )
-            if elite_nofollow:
-                ctx["confirm_buy_sol"] = 0.0
-                ctx["confirm_sell_sol"] = 0.0
-                ctx["confirm_unique_buyers"] = 0
-                ctx["confirm_top_share"] = 0.0
-                ctx["confirm_ms"] = 0
-                ctx["birth_entry_profile"] = "elite_nofollow"
-                watch_ctx = dict(ctx)
-            else:
-                self.birth_fanout_watch[event.mint] = {
-                    "ts_ms": event.ts_ms,
-                    "price": price,
-                    "ctx": dict(ctx),
-                    "features": self.slim_features(features),
-                }
-                self.logger.decision(
-                    "birth_fanout_watch",
-                    event.mint,
-                    {
-                        "lane": "birth_fanout",
-                        "reason": (
-                            f"watch birth1500={birth_buy:.3f}/{birth_unique} "
-                            f"top={birth_top:.2f} pre={ctx.get('pre_price_buy_sol', 0.0):.3f} "
-                            f"move={ctx['entry_move_from_first']:.2f}x"
-                        ),
-                        "features": self.slim_features(features),
-                    },
-                )
-                return None
+        if ctx["first_price_delay_ms"] > env_int("PGG2_BIRTH_FANOUT_MAX_FIRST_PRICE_DELAY_MS", 5000):
+            return None
+        if ctx["first_price_age_ms"] > env_int("PGG2_BIRTH_FANOUT_MAX_FIRST_PRICE_AGE_MS", 1500):
+            return None
+        if ctx["entry_move_from_first"] > env_float("PGG2_BIRTH_FANOUT_MAX_ENTRY_MOVE", 1.50):
+            return None
+        if ctx["post1500_buy_sol"] < env_float("PGG2_BIRTH_FANOUT_MIN_BUY_SOL", 3.0):
+            return None
+        if ctx["post1500_unique_buyers"] < env_int("PGG2_BIRTH_FANOUT_MIN_BUYERS", 8):
+            return None
+        if ctx["post1500_top_share"] > env_float("PGG2_BIRTH_FANOUT_MAX_TOP_SHARE", 0.50):
+            return None
+        if ctx["post1500_sell_sol"] > max(
+            0.010,
+            ctx["post1500_buy_sol"] * env_float("PGG2_BIRTH_FANOUT_MAX_SELL_RATIO", 0.08),
+        ):
+            return None
 
-        if ctx.get("birth_entry_profile") == "elite_nofollow":
-            scout = env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_SOL", 0.020)
-        else:
-            scout = env_float("PGG2_BIRTH_FANOUT_SOL", max(0.0005, self.config.scout_sol * 0.50))
-            full_follow_ok = (
-                float(ctx.get("pre_price_buy_sol") or 0.0)
-                >= env_float("PGG2_BIRTH_FANOUT_FOLLOW_FULL_MIN_PRE_PRICE_BUY_SOL", 7.5)
-            )
-            if not full_follow_ok:
-                scout = min(scout, env_float("PGG2_BIRTH_FANOUT_FOLLOW_WEAK_SOL", 0.020))
+        # Live tape filter: birth-fanout winners had sustained 700ms breadth at
+        # entry, while most losses were thin or top-heavy in the immediate tape.
+        s700_live = features.get("s700") or {}
+        live_unique700 = int(s700_live.get("unique_buyers") or 0)
+        live_top700 = float(s700_live.get("top_buy_share") or 1.0)
+        if live_unique700 < env_int("PGG2_BIRTH_FANOUT_MIN_LIVE_BUYERS700", 7):
+            return None
+        if live_top700 > env_float("PGG2_BIRTH_FANOUT_MAX_LIVE_TOP700", 0.62):
+            return None
+
+        scout = env_float("PGG2_BIRTH_FANOUT_SOL", max(0.0005, self.config.scout_sol * 0.50))
         scout = min(self.config.max_position_sol, max(0.0005, scout))
         score = (
             120.0
-            + min(60.0, float(ctx.get("birth1500_buy_sol") or ctx["post1500_buy_sol"]) * 5.0)
-            + min(45.0, int(ctx.get("birth1500_unique_buyers") or ctx["post1500_unique_buyers"]) * 4.0)
-            + min(35.0, ctx.get("confirm_buy_sol", 0.0) * 8.0)
+            + min(60.0, ctx["post1500_buy_sol"] * 5.0)
+            + min(45.0, ctx["post1500_unique_buyers"] * 4.0)
             + max(0.0, ctx["entry_move_from_first"] - 1.0) * 80.0
-            - max(0.0, float(ctx.get("birth1500_top_share") or ctx["post1500_top_share"]) - 0.35) * 55.0
+            - max(0.0, ctx["post1500_top_share"] - 0.35) * 55.0
         )
         reason = (
-            f"birth_fanout confirm={ctx.get('confirm_ms', 0)}ms first_age={ctx['first_price_age_ms']}ms "
-            f"birth1500={float(ctx.get('birth1500_buy_sol') or ctx['post1500_buy_sol']):.3f}/"
-            f"{int(ctx.get('birth1500_unique_buyers') or ctx['post1500_unique_buyers'])} "
-            f"top={float(ctx.get('birth1500_top_share') or ctx['post1500_top_share']):.2f} "
-            f"pre={ctx.get('pre_price_buy_sol', 0.0):.3f} "
-            f"profile={ctx.get('birth_entry_profile', 'follow_confirm')} "
-            f"follow={ctx.get('confirm_buy_sol', 0.0):.3f}/{ctx.get('confirm_unique_buyers', 0)} "
+            f"birth_fanout first_age={ctx['first_price_age_ms']}ms "
+            f"b1500={ctx['post1500_buy_sol']:.3f}/{ctx['post1500_unique_buyers']} "
+            f"top={ctx['post1500_top_share']:.2f} live700={live_unique700} top={live_top700:.2f} "
             f"move={ctx['entry_move_from_first']:.2f}x"
         )
         plan = StrikePlan(
@@ -1122,329 +897,13 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         plan.features.update(
             {
                 "birth_fanout": ctx,
-                "birth_fanout_watch": watch_ctx,
+                "birth_fanout_live_unique700": live_unique700,
+                "birth_fanout_live_top700": live_top700,
                 "entry_size_reason": "birth_fanout_probe",
                 "entry_probe_sol": scout,
             }
         )
-        self.birth_fanout_watch.pop(event.mint, None)
         return plan
-
-    def stealth_arm_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        """Aggressive PGG2 stealth-arm lane.
-
-        Fast quote-log validation found a blind spot at the wave-arm layer:
-        fresh 3-buyer arms with 5-8 SOL bought, no sells, and a temporarily
-        unpopulated vSOL field produced many 2x+ moves, including the current
-        BaZp 8x miss. It is noisy, so this lane is tiny-size and live-quote
-        loss-clamped; it must not pollute the cleaner birth/reclaim lanes.
-        """
-        if not env_bool("PGG2_STEALTH_ARM_ENABLED", False):
-            return None
-        if not event.is_buy or event.mint in self.stealth_arm_seen:
-            return None
-        if not features.get("wave_armed") or features.get("complete"):
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            return None
-        s700 = features["s700"]
-        buy700 = float(s700.get("buy_sol") or 0.0)
-        uniq700 = int(s700.get("unique_buyers") or 0)
-        top700 = float(s700.get("top_buy_share") or 1.0)
-        sell700 = float(s700.get("sell_sol") or 0.0)
-        sell1500 = float(features["s1500"].get("sell_sol") or 0.0)
-        move700 = float(features.get("move700") or 1.0)
-        wave_base = float(features.get("wave_base_move") or 1.0)
-        vsol = float(features.get("vsol_sol") or 0.0)
-        if buy700 < env_float("PGG2_STEALTH_ARM_MIN_BUY700", 5.0):
-            return None
-        if buy700 > env_float("PGG2_STEALTH_ARM_MAX_BUY700", 8.0):
-            return None
-        if uniq700 != env_int("PGG2_STEALTH_ARM_UNIQ700", 3):
-            return None
-        if top700 < env_float("PGG2_STEALTH_ARM_MIN_TOP700", 0.45):
-            return None
-        if top700 > env_float("PGG2_STEALTH_ARM_MAX_TOP700", 0.56):
-            return None
-        if sell700 + sell1500 > env_float("PGG2_STEALTH_ARM_MAX_SELL_SOL", 0.001):
-            return None
-        if move700 < env_float("PGG2_STEALTH_ARM_MIN_MOVE700", 0.98):
-            return None
-        if move700 > env_float("PGG2_STEALTH_ARM_MAX_MOVE700", 1.08):
-            return None
-        if wave_base > env_float("PGG2_STEALTH_ARM_MAX_BASE_MOVE", 1.05):
-            return None
-        if vsol > env_float("PGG2_STEALTH_ARM_MAX_VSOL", 1.0):
-            return None
-
-        scout = min(
-            self.config.max_position_sol,
-            max(0.0005, env_float("PGG2_STEALTH_ARM_SOL", 0.010)),
-        )
-        score = 95.0 + min(40.0, buy700 * 4.0) + max(0.0, move700 - 1.0) * 180.0
-        reason = (
-            f"stealth_arm b700={buy700:.3f}/{uniq700} top={top700:.2f} "
-            f"m700={move700:.3f} base={wave_base:.2f} vsol={vsol:.2f}"
-        )
-        plan = StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="stealth_arm",
-            reason=reason,
-            score=score,
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=self.slim_features(features),
-        )
-        plan.features.update({"entry_size_reason": "stealth_arm_probe", "entry_probe_sol": scout})
-        return plan
-
-    def spark3_arm_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        """PGG2 spark3 arm lane.
-
-        Fast event-log validation found a live blind spot in unstruck wave arms:
-        3 unique buyers, 4.5-7.5 SOL bought, zero sells, fresh base, and a
-        controlled/vertical move already underway. It caught current-run misses
-        that reached 3.34x and 1.58x while staying positive across stored quote
-        tapes under a harsh tiny-loss proxy. This lane is intentionally tiny and
-        separately quote-clamped so it cannot displace the proven lanes.
-        """
-        spark3_enabled = env_bool("PGG2_SPARK3_ARM_ENABLED", False)
-        spark3_shadow = env_bool("PGG2_SPARK3_ARM_SHADOW_ONLY", False)
-        if not (spark3_enabled or spark3_shadow):
-            return None
-        if not event.is_buy or event.mint in self.spark3_arm_seen:
-            return None
-        if not features.get("wave_armed") or features.get("complete"):
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            return None
-        s700 = features["s700"]
-        buy700 = float(s700.get("buy_sol") or 0.0)
-        uniq700 = int(s700.get("unique_buyers") or 0)
-        top700 = float(s700.get("top_buy_share") or 1.0)
-        sell700 = float(s700.get("sell_sol") or 0.0)
-        sell1500 = float(features["s1500"].get("sell_sol") or 0.0)
-        move700 = float(features.get("move700") or 1.0)
-        wave_base = float(features.get("wave_base_move") or 1.0)
-        if uniq700 != env_int("PGG2_SPARK3_ARM_UNIQ700", 3):
-            return None
-        if buy700 < env_float("PGG2_SPARK3_ARM_MIN_BUY700", 4.5):
-            return None
-        if buy700 > env_float("PGG2_SPARK3_ARM_MAX_BUY700", 7.5):
-            return None
-        if top700 < env_float("PGG2_SPARK3_ARM_MIN_TOP700", 0.30):
-            return None
-        if top700 > env_float("PGG2_SPARK3_ARM_MAX_TOP700", 0.66):
-            return None
-        if sell700 + sell1500 > env_float("PGG2_SPARK3_ARM_MAX_SELL_SOL", 0.001):
-            return None
-        if wave_base > env_float("PGG2_SPARK3_ARM_MAX_BASE_MOVE", 1.05):
-            return None
-        if move700 < env_float("PGG2_SPARK3_ARM_MIN_MOVE700", 1.15):
-            return None
-        if move700 > env_float("PGG2_SPARK3_ARM_MAX_MOVE700", 999999999999.0):
-            return None
-
-        scout = min(
-            self.config.max_position_sol,
-            max(0.0005, env_float("PGG2_SPARK3_ARM_SOL", 0.010)),
-        )
-        score = 105.0 + min(35.0, buy700 * 4.0) + min(220.0, max(0.0, move700 - 1.0) * 180.0)
-        reason = (
-            f"spark3_arm b700={buy700:.3f}/{uniq700} top={top700:.2f} "
-            f"m700={move700:.3f} base={wave_base:.2f}"
-        )
-        if spark3_shadow:
-            self.spark3_arm_seen.add(event.mint)
-            self.spark3_arms[event.mint] = {
-                "ts_ms": event.ts_ms,
-                "base_price": price,
-                "min_price": price,
-                "max_price": price,
-                "reason": reason,
-                "features": self.slim_features(features),
-            }
-            self.logger.decision(
-                "spark3_candidate",
-                event.mint,
-                {
-                    "lane": "spark3_arm",
-                    "reason": reason,
-                    "score": score,
-                    "features": self.slim_features(features),
-                },
-            )
-            log(f"PGG2-SPARK3-CANDIDATE {short_addr(event.mint)} {reason} score={score:.1f}")
-            return None
-        plan = StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="spark3_arm",
-            reason=reason,
-            score=score,
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=self.slim_features(features),
-        )
-        plan.features.update({"entry_size_reason": "spark3_arm_probe", "entry_probe_sol": scout})
-        return plan
-
-    def spark3_breakout_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        if not env_bool("PGG2_SPARK3_BREAKOUT_ENABLED", False):
-            return None
-        if not event.is_buy or event.mint in self.spark3_breakout_seen:
-            return None
-        arm = self.spark3_arms.get(event.mint)
-        if not arm:
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        arm_age_ms = event.ts_ms - int(arm.get("ts_ms") or 0)
-        if arm_age_ms < 0 or arm_age_ms > env_int("PGG2_SPARK3_BREAKOUT_MAX_DELAY_MS", 30000):
-            return None
-        price = float(features.get("price") or 0.0)
-        base_price = float(arm.get("base_price") or 0.0)
-        if price <= 0 or base_price <= 0:
-            return None
-        arm["min_price"] = min(float(arm.get("min_price") or base_price), price)
-        arm["max_price"] = max(float(arm.get("max_price") or base_price), price)
-        pre_confirm_hold = float(arm.get("min_price") or base_price) / base_price
-        if pre_confirm_hold < env_float("PGG2_SPARK3_BREAKOUT_MIN_PRE_CONFIRM_HOLD", 0.92):
-            self.spark3_breakout_seen.add(event.mint)
-            self.logger.decision(
-                "spark3_breakout_reject",
-                event.mint,
-                {
-                    "lane": "spark3_breakout",
-                    "reason": f"pre_confirm_dump hold={pre_confirm_hold:.3f}",
-                    "features": self.slim_features(features),
-                },
-            )
-            return None
-        breakout_mult = price / base_price
-        if price > env_float("PGG2_SPARK3_BREAKOUT_MAX_ABS_PRICE", 0.010):
-            return None
-        if breakout_mult < env_float("PGG2_SPARK3_BREAKOUT_MIN_MULT", 1.32):
-            return None
-        confirm_ms = env_int("PGG2_SPARK3_BREAKOUT_CONFIRM_MS", 1000)
-        hold_ratio = env_float("PGG2_SPARK3_BREAKOUT_CONFIRM_MIN_HOLD", 0.92)
-        watch = self.spark3_breakout_watch.get(event.mint)
-        if watch:
-            watch_age_ms = event.ts_ms - int(watch.get("ts_ms") or 0)
-            if watch_age_ms < confirm_ms:
-                return None
-            watch_price = float(watch.get("price") or 0.0)
-            if watch_price <= 0 or price < watch_price * hold_ratio:
-                self.spark3_breakout_seen.add(event.mint)
-                self.spark3_breakout_watch.pop(event.mint, None)
-                self.logger.decision(
-                    "spark3_breakout_reject",
-                    event.mint,
-                    {
-                        "lane": "spark3_breakout",
-                        "reason": f"failed_hold age={watch_age_ms}ms hold={price / max(watch_price, 1e-18):.3f}",
-                        "features": self.slim_features(features),
-                    },
-                )
-                return None
-            if breakout_mult > env_float("PGG2_SPARK3_BREAKOUT_CONFIRM_MAX_MULT", 4.50):
-                self.spark3_breakout_seen.add(event.mint)
-                self.spark3_breakout_watch.pop(event.mint, None)
-                self.logger.decision(
-                    "spark3_breakout_reject",
-                    event.mint,
-                    {
-                        "lane": "spark3_breakout",
-                        "reason": f"confirm_overextended break={breakout_mult:.3f}x",
-                        "features": self.slim_features(features),
-                    },
-                )
-                return None
-            watch_features = dict(watch.get("features") or {})
-            scout = min(
-                self.config.max_position_sol,
-                max(0.0005, env_float("PGG2_SPARK3_BREAKOUT_SOL", 0.050)),
-            )
-            score = 160.0 + min(160.0, max(0.0, breakout_mult - 1.0) * 220.0)
-            reason = (
-                f"spark3_breakout arm_age={arm_age_ms}ms confirm={watch_age_ms}ms break={breakout_mult:.3f}x "
-                f"watch={float(watch.get('breakout_mult') or 0.0):.3f}x from={short_addr(event.mint)}"
-            )
-            plan = StrikePlan(
-                mint=event.mint,
-                ts_ms=event.ts_ms,
-                lane="spark3_breakout",
-                reason=reason,
-                score=score,
-                scout_sol=scout,
-                target_sol=scout,
-                price=price,
-                needs_curve_fill=False,
-                features=self.slim_features(features),
-            )
-            plan.features.update(
-                {
-                    "spark3_arm": arm,
-                    "spark3_breakout_mult": breakout_mult,
-                    "spark3_breakout_watch_features": watch_features,
-                    "entry_size_reason": "spark3_breakout",
-                    "entry_probe_sol": scout,
-                }
-            )
-            self.spark3_breakout_watch.pop(event.mint, None)
-            return plan
-        sell700 = float(features["s700"].get("sell_sol") or 0.0)
-        sell1500 = float(features["s1500"].get("sell_sol") or 0.0)
-        buy700 = float(features["s700"].get("buy_sol") or 0.0)
-        uniq700 = int(features["s700"].get("unique_buyers") or 0)
-        top700 = float(features["s700"].get("top_buy_share") or 1.0)
-        hhi700 = float(features["s700"].get("buyer_hhi") or 1.0)
-        if uniq700 < env_int("PGG2_SPARK3_BREAKOUT_MIN_UNIQ700", 4):
-            return None
-        if top700 > env_float("PGG2_SPARK3_BREAKOUT_MAX_TOP700", 0.74):
-            return None
-        if hhi700 > env_float("PGG2_SPARK3_BREAKOUT_MAX_HHI700", 0.62):
-            return None
-        if sell700 + sell1500 > max(
-            env_float("PGG2_SPARK3_BREAKOUT_MAX_SELL_SOL", 0.050),
-            buy700 * env_float("PGG2_SPARK3_BREAKOUT_MAX_SELL_RATIO", 0.08),
-        ):
-            return None
-        if breakout_mult > env_float("PGG2_SPARK3_BREAKOUT_MAX_MULT", 1.60):
-            return None
-        self.spark3_breakout_watch[event.mint] = {
-            "ts_ms": event.ts_ms,
-            "price": price,
-            "breakout_mult": breakout_mult,
-            "features": self.slim_features(features),
-        }
-        self.logger.decision(
-            "spark3_breakout_watch",
-            event.mint,
-            {
-                "lane": "spark3_breakout",
-                "reason": f"watch break={breakout_mult:.3f}x",
-                "features": self.slim_features(features),
-            },
-        )
-        return None
 
     def curve_lag_reveal_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
         """PGG2 curve-lag reveal lane.
@@ -1466,9 +925,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return None
         if event.mint in self.broker.positions or event.mint in self.broker.pending:
             return None
-        has_curve = bool(features.get("has_curve"))
-        allow_price_hint = env_bool("PGG2_PRICED_BREAKOUT_ALLOW_PRICE_HINT", True)
-        if features.get("complete") or (not has_curve and not allow_price_hint):
+        if features.get("complete") or not features.get("has_curve"):
             return None
         price = float(features.get("price") or 0.0)
         if price <= 0:
@@ -1574,797 +1031,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             }
         )
         return plan
-
-    def preprice_reveal_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        """PGG2 preprice-reveal lane.
-
-        Current quote tape showed a blind spot: a broad zero-price launch bundle
-        arms the mint, first real curve price appears within ~1s, then the token
-        moves before post-price confirmation reaches curve_lag thresholds. This
-        lane buys the first priced continuation after a broad pre-price cluster.
-        """
-        if not env_bool("PGG2_PREPRICE_REVEAL_ENABLED", True):
-            return None
-        if not event.is_buy or event.mint in self.preprice_reveal_seen:
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        has_curve = bool(features.get("has_curve"))
-        allow_price_hint = env_bool("PGG2_PRICED_BREAKOUT_ALLOW_PRICE_HINT", True)
-        if features.get("complete") or (not has_curve and not allow_price_hint):
-            if env_bool("PGG2_PRICED_BREAKOUT_DEBUG", False) and event.sol >= 0.10:
-                log(
-                    f"PGG2-PRICED-BREAKOUT-SKIP {short_addr(event.mint)} no_curve "
-                    f"has_curve={int(bool(features.get('has_curve')))} price={float(features.get('price') or 0.0):.9e} "
-                    f"buy={event.sol:.3f}"
-                )
-            return None
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            if env_bool("PGG2_PRICED_BREAKOUT_DEBUG", False) and event.sol >= 0.10:
-                log(f"PGG2-PRICED-BREAKOUT-SKIP {short_addr(event.mint)} zero_price buy={event.sol:.3f}")
-            return None
-        tape = self.tapes.get(event.mint)
-        if not tape or not tape.prices:
-            if env_bool("PGG2_PRICED_BREAKOUT_DEBUG", False) and event.sol >= 0.10:
-                log(f"PGG2-PRICED-BREAKOUT-SKIP {short_addr(event.mint)} no_tape_price buy={event.sol:.3f}")
-            return None
-        first_price_ts, first_price = tape.prices[0]
-        if first_price <= 0:
-            return None
-        anchor_ts = tape.first_create_ms or tape.first_seen_ms or first_price_ts
-        first_price_delay_ms = max(0, first_price_ts - anchor_ts)
-        first_price_age_ms = max(0, int(features["ts_ms"]) - first_price_ts)
-        if first_price_delay_ms < env_int("PGG2_PREPRICE_REVEAL_MIN_FIRST_PRICE_DELAY_MS", 150):
-            return None
-        if first_price_delay_ms > env_int("PGG2_PREPRICE_REVEAL_MAX_FIRST_PRICE_DELAY_MS", 1200):
-            return None
-        if first_price_age_ms > env_int("PGG2_PREPRICE_REVEAL_MAX_FIRST_PRICE_AGE_MS", 700):
-            return None
-
-        pre = self.event_window_stats(event.mint, anchor_ts, first_price_ts)
-        pre_buy_sol = float(pre.get("buy_sol") or 0.0)
-        pre_sell_sol = float(pre.get("sell_sol") or 0.0)
-        pre_unique = int(pre.get("unique_buyers") or 0)
-        pre_top = float(pre.get("top_buy_share") or 1.0)
-        if pre_buy_sol < env_float("PGG2_PREPRICE_REVEAL_MIN_PRE_BUY_SOL", 14.0):
-            return None
-        if pre_unique < env_int("PGG2_PREPRICE_REVEAL_MIN_PRE_BUYERS", 12):
-            return None
-        if pre_top > env_float("PGG2_PREPRICE_REVEAL_MAX_PRE_TOP", 0.30):
-            return None
-        if pre_sell_sol > max(0.010, pre_buy_sol * env_float("PGG2_PREPRICE_REVEAL_MAX_PRE_SELL_RATIO", 0.08)):
-            return None
-
-        vsol = float(features.get("vsol_sol") or 0.0)
-        entry_move = price / max(first_price, 1e-18)
-        if event.sol < env_float("PGG2_PREPRICE_REVEAL_MIN_CURRENT_BUY_SOL", 0.03):
-            return None
-        if vsol < env_float("PGG2_PREPRICE_REVEAL_MIN_VSOL", 35.0):
-            return None
-        if entry_move > env_float("PGG2_PREPRICE_REVEAL_MAX_ENTRY_MOVE", 1.15):
-            return None
-
-        scout = min(self.config.max_position_sol, env_float("PGG2_PREPRICE_REVEAL_SOL", self.config.scout_sol))
-        score = (
-            130.0
-            + min(60.0, pre_buy_sol * 2.0)
-            + min(42.0, pre_unique * 3.0)
-            + min(20.0, event.sol * 40.0)
-            - max(0.0, pre_top - 0.30) * 55.0
-        )
-        reason = (
-            f"preprice_reveal delay={first_price_delay_ms}ms first_age={first_price_age_ms}ms "
-            f"pre={pre_buy_sol:.2f}/{pre_unique} top={pre_top:.2f} "
-            f"cur_buy={event.sol:.3f} "
-            f"move={entry_move:.2f}x vsol={vsol:.2f}"
-        )
-        reveal_features = self.slim_features(features)
-        reveal_features.update(
-            {
-                "preprice_first_price": first_price,
-                "preprice_first_price_ts_ms": first_price_ts,
-                "preprice_first_price_delay_ms": first_price_delay_ms,
-                "preprice_first_price_age_ms": first_price_age_ms,
-                "preprice_pre": pre,
-                "preprice_entry_move": entry_move,
-                "entry_size_reason": "preprice_reveal",
-                "entry_probe_sol": scout,
-            }
-        )
-        return StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="preprice_reveal",
-            reason=reason,
-            score=score,
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=reveal_features,
-        )
-
-    def priced_snap_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        """Immediate priced-breakout lane.
-
-        Raw-tape forensics showed the existing priced_breakout confirmation wait
-        was the wrong shape for the live runners: the signal is already visible
-        at the first clean 1.18x-1.75x priced break, and waiting 750ms often
-        turns it into a late/tight-stop entry. This lane enters immediately but
-        only on clean recent breadth and low sell pressure.
-        """
-        if not env_bool("PGG2_PRICED_SNAP_ENABLED", False):
-            return None
-        if not event.is_buy or event.mint in self.priced_snap_seen:
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        if features.get("complete") or not bool(features.get("has_curve")):
-            return None
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            return None
-        tape = self.tapes.get(event.mint)
-        if not tape or not tape.prices:
-            return None
-        first_price_ts, first_price = tape.prices[0]
-        first_price = float(first_price or 0.0)
-        if first_price <= 0:
-            return None
-
-        entry_move = price / first_price
-        age_sec = (event.ts_ms - int(first_price_ts)) / 1000.0
-        if age_sec < env_float("PGG2_PRICED_SNAP_MIN_AGE_SEC", 0.15):
-            return None
-        if age_sec > env_float("PGG2_PRICED_SNAP_MAX_AGE_SEC", 45.0):
-            return None
-        if entry_move < env_float("PGG2_PRICED_SNAP_MIN_MOVE", 1.18):
-            return None
-        if entry_move > env_float("PGG2_PRICED_SNAP_MAX_MOVE", 1.75):
-            return None
-
-        buy1500 = float(features.get("buy1500") or 0.0)
-        sell1500 = float(features.get("sell1500") or 0.0)
-        uniq1500 = int(features.get("uniq1500") or 0)
-        top1500 = float(features.get("top_share1500") or 1.0)
-        sell_ratio = sell1500 / max(buy1500, 0.001)
-        if buy1500 < env_float("PGG2_PRICED_SNAP_MIN_BUY1500", 6.0):
-            return None
-        if uniq1500 < env_int("PGG2_PRICED_SNAP_MIN_UNIQ1500", 4):
-            return None
-        if top1500 > env_float("PGG2_PRICED_SNAP_MAX_TOP1500", 0.55):
-            return None
-        if sell1500 > max(0.010, buy1500 * env_float("PGG2_PRICED_SNAP_MAX_SELL_RATIO1500", 0.08)):
-            return None
-        if event.sol < env_float("PGG2_PRICED_SNAP_MIN_CURRENT_BUY_SOL", 0.03):
-            return None
-        vsol = float(features.get("vsol_sol") or 0.0)
-        min_vsol = env_float("PGG2_PRICED_SNAP_MIN_VSOL", 0.0)
-        if min_vsol > 0 and vsol < min_vsol:
-            return None
-
-        scout = min(self.config.max_position_sol, env_float("PGG2_PRICED_SNAP_SOL", self.config.scout_sol))
-        score = (
-            150.0
-            + min(55.0, buy1500 * 5.5)
-            + min(45.0, uniq1500 * 5.0)
-            + max(0.0, entry_move - 1.0) * 120.0
-            - max(0.0, top1500 - 0.40) * 55.0
-            - sell_ratio * 95.0
-        )
-        reason = (
-            f"priced_snap move={entry_move:.2f}x age={age_sec:.1f}s "
-            f"b1500={buy1500:.2f}/{uniq1500} top={top1500:.2f} "
-            f"cur_buy={event.sol:.2f} sellr={sell_ratio:.2f} vsol={vsol:.2f}"
-        )
-        snap_features = self.slim_features(features)
-        snap_features.update(
-            {
-                "entry_size_reason": "priced_snap",
-                "entry_probe_sol": scout,
-                "priced_snap_first_price": first_price,
-                "priced_snap_first_price_ts_ms": int(first_price_ts),
-                "priced_snap_entry_move": entry_move,
-                "priced_snap_age_sec": age_sec,
-                "priced_snap_sell_ratio1500": sell_ratio,
-            }
-        )
-        return StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="priced_snap",
-            reason=reason,
-            score=score,
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=snap_features,
-        )
-
-    def priced_breakout_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        """PGG2 priced-breakout lane.
-
-        This is the live blind-spot lane found from quote/raw logs: some mints
-        never form the old wave/reclaim plan, but once a real curve price exists
-        they cleanly break 1.35x from first price and continue to 1.8x-8x. The
-        lane buys only after priced confirmation, with recent breadth and no
-        sell pressure; live quote preflight still decides whether execution is
-        clean enough to actually open.
-        """
-        if not env_bool("PGG2_PRICED_BREAKOUT_ENABLED", True):
-            return None
-        if not event.is_buy or event.mint in self.priced_breakout_seen:
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        has_curve = bool(features.get("has_curve"))
-        allow_price_hint = env_bool("PGG2_PRICED_BREAKOUT_ALLOW_PRICE_HINT", True)
-        if features.get("complete") or (not has_curve and not allow_price_hint):
-            return None
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            return None
-        tape = self.tapes.get(event.mint)
-        if not tape or not tape.prices:
-            return None
-        first_price_ts, first_price = tape.prices[0]
-        first_price = float(first_price or 0.0)
-        if first_price <= 0:
-            return None
-        entry_move = price / first_price
-        age_sec = (event.ts_ms - int(first_price_ts)) / 1000.0
-        if age_sec < env_float("PGG2_PRICED_BREAKOUT_MIN_AGE_SEC", 0.25):
-            return None
-        if age_sec > env_float("PGG2_PRICED_BREAKOUT_MAX_AGE_SEC", 20.0):
-            return None
-
-        buy1500 = float(features.get("buy1500") or 0.0)
-        sell1500 = float(features.get("sell1500") or 0.0)
-        uniq1500 = int(features.get("uniq1500") or 0)
-        top1500 = float(features.get("top_share1500") or 1.0)
-        vsol = float(features.get("vsol_sol") or 0.0)
-        sell_ratio = sell1500 / max(buy1500, 0.001)
-        vsol_ok = vsol >= env_float("PGG2_PRICED_BREAKOUT_MIN_VSOL", 30.0) or (allow_price_hint and not has_curve)
-        breadth_breakout = (
-            buy1500 >= env_float("PGG2_PRICED_BREAKOUT_MIN_BUY1500", 3.0)
-            and uniq1500 >= env_int("PGG2_PRICED_BREAKOUT_MIN_UNIQ1500", 4)
-            and top1500 <= env_float("PGG2_PRICED_BREAKOUT_MAX_TOP1500", 0.60)
-            and sell1500 <= max(0.010, buy1500 * env_float("PGG2_PRICED_BREAKOUT_MAX_SELL_RATIO1500", 0.08))
-            and vsol_ok
-        )
-        whale_breakout = (
-            env_bool("PGG2_PRICED_BREAKOUT_WHALE_PROFILE_ENABLED", True)
-            and age_sec <= env_float("PGG2_PRICED_BREAKOUT_WHALE_MAX_AGE_SEC", 6.0)
-            and event.sol >= env_float("PGG2_PRICED_BREAKOUT_WHALE_MIN_CURRENT_BUY_SOL", 0.20)
-            and buy1500 >= env_float("PGG2_PRICED_BREAKOUT_WHALE_MIN_BUY1500", 0.20)
-            and uniq1500 >= env_int("PGG2_PRICED_BREAKOUT_WHALE_MIN_UNIQ1500", 3)
-            and top1500 <= env_float("PGG2_PRICED_BREAKOUT_WHALE_MAX_TOP1500", 0.75)
-            and sell1500 <= max(0.005, buy1500 * env_float("PGG2_PRICED_BREAKOUT_WHALE_MAX_SELL_RATIO1500", 0.03))
-            and (vsol >= env_float("PGG2_PRICED_BREAKOUT_WHALE_MIN_VSOL", 40.0) or (allow_price_hint and not has_curve))
-        )
-        if env_bool("PGG2_PRICED_BREAKOUT_DEBUG", False) and entry_move >= env_float("PGG2_PRICED_BREAKOUT_MIN_MOVE", 1.35):
-            log(
-                f"PGG2-PRICED-BREAKOUT-CHECK {short_addr(event.mint)} move={entry_move:.2f} age={age_sec:.1f}s "
-                f"cur={event.sol:.3f} b1500={buy1500:.2f}/{uniq1500} top={top1500:.2f} "
-                f"sell={sell1500:.3f} vsol={vsol:.2f} breadth={int(breadth_breakout)} whale={int(whale_breakout)}"
-            )
-        if not (breadth_breakout or whale_breakout):
-            if event.mint in self.priced_breakout_watch:
-                self.priced_breakout_seen.add(event.mint)
-                self.priced_breakout_watch.pop(event.mint, None)
-                self.logger.decision(
-                    "priced_breakout_reject",
-                    event.mint,
-                    {"reason": "confirm_breadth_failed", "features": self.slim_features(features)},
-                )
-            return None
-        if features.get("last_buy_age_ms", 999999) > env_int("PGG2_PRICED_BREAKOUT_MAX_LAST_BUY_AGE_MS", 450):
-            return None
-
-        profile = "breadth" if breadth_breakout else "whale"
-        watch = self.priced_breakout_watch.get(event.mint)
-        if not watch:
-            if entry_move < env_float("PGG2_PRICED_BREAKOUT_MIN_MOVE", 1.35):
-                return None
-            if entry_move > env_float("PGG2_PRICED_BREAKOUT_MAX_MOVE", 1.85):
-                return None
-            self.priced_breakout_watch[event.mint] = {
-                "ts_ms": event.ts_ms,
-                "price": price,
-                "entry_move": entry_move,
-                "profile": profile,
-            }
-            self.logger.decision(
-                "priced_breakout_watch",
-                event.mint,
-                {
-                    "reason": f"watch {profile} move={entry_move:.3f}x",
-                    "features": self.slim_features(features),
-                },
-            )
-            return None
-
-        watch_age_ms = event.ts_ms - int(watch["ts_ms"])
-        if watch_age_ms > env_int("PGG2_PRICED_BREAKOUT_CONFIRM_MAX_WATCH_MS", 2500):
-            self.priced_breakout_seen.add(event.mint)
-            self.priced_breakout_watch.pop(event.mint, None)
-            self.logger.decision(
-                "priced_breakout_reject",
-                event.mint,
-                {"reason": f"confirm_timeout age={watch_age_ms}ms", "features": self.slim_features(features)},
-            )
-            return None
-        if watch_age_ms < env_int("PGG2_PRICED_BREAKOUT_CONFIRM_MS", 750):
-            return None
-        watch_price = float(watch["price"])
-        hold_ratio = price / max(watch_price, 1e-18)
-        if hold_ratio < env_float("PGG2_PRICED_BREAKOUT_CONFIRM_MIN_HOLD", 0.97):
-            self.priced_breakout_seen.add(event.mint)
-            self.priced_breakout_watch.pop(event.mint, None)
-            self.logger.decision(
-                "priced_breakout_reject",
-                event.mint,
-                {
-                    "reason": f"confirm_failed_hold age={watch_age_ms}ms hold={hold_ratio:.3f}",
-                    "features": self.slim_features(features),
-                },
-            )
-            return None
-        if entry_move > env_float("PGG2_PRICED_BREAKOUT_CONFIRM_MAX_ENTRY_MOVE", 1.85):
-            self.priced_breakout_seen.add(event.mint)
-            self.priced_breakout_watch.pop(event.mint, None)
-            self.logger.decision(
-                "priced_breakout_reject",
-                event.mint,
-                {
-                    "reason": f"confirm_overextended move={entry_move:.3f}x",
-                    "features": self.slim_features(features),
-                },
-            )
-            return None
-
-        scout = min(self.config.max_position_sol, env_float("PGG2_PRICED_BREAKOUT_SOL", self.config.scout_sol))
-        score = (
-            145.0
-            + min(50.0, buy1500 * 5.0)
-            + min(42.0, uniq1500 * 5.0)
-            + max(0.0, entry_move - 1.0) * 95.0
-            - max(0.0, top1500 - 0.45) * 40.0
-            - sell_ratio * 80.0
-        )
-        reason = (
-            f"priced_breakout {profile} confirm={watch_age_ms}ms move={entry_move:.2f}x "
-            f"watch={float(watch['entry_move']):.2f}x age={age_sec:.1f}s "
-            f"b1500={buy1500:.2f}/{uniq1500} top={top1500:.2f} "
-            f"cur_buy={event.sol:.2f} sellr={sell_ratio:.2f} vsol={vsol:.2f}"
-        )
-        breakout_features = self.slim_features(features)
-        breakout_features.update(
-            {
-                "entry_size_reason": "priced_breakout",
-                "entry_probe_sol": scout,
-                "priced_breakout_first_price": first_price,
-                "priced_breakout_first_price_ts_ms": int(first_price_ts),
-                "priced_breakout_entry_move": entry_move,
-                "priced_breakout_age_sec": age_sec,
-                "priced_breakout_profile": profile,
-                "priced_breakout_watch_move": float(watch["entry_move"]),
-                "priced_breakout_confirm_ms": watch_age_ms,
-                "priced_breakout_confirm_hold": hold_ratio,
-            }
-        )
-        self.priced_breakout_watch.pop(event.mint, None)
-        return StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="priced_breakout",
-            reason=reason,
-            score=score,
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=breakout_features,
-        )
-
-    def late_swarm_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        """Late broad-swarm lane.
-
-        Quote/raw runs showed a second blind spot: some real runners do not look
-        tradable in the first 20 seconds, then a broad late swarm arrives
-        (example: D3K3 with ~29 SOL / 15 buyers / top 0.14 around 87s). This
-        lane is intentionally narrow: big breadth, low concentration, no sell
-        pressure, and a live executable quote guard still has final veto.
-        """
-        if not env_bool("PGG2_LATE_SWARM_ENABLED", True):
-            return None
-        if not event.is_buy or event.mint in self.late_swarm_seen:
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        if features.get("complete") or not features.get("has_curve"):
-            return None
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            return None
-        tape = self.tapes.get(event.mint)
-        if not tape or not tape.prices:
-            return None
-        first_price_ts, first_price = tape.prices[0]
-        first_price = float(first_price or 0.0)
-        if first_price <= 0:
-            return None
-        age_sec = (event.ts_ms - int(first_price_ts)) / 1000.0
-        if age_sec < env_float("PGG2_LATE_SWARM_MIN_AGE_SEC", 20.0):
-            return None
-        if age_sec > env_float("PGG2_LATE_SWARM_MAX_AGE_SEC", 180.0):
-            return None
-        entry_move = price / first_price
-        if entry_move < env_float("PGG2_LATE_SWARM_MIN_MOVE", 1.05):
-            return None
-        if entry_move > env_float("PGG2_LATE_SWARM_MAX_MOVE", 3.20):
-            return None
-
-        s3000 = features.get("s3000") or {}
-        buy3000 = float(features.get("buy3000") or s3000.get("buy_sol") or 0.0)
-        sell3000 = float(features.get("sell3000") or s3000.get("sell_sol") or 0.0)
-        uniq3000 = int(features.get("uniq3000") or s3000.get("unique_buyers") or 0)
-        top3000 = float(features.get("top_share3000") or s3000.get("top_buy_share") or 1.0)
-        sell_ratio = sell3000 / max(buy3000, 0.001)
-        vsol = float(features.get("vsol_sol") or 0.0)
-        if buy3000 < env_float("PGG2_LATE_SWARM_MIN_BUY3000", 20.0):
-            return None
-        if uniq3000 < env_int("PGG2_LATE_SWARM_MIN_UNIQ3000", 12):
-            return None
-        if top3000 > env_float("PGG2_LATE_SWARM_MAX_TOP3000", 0.22):
-            return None
-        if sell3000 > max(0.02, buy3000 * env_float("PGG2_LATE_SWARM_MAX_SELL_RATIO3000", 0.02)):
-            return None
-        if vsol < env_float("PGG2_LATE_SWARM_MIN_VSOL", 35.0):
-            return None
-        if features.get("last_buy_age_ms", 999999) > env_int("PGG2_LATE_SWARM_MAX_LAST_BUY_AGE_MS", 500):
-            return None
-
-        scout = min(self.config.max_position_sol, env_float("PGG2_LATE_SWARM_SOL", 0.020))
-        score = (
-            190.0
-            + min(80.0, buy3000 * 2.5)
-            + min(70.0, uniq3000 * 4.0)
-            + max(0.0, entry_move - 1.0) * 55.0
-            - top3000 * 55.0
-            - sell_ratio * 160.0
-        )
-        reason = (
-            f"late_swarm move={entry_move:.2f}x age={age_sec:.1f}s "
-            f"b3000={buy3000:.2f}/{uniq3000} top={top3000:.2f} "
-            f"sellr={sell_ratio:.3f} vsol={vsol:.2f}"
-        )
-        swarm_features = self.slim_features(features)
-        swarm_features.update(
-            {
-                "entry_size_reason": "late_swarm",
-                "entry_probe_sol": scout,
-                "late_swarm_entry_move": entry_move,
-                "late_swarm_age_sec": age_sec,
-                "late_swarm_buy3000": buy3000,
-                "late_swarm_uniq3000": uniq3000,
-                "late_swarm_top3000": top3000,
-            }
-        )
-        return StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="late_swarm",
-            reason=reason,
-            score=score,
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=swarm_features,
-        )
-
-    def curve_arm_scout_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        if not env_bool("PGG2_CURVE_ARM_SCOUT_ENABLED", False):
-            return None
-        if not event.is_buy or event.mint in self.curve_arm_scout_seen:
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        if features.get("complete") or not features.get("has_curve"):
-            return None
-        if int(features.get("wave_arm_age_ms") or 0) > env_int("PGG2_CURVE_ARM_MAX_ARM_AGE_MS", 900):
-            return None
-        buy1500 = float(features.get("buy1500") or 0.0)
-        uniq1500 = int(features.get("uniq1500") or 0)
-        top1500 = float(features.get("top_share1500") or 1.0)
-        sell1500 = float(features.get("sell1500") or 0.0)
-        vsol = float(features.get("vsol_sol") or 0.0)
-        move700 = float(features.get("move700") or 1.0)
-        if buy1500 < env_float("PGG2_CURVE_ARM_MIN_BUY1500", 2.50):
-            return None
-        if buy1500 > env_float("PGG2_CURVE_ARM_MAX_BUY1500", 4.00):
-            return None
-        if uniq1500 < env_int("PGG2_CURVE_ARM_MIN_UNIQ1500", 3):
-            return None
-        if top1500 > env_float("PGG2_CURVE_ARM_MAX_TOP1500", 0.40):
-            return None
-        if sell1500 > env_float("PGG2_CURVE_ARM_MAX_SELL1500", 0.001):
-            return None
-        if vsol < env_float("PGG2_CURVE_ARM_MIN_VSOL", 40.0):
-            return None
-        if move700 > env_float("PGG2_CURVE_ARM_MAX_MOVE700", 1.03):
-            return None
-        scout = min(self.config.max_position_sol, env_float("PGG2_CURVE_ARM_SCOUT_SOL", self.config.scout_sol))
-        score = float(features.get("score") or 0.0)
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            return None
-        reason = (
-            f"curve_arm_scout b1500={buy1500:.3f}/{uniq1500} top={top1500:.2f} "
-            f"vsol={vsol:.2f} move700={move700:.3f}"
-        )
-        plan = StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="curve_arm_scout",
-            reason=reason,
-            score=score,
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=self.slim_features(features),
-        )
-        plan.features.update({"entry_size_reason": "curve_arm_scout", "entry_probe_sol": scout})
-        return plan
-
-    def raw_momentum_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        """Quote-only blind-spot lane for older/unarmed tape momentum.
-
-        Raw momentum is intentionally two-step:
-          1. arm when the 10s tape shows broad momentum
-          2. buy only after price confirms continuation from that arm
-
-        The direct-buy version caught too many first-spike fakeouts. This keeps
-        the moonshot blind-spot detector, but refuses to buy until the mint proves
-        the spike is continuing instead of rolling over.
-        """
-        if not env_bool("PGG2_RAW_MOMENTUM_ENABLED", False):
-            return None
-        if not event.is_buy or event.mint in self.raw_momentum_seen:
-            return None
-        if features.get("complete"):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            return None
-        tape = self.tapes.get(event.mint)
-        if not tape or not tape.prices:
-            return None
-        first_price = float(tape.prices[0][1] or 0.0)
-        if first_price <= 0:
-            return None
-        window_ms = env_int("PGG2_RAW_MOMENTUM_WINDOW_MS", 10000)
-        stats = self.event_window_stats(event.mint, event.ts_ms - window_ms, event.ts_ms)
-        buy_sol = float(stats.get("buy_sol") or 0.0)
-        sell_sol = float(stats.get("sell_sol") or 0.0)
-        unique_buyers = int(stats.get("unique_buyers") or 0)
-        top_share = float(stats.get("top_buy_share") or 1.0)
-        sell_ratio = sell_sol / max(buy_sol, 0.001)
-        entry_move = price / first_price
-        vsol = float(features.get("vsol_sol") or 0.0)
-        if buy_sol < env_float("PGG2_RAW_MOMENTUM_MIN_BUY_SOL", 8.0):
-            return None
-        if unique_buyers < env_int("PGG2_RAW_MOMENTUM_MIN_UNIQ", 8):
-            return None
-        if top_share < env_float("PGG2_RAW_MOMENTUM_MIN_TOP", 0.25):
-            return None
-        if top_share > env_float("PGG2_RAW_MOMENTUM_MAX_TOP", 0.35):
-            return None
-        if sell_ratio > env_float("PGG2_RAW_MOMENTUM_MAX_SELL_RATIO", 0.15):
-            return None
-        if entry_move < env_float("PGG2_RAW_MOMENTUM_MIN_MOVE", 1.15):
-            return None
-        if entry_move > env_float("PGG2_RAW_MOMENTUM_MAX_MOVE", 1.70):
-            return None
-        if vsol < env_float("PGG2_RAW_MOMENTUM_MIN_VSOL", 35.0):
-            return None
-        arm = self.raw_momentum_arms.get(event.mint)
-        if not arm:
-            self.raw_momentum_arms[event.mint] = {
-                "ts_ms": event.ts_ms,
-                "price": price,
-                "buy_sol": buy_sol,
-                "sell_sol": sell_sol,
-                "unique_buyers": unique_buyers,
-                "top_share": top_share,
-                "sell_ratio": sell_ratio,
-                "entry_move": entry_move,
-                "vsol": vsol,
-            }
-            log(
-                f"PGG2-RAW-MOMENTUM-ARM {short_addr(event.mint)} "
-                f"buy10s={buy_sol:.2f}/{unique_buyers} top={top_share:.2f} "
-                f"move={entry_move:.2f}x vsol={vsol:.2f}"
-            )
-            return None
-        arm_age = event.ts_ms - int(arm.get("ts_ms") or event.ts_ms)
-        if arm_age > env_int("PGG2_RAW_MOMENTUM_CONFIRM_MAX_AGE_MS", 6500):
-            self.raw_momentum_seen.add(event.mint)
-            self.raw_momentum_arms.pop(event.mint, None)
-            log(f"PGG2-RAW-MOMENTUM-EXPIRE {short_addr(event.mint)} age_ms={arm_age}")
-            return None
-        arm_price = float(arm.get("price") or 0.0)
-        if arm_price <= 0:
-            self.raw_momentum_seen.add(event.mint)
-            self.raw_momentum_arms.pop(event.mint, None)
-            return None
-        confirm_mult = price / arm_price
-        s700 = features["s700"]
-        s1500 = features["s1500"]
-        buy700 = float(s700.get("buy_sol") or 0.0)
-        sell700 = float(s700.get("sell_sol") or 0.0)
-        sell_ratio700 = sell700 / max(buy700, 0.001)
-        if confirm_mult < env_float("PGG2_RAW_MOMENTUM_CONFIRM_MULT", 1.10):
-            return None
-        if features["last_buy_age_ms"] > env_int("PGG2_RAW_MOMENTUM_CONFIRM_MAX_LAST_BUY_MS", 450):
-            return None
-        if sell_ratio700 > env_float("PGG2_RAW_MOMENTUM_CONFIRM_MAX_SELL_RATIO700", 0.10):
-            return None
-        if int(s700.get("unique_buyers") or 0) < env_int("PGG2_RAW_MOMENTUM_CONFIRM_MIN_UNIQ700", 3):
-            return None
-        if float(s1500.get("buy_sol") or 0.0) < env_float("PGG2_RAW_MOMENTUM_CONFIRM_MIN_BUY1500", 3.5):
-            return None
-        scout = min(self.config.max_position_sol, env_float("PGG2_RAW_MOMENTUM_SOL", self.config.scout_sol))
-        reason = (
-            f"raw_momentum buy10s={buy_sol:.2f}/{unique_buyers} top={top_share:.2f} "
-            f"sellr={sell_ratio:.2f} move={entry_move:.2f}x "
-            f"confirm={confirm_mult:.2f}x age={arm_age}ms vsol={vsol:.2f}"
-        )
-        raw_features = self.slim_features(features)
-        raw_features.update(
-            {
-                "raw_arm_age_ms": arm_age,
-                "raw_confirm_mult": confirm_mult,
-                "raw_buy_sol_10s": buy_sol,
-                "raw_sell_sol_10s": sell_sol,
-                "raw_unique_buyers_10s": unique_buyers,
-                "raw_top_share_10s": top_share,
-                "raw_sell_ratio_10s": sell_ratio,
-                "raw_entry_move": entry_move,
-                "entry_size_reason": "raw_momentum",
-                "entry_probe_sol": scout,
-            }
-        )
-        return StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="raw_momentum",
-            reason=reason,
-            score=float(features.get("score") or 0.0),
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=raw_features,
-        )
-
-    def whale_spark_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
-        """Delayed-swarm lane after a huge first buy.
-
-        Current quote tape showed several 2x+ moves that start with a 10+ SOL
-        first buyer while the curve cache is still unpriced, then a broad priced
-        burst roughly 8-12 seconds later. The normal raw-momentum lane rejects
-        them as top-heavy because the first whale dominates the whole 10s tape.
-        This lane ignores the initial whale for entry and requires fresh recent
-        breadth before buying.
-        """
-        if not env_bool("PGG2_WHALE_SPARK_ENABLED", False):
-            return None
-        if not event.is_buy or event.mint in self.whale_spark_seen:
-            return None
-        if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
-            return None
-        if features.get("complete"):
-            return None
-        if event.mint in self.broker.positions or event.mint in self.broker.pending:
-            return None
-        price = float(features.get("price") or 0.0)
-        if price <= 0:
-            return None
-        first_buy_sol = float(features.get("first_buy_sol") or 0.0)
-        if first_buy_sol < env_float("PGG2_WHALE_SPARK_MIN_FIRST_BUY_SOL", 10.0):
-            return None
-        if first_buy_sol > env_float("PGG2_WHALE_SPARK_MAX_FIRST_BUY_SOL", 25.0):
-            return None
-        first_buyer = str(features.get("first_buyer") or "")
-        trusted_raw = env_str("PGG2_WHALE_SPARK_TRUSTED_FIRST_BUYERS", "")
-        trusted = {x.strip() for x in trusted_raw.split(",") if x.strip()}
-        if trusted and first_buyer not in trusted:
-            return None
-        age_ms = int(features.get("age_ms") or 0)
-        if age_ms < env_int("PGG2_WHALE_SPARK_MIN_AGE_MS", 7500):
-            return None
-        if age_ms > env_int("PGG2_WHALE_SPARK_MAX_AGE_MS", 25000):
-            return None
-        tape = self.tapes.get(event.mint)
-        if not tape or not tape.prices:
-            return None
-        first_price = float(tape.prices[0][1] or 0.0)
-        if first_price <= 0:
-            return None
-        entry_move = price / first_price
-        if entry_move > env_float("PGG2_WHALE_SPARK_MAX_ENTRY_MOVE", 1.35):
-            return None
-        s700 = features["s700"]
-        s1500 = features["s1500"]
-        buy700 = float(s700.get("buy_sol") or 0.0)
-        buy1500 = float(s1500.get("buy_sol") or 0.0)
-        uniq700 = int(s700.get("unique_buyers") or 0)
-        uniq1500 = int(s1500.get("unique_buyers") or 0)
-        top1500 = float(s1500.get("top_buy_share") or 1.0)
-        sell1500 = float(s1500.get("sell_sol") or 0.0)
-        sell_ratio = sell1500 / max(buy1500, 0.001)
-        vsol = float(features.get("vsol_sol") or 0.0)
-        if buy700 < env_float("PGG2_WHALE_SPARK_MIN_BUY700", 4.0):
-            return None
-        if buy1500 < env_float("PGG2_WHALE_SPARK_MIN_BUY1500", 8.0):
-            return None
-        if uniq700 < env_int("PGG2_WHALE_SPARK_MIN_UNIQ700", 3):
-            return None
-        if uniq1500 < env_int("PGG2_WHALE_SPARK_MIN_UNIQ1500", 5):
-            return None
-        if top1500 > env_float("PGG2_WHALE_SPARK_MAX_TOP1500", 0.38):
-            return None
-        if sell_ratio > env_float("PGG2_WHALE_SPARK_MAX_SELL_RATIO1500", 0.12):
-            return None
-        if features["last_buy_age_ms"] > env_int("PGG2_WHALE_SPARK_MAX_LAST_BUY_MS", 450):
-            return None
-        if vsol < env_float("PGG2_WHALE_SPARK_MIN_VSOL", 35.0):
-            return None
-        scout = min(self.config.max_position_sol, env_float("PGG2_WHALE_SPARK_SOL", self.config.scout_sol))
-        reason = (
-            f"whale_spark first={first_buy_sol:.2f} age={age_ms}ms "
-            f"b1500={buy1500:.2f}/{uniq1500} top={top1500:.2f} "
-            f"move={entry_move:.2f}x vsol={vsol:.2f}"
-        )
-        spark_features = self.slim_features(features)
-        spark_features.update(
-            {
-                "whale_spark_first_buyer": first_buyer,
-                "whale_spark_first_buy_sol": first_buy_sol,
-                "whale_spark_entry_move": entry_move,
-                "entry_size_reason": "whale_spark",
-                "entry_probe_sol": scout,
-            }
-        )
-        return StrikePlan(
-            mint=event.mint,
-            ts_ms=event.ts_ms,
-            lane="whale_spark",
-            reason=reason,
-            score=float(features.get("score") or 0.0),
-            scout_sol=scout,
-            target_sol=scout,
-            price=price,
-            needs_curve_fill=False,
-            features=spark_features,
-        )
 
     def early_ignition_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
         if not env_bool("PGG2_EARLY_IGNITION_ENABLED", True):
@@ -2634,209 +1300,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return
         self.maybe_arm_first_burst(event, features)
         features = self.feature_snapshot(event.mint, ts_ms) or features
-        spark3_plan = self.spark3_arm_ready(event, features)
-        if spark3_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": spark3_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": spark3_plan.lane,
-                    "reason": spark3_plan.reason,
-                    "score": spark3_plan.score,
-                    "scout_sol": spark3_plan.scout_sol,
-                    "target_sol": spark3_plan.target_sol,
-                    "needs_curve_fill": spark3_plan.needs_curve_fill,
-                    "features": spark3_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(spark3_plan, float(features.get("price") or 0.0))
-            self.spark3_arm_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": spark3_plan.lane, "features": self.slim_features(features)})
-            return
-        stealth_plan = self.stealth_arm_ready(event, features)
-        if stealth_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": stealth_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": stealth_plan.lane,
-                    "reason": stealth_plan.reason,
-                    "score": stealth_plan.score,
-                    "scout_sol": stealth_plan.scout_sol,
-                    "target_sol": stealth_plan.target_sol,
-                    "needs_curve_fill": stealth_plan.needs_curve_fill,
-                    "features": stealth_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(stealth_plan, float(features.get("price") or 0.0))
-            self.stealth_arm_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": stealth_plan.lane, "features": self.slim_features(features)})
-            return
-        spark3_breakout_plan = self.spark3_breakout_ready(event, features)
-        if spark3_breakout_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": spark3_breakout_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": spark3_breakout_plan.lane,
-                    "reason": spark3_breakout_plan.reason,
-                    "score": spark3_breakout_plan.score,
-                    "scout_sol": spark3_breakout_plan.scout_sol,
-                    "target_sol": spark3_breakout_plan.target_sol,
-                    "needs_curve_fill": spark3_breakout_plan.needs_curve_fill,
-                    "features": spark3_breakout_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(spark3_breakout_plan, float(features.get("price") or 0.0))
-            self.spark3_breakout_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": spark3_breakout_plan.lane, "features": self.slim_features(features)})
-            return
-        preprice_plan = self.preprice_reveal_ready(event, features)
-        if preprice_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": preprice_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": preprice_plan.lane,
-                    "reason": preprice_plan.reason,
-                    "score": preprice_plan.score,
-                    "scout_sol": preprice_plan.scout_sol,
-                    "target_sol": preprice_plan.target_sol,
-                    "needs_curve_fill": preprice_plan.needs_curve_fill,
-                    "features": preprice_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(preprice_plan, float(features.get("price") or 0.0))
-            self.preprice_reveal_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": preprice_plan.lane, "features": self.slim_features(features)})
-            return
-        snap_plan = self.priced_snap_ready(event, features)
-        if snap_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": snap_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": snap_plan.lane,
-                    "reason": snap_plan.reason,
-                    "score": snap_plan.score,
-                    "scout_sol": snap_plan.scout_sol,
-                    "target_sol": snap_plan.target_sol,
-                    "needs_curve_fill": snap_plan.needs_curve_fill,
-                    "features": snap_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(snap_plan, float(features.get("price") or 0.0))
-            self.priced_snap_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": snap_plan.lane, "features": self.slim_features(features)})
-            return
-        breakout_plan = self.priced_breakout_ready(event, features)
-        if breakout_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": breakout_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": breakout_plan.lane,
-                    "reason": breakout_plan.reason,
-                    "score": breakout_plan.score,
-                    "scout_sol": breakout_plan.scout_sol,
-                    "target_sol": breakout_plan.target_sol,
-                    "needs_curve_fill": breakout_plan.needs_curve_fill,
-                    "features": breakout_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(breakout_plan, float(features.get("price") or 0.0))
-            self.priced_breakout_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": breakout_plan.lane, "features": self.slim_features(features)})
-            return
-        late_swarm_plan = self.late_swarm_ready(event, features)
-        if late_swarm_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": late_swarm_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": late_swarm_plan.lane,
-                    "reason": late_swarm_plan.reason,
-                    "score": late_swarm_plan.score,
-                    "scout_sol": late_swarm_plan.scout_sol,
-                    "target_sol": late_swarm_plan.target_sol,
-                    "needs_curve_fill": late_swarm_plan.needs_curve_fill,
-                    "features": late_swarm_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(late_swarm_plan, float(features.get("price") or 0.0))
-            self.late_swarm_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": late_swarm_plan.lane, "features": self.slim_features(features)})
-            return
         birth_plan = self.birth_fanout_ready(event, features)
         if birth_plan:
             ok, reason = self.broker.can_strike(event.mint, ts_ms)
@@ -2894,94 +1357,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             if pos:
                 self.init_position_follow(pos, trusted=True, entry_features=features)
                 self.logger.decision("open", event.mint, {"lane": curve_lag_plan.lane, "features": self.slim_features(features)})
-            return
-        curve_arm_plan = self.curve_arm_scout_ready(event, features)
-        if curve_arm_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": curve_arm_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": curve_arm_plan.lane,
-                    "reason": curve_arm_plan.reason,
-                    "score": curve_arm_plan.score,
-                    "scout_sol": curve_arm_plan.scout_sol,
-                    "target_sol": curve_arm_plan.target_sol,
-                    "needs_curve_fill": curve_arm_plan.needs_curve_fill,
-                    "features": curve_arm_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(curve_arm_plan, float(features.get("price") or 0.0))
-            self.curve_arm_scout_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": curve_arm_plan.lane, "features": self.slim_features(features)})
-            return
-        whale_plan = self.whale_spark_ready(event, features)
-        if whale_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": whale_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": whale_plan.lane,
-                    "reason": whale_plan.reason,
-                    "score": whale_plan.score,
-                    "scout_sol": whale_plan.scout_sol,
-                    "target_sol": whale_plan.target_sol,
-                    "needs_curve_fill": whale_plan.needs_curve_fill,
-                    "features": whale_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(whale_plan, float(features.get("price") or 0.0))
-            self.whale_spark_seen.add(event.mint)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": whale_plan.lane, "features": self.slim_features(features)})
-            return
-        raw_plan = self.raw_momentum_ready(event, features)
-        if raw_plan:
-            ok, reason = self.broker.can_strike(event.mint, ts_ms)
-            if not ok:
-                self.logger.decision(
-                    "strike_skipped",
-                    event.mint,
-                    {"reason": reason, "lane": raw_plan.lane, "features": self.slim_features(features)},
-                )
-                return
-            self.logger.decision(
-                "strike_plan",
-                event.mint,
-                {
-                    "lane": raw_plan.lane,
-                    "reason": raw_plan.reason,
-                    "score": raw_plan.score,
-                    "scout_sol": raw_plan.scout_sol,
-                    "target_sol": raw_plan.target_sol,
-                    "needs_curve_fill": raw_plan.needs_curve_fill,
-                    "features": raw_plan.features,
-                },
-            )
-            pos = self.broker.queue_or_fill(raw_plan, float(features.get("price") or 0.0))
-            self.raw_momentum_seen.add(event.mint)
-            self.raw_momentum_arms.pop(event.mint, None)
-            if pos:
-                self.init_position_follow(pos, trusted=True, entry_features=features)
-                self.logger.decision("open", event.mint, {"lane": raw_plan.lane, "features": self.slim_features(features)})
             return
         early_plan = self.early_ignition_ready(event, features)
         if early_plan:
@@ -3115,11 +1490,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
     def close_position(self, mint: str, ts_ms: int, price: float, reason: str, features: dict[str, Any], killed: bool) -> None:
         before_pnl = self.broker.stats.realized_pnl_sol
         super().close_position(mint, ts_ms, price, reason, features, killed)
-        if mint in self.broker.positions:
-            # Live/quote mode can reject a paper sell signal when the executable
-            # Raptor quote is not good enough yet. Keep the follow state intact
-            # so the next tick can still manage the open position correctly.
-            return
         pnl = self.broker.stats.realized_pnl_sol - before_pnl
         if pnl > env_float("PIGGY_PROFIT_REENTRY_MIN_PNL_SOL", 0.0):
             self.profitable_closes[mint] = {
@@ -3149,32 +1519,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         self.broker.stats.best_mult = max(self.broker.stats.best_mult, pos.peak_mult)
         self.add_follow_features(pos, features)
 
-        quote_loss_clamp = getattr(self.broker, "quote_loss_clamp_reason", None)
-        if quote_loss_clamp and self.moonshot_lane(pos.lane):
-            quote_action = quote_loss_clamp(pos, ts_ms)
-            if quote_action:
-                self.close_position(
-                    mint,
-                    ts_ms,
-                    price,
-                    quote_action,
-                    features,
-                    killed=(quote_action == "quote_loss_clamp"),
-                )
-                return
-
-        quote_profit_bank = getattr(self.broker, "quote_profit_bank_reason", None)
-        if quote_profit_bank and self.moonshot_lane(pos.lane):
-            quote_exit = quote_profit_bank(pos, ts_ms)
-            if quote_exit:
-                self.close_position(mint, ts_ms, price, quote_exit, features, killed=False)
-                return
-
         kill = self.piggy_kill_reason(pos, features)
         if kill:
-            defer_paper_kill = getattr(self.broker, "defer_paper_kill_reason", None)
-            if defer_paper_kill and defer_paper_kill(pos, kill, ts_ms):
-                return
             self.close_position(mint, ts_ms, price, kill, features, killed=True)
             return
         if features["complete"]:
@@ -3193,55 +1539,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 if pos.peak_mult >= 1.32 and sell_pressure and mult >= 1.12:
                     self.close_position(mint, ts_ms, price, "moonshot_pop_after_sell", features, killed=False)
                     return
-                if (
-                    pos.lane == "birth_fanout"
-                    and pos.peak_mult >= env_float("PGG2_BIRTH_FANOUT_SELL_SLAM_BANK_PEAK", 1.20)
-                    and mult >= env_float("PGG2_BIRTH_FANOUT_SELL_SLAM_BANK_MIN_MULT", 1.10)
-                    and features["s700"]["sell_sol"] >= max(
-                        env_float("PGG2_BIRTH_FANOUT_SELL_SLAM_BANK_MIN_SELL_SOL", 0.35),
-                        features["s700"]["buy_sol"] * env_float("PGG2_BIRTH_FANOUT_SELL_SLAM_BANK_MIN_SELL_RATIO", 0.18),
-                    )
-                ):
-                    self.close_position(mint, ts_ms, price, "birth_fanout_sell_slam_bank", features, killed=False)
-                    return
-                if (
-                    pos.lane in {"birth_fanout", "whale_spark"}
-                    and pos.peak_mult >= env_float("PGG2_BIRTH_FANOUT_POP_BANK_PEAK", 1.10)
-                    and mult >= env_float("PGG2_BIRTH_FANOUT_POP_BANK_MIN_MULT", 1.04)
-                    and mult <= pos.peak_mult * env_float("PGG2_BIRTH_FANOUT_POP_BANK_TRAIL", 0.98)
-                ):
-                    self.close_position(mint, ts_ms, price, f"{pos.lane}_pop_bank", features, killed=False)
-                    return
-                if pos.lane == "priced_snap":
-                    first_pop_min_mult = env_float("PGG2_PRICED_SNAP_FIRSTPOP_MIN_MULT", 1.32)
-                elif pos.lane == "priced_breakout":
-                    first_pop_min_mult = env_float("PGG2_PRICED_BREAKOUT_FIRSTPOP_MIN_MULT", 1.12)
-                else:
-                    first_pop_min_mult = 1.02
-                if (
-                    pos.lane not in {"birth_fanout", "whale_spark"}
-                    and pos.peak_mult >= 1.08
-                    and sell_pressure
-                    and mult >= first_pop_min_mult
-                ):
+                if pos.peak_mult >= 1.08 and sell_pressure and mult >= 1.02:
                     self.close_position(mint, ts_ms, price, "first_pop_sell_exit", features, killed=False)
-                    return
-                if (
-                    pos.lane in {"priced_breakout", "priced_snap"}
-                    and pos.peak_mult >= env_float(
-                        "PGG2_PRICED_SNAP_POP_BANK_PEAK" if pos.lane == "priced_snap" else "PGG2_PRICED_BREAKOUT_POP_BANK_PEAK",
-                        1.25,
-                    )
-                    and mult >= env_float(
-                        "PGG2_PRICED_SNAP_POP_BANK_MIN_MULT" if pos.lane == "priced_snap" else "PGG2_PRICED_BREAKOUT_POP_BANK_MIN_MULT",
-                        1.12,
-                    )
-                    and mult <= pos.peak_mult * env_float(
-                        "PGG2_PRICED_SNAP_POP_BANK_TRAIL" if pos.lane == "priced_snap" else "PGG2_PRICED_BREAKOUT_POP_BANK_TRAIL",
-                        0.90,
-                    )
-                ):
-                    self.close_position(mint, ts_ms, price, f"{pos.lane}_pop_bank", features, killed=False)
                     return
                 if (
                     probe_sized
@@ -3287,21 +1586,13 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 ):
                     self.close_position(mint, ts_ms, price, "breadth_ignition_no_follow", features, killed=True)
                     return
-                birth_entry_feats = (self.position_follow.get(mint) or {}).get("entry_features") or {}
-                birth_broad_recovery = (
-                    pos.lane == "birth_fanout"
-                    and float(birth_entry_feats.get("buy1500") or 0.0) >= env_float("PGG2_BIRTH_FANOUT_RECOVERY_MIN_BUY1500", 5.0)
-                    and int(birth_entry_feats.get("uniq1500") or 0) >= env_int("PGG2_BIRTH_FANOUT_RECOVERY_MIN_UNIQ1500", 10)
-                    and float(birth_entry_feats.get("top_share1500") or 1.0) <= env_float("PGG2_BIRTH_FANOUT_RECOVERY_MAX_TOP1500", 0.42)
-                )
                 if (
                     pos.lane == "birth_fanout"
                     and pos.age_sec(ts_ms) >= env_float("PGG2_BIRTH_FANOUT_NO_FOLLOW_AFTER_SEC", 4.0)
                     and pos.peak_mult < env_float("PGG2_BIRTH_FANOUT_NO_FOLLOW_MIN_PEAK", 1.06)
                     and mult <= env_float("PGG2_BIRTH_FANOUT_NO_FOLLOW_MULT", 0.99)
                     and (
-                        not birth_broad_recovery
-                        or not features["flow_live"]
+                        not features["flow_live"]
                         or features["last_buy_age_ms"] >= env_int("PGG2_BIRTH_FANOUT_NO_FOLLOW_LAST_BUY_MS", 500)
                     )
                 ):
@@ -3382,7 +1673,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if pos.age_sec(ts_ms) >= 75.0:
             self.close_position(mint, ts_ms, price, "hard_75s_time_stop", features, killed=False)
 
-    def piggy_kill_reason(self, pos: Any, features: dict[str, Any]) -> Optional[str]:
+    @staticmethod
+    def piggy_kill_reason(pos: Any, features: dict[str, Any]) -> Optional[str]:
         s250 = features["s250"]
         s700 = features["s700"]
         if SameBlockPiggybackBot.moonshot_lane(pos.lane):
@@ -3390,64 +1682,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             full_sized_entry = pos.target_sol > 0 and pos.scout_sol >= (
                 pos.target_sol * env_float("PIGGY_FULL_SIZE_SCOUT_TARGET_RATIO", 0.95)
             )
-            birth_profile = ""
-            if pos.lane == "birth_fanout":
-                follow_entry = (self.position_follow.get(pos.mint) or {}).get("entry_features") or {}
-                plan_entry = getattr(pos, "entry_features", None) or {}
-                entry_features = follow_entry if follow_entry else plan_entry
-                birth_ctx = entry_features.get("birth_fanout") if isinstance(entry_features, dict) else {}
-                if not birth_ctx and isinstance(plan_entry, dict):
-                    birth_ctx = plan_entry.get("birth_fanout")
-                if not isinstance(birth_ctx, dict):
-                    birth_ctx = {}
-                birth_profile = str(
-                    birth_ctx.get("birth_entry_profile")
-                    or (entry_features.get("birth_entry_profile") if isinstance(entry_features, dict) else "")
-                    or ""
-                )
-                if not birth_profile:
-                    reason_parts = str(getattr(pos, "reason", "") or "").split()
-                    for part in reason_parts:
-                        if part.startswith("profile="):
-                            birth_profile = part.split("=", 1)[1].strip()
-                            break
-            if pos.lane == "raw_momentum" and pos.last_mult <= env_float("PGG2_RAW_MOMENTUM_HARD_BREAK_MULT", 0.95):
-                return "kill_raw_momentum_hard_break"
-            if pos.lane == "priced_breakout" and pos.last_mult <= env_float("PGG2_PRICED_BREAKOUT_HARD_BREAK_MULT", 0.94):
-                return "kill_priced_breakout_hard_break"
-            if pos.lane == "birth_fanout":
-                if birth_profile == "elite_nofollow":
-                    # Elite no-follow birth probes are intentionally small and early.
-                    # The live tape showed a clean elite probe dip to 0.90x in 0.33s,
-                    # then rip to 2.33x. Give only this 0.02 SOL profile room to
-                    # survive the first launch shakeout; keep a panic cut for true rugs.
-                    if pos.last_mult <= env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_PANIC_BREAK_MULT", 0.72):
-                        return "kill_birth_fanout_elite_panic_break"
-                    if (
-                        age_sec >= env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_HARD_GRACE_SEC", 1.25)
-                        and pos.last_mult <= env_float("PGG2_BIRTH_FANOUT_ELITE_NOFOLLOW_HARD_BREAK_MULT", 0.82)
-                    ):
-                        return "kill_birth_fanout_elite_hard_break"
-                elif (
-                    birth_profile == "follow_confirm"
-                    and features["s1500"]["sell_sol"] <= env_float("PGG2_BIRTH_FANOUT_FOLLOW_GRACE_MAX_SELL_SOL", 0.001)
-                    and features["s700"]["sell_sol"] <= env_float("PGG2_BIRTH_FANOUT_FOLLOW_GRACE_MAX_SELL_SOL", 0.001)
-                ):
-                    # Full-size follow-confirm births sometimes dip before the
-                    # delayed second burst. If there are no sells, a sub-2.8s
-                    # hard break is usually price discovery noise, not a rug.
-                    if pos.last_mult <= env_float("PGG2_BIRTH_FANOUT_FOLLOW_PANIC_BREAK_MULT", 0.82):
-                        return "kill_birth_fanout_follow_panic_break"
-                    if (
-                        age_sec >= env_float("PGG2_BIRTH_FANOUT_FOLLOW_HARD_GRACE_SEC", 2.75)
-                        and pos.last_mult <= env_float("PGG2_BIRTH_FANOUT_FOLLOW_HARD_BREAK_MULT", 0.90)
-                    ):
-                        return "kill_birth_fanout_follow_hard_break"
-                elif pos.last_mult <= env_float("PGG2_BIRTH_FANOUT_HARD_BREAK_MULT", 0.92):
-                    return "kill_birth_fanout_hard_break"
             if (
                 pos.state == "SCOUT"
-                and birth_profile != "elite_nofollow"
                 and age_sec <= env_float("PIGGY_EARLY_FAIL_SEC", 8.0)
                 and pos.peak_mult < env_float("PIGGY_EARLY_FAIL_MIN_PEAK", 1.005)
                 and pos.last_mult <= env_float("PIGGY_EARLY_FAIL_MULT", 0.90)
@@ -3459,13 +1695,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             if (
                 pos.state == "SCOUT"
                 and full_sized_entry
-                and pos.lane not in {
-                    "birth_fanout",
-                    "curve_lag_reveal",
-                    "preprice_reveal",
-                    "reclaim_wave",
-                    "second_wave_after_cluster",
-                }
                 and age_sec >= env_float("PIGGY_FULL_NO_POP_AFTER_SEC", 3.25)
                 and age_sec <= env_float("PIGGY_FULL_NO_POP_UNTIL_SEC", 10.0)
                 and pos.peak_mult < env_float("PIGGY_FULL_NO_POP_MIN_PEAK", 1.035)
@@ -3491,7 +1720,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 )
             ):
                 return "kill_no_followthrough_bounce"
-            if pos.lane != "birth_fanout" and pos.last_mult <= env_float("PIGGY_MOON_HARD_BREAK_MULT", 0.88):
+            if pos.last_mult <= env_float("PIGGY_MOON_HARD_BREAK_MULT", 0.88):
                 return "kill_moon_hard_break"
             return None
         if pos.last_mult <= 0.80:
@@ -3542,21 +1771,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if (
             pos.lane == "birth_fanout"
             and not env_bool("PGG2_BIRTH_FANOUT_SCALE_ENABLED", False)
-        ):
-            return None
-        if (
-            pos.lane == "stealth_arm"
-            and not env_bool("PGG2_STEALTH_ARM_SCALE_ENABLED", False)
-        ):
-            return None
-        if (
-            pos.lane == "spark3_arm"
-            and not env_bool("PGG2_SPARK3_ARM_SCALE_ENABLED", False)
-        ):
-            return None
-        if (
-            pos.lane == "spark3_breakout"
-            and not env_bool("PGG2_SPARK3_BREAKOUT_SCALE_ENABLED", False)
         ):
             return None
         if probe_sized and SameBlockPiggybackBot.moonshot_lane(pos.lane):
@@ -3666,10 +1880,9 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             self.broker.save_state()
 
     async def run(self) -> None:
-        if not self.config.paper_trading and not self.config.live_enabled:
-            raise RuntimeError("Live execution is gated. Set PGG2_EXECUTION_MODE=quote first, then explicit live gates.")
-        execution_mode = env_str("PGG2_EXECUTION_MODE", "paper").lower()
-        mode = "DRY_LIVE" if execution_mode == "dry_live" else ("PAPER" if self.config.paper_trading else execution_mode.upper())
+        if not self.config.paper_trading:
+            raise RuntimeError("Live execution is gated. Validate paper/replay first, then wire the Raptor executor.")
+        mode = "DRY_LIVE" if env_str("PGG2_EXECUTION_MODE", "paper").lower() == "dry_live" else "PAPER"
         log(
             f"PIGGY: starting {mode} scout={self.config.scout_sol:.4f} max_pos={self.config.max_position_sol:.4f} "
             f"cluster_age={self.config.birth_max_age_ms}ms max_open={self.config.max_open_positions}"

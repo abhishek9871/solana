@@ -566,7 +566,6 @@ class Position:
     target_sol: float
     lane: str
     reason: str
-    entry_features: dict[str, Any] = field(default_factory=dict)
     realized_sol: float = 0.0
     peak_price: float = 0.0
     peak_mult: float = 1.0
@@ -584,12 +583,8 @@ class Position:
     def update(self, price: float) -> float:
         if price <= 0 or self.avg_price <= 0:
             return self.last_mult
-        next_mult = price / self.avg_price
-        max_reasonable_mult = env_float("PIGGY_MAX_REASONABLE_PRICE_MULT", 50.0)
-        if max_reasonable_mult > 0 and next_mult > max_reasonable_mult:
-            return self.last_mult
         self.last_price = price
-        self.last_mult = next_mult
+        self.last_mult = price / self.avg_price
         if self.peak_price <= 0 or price > self.peak_price:
             self.peak_price = price
         self.peak_mult = max(self.peak_mult, self.last_mult)
@@ -869,7 +864,6 @@ class PaperBroker:
             target_sol=plan.target_sol,
             lane=plan.lane,
             reason=plan.reason,
-            entry_features=dict(plan.features or {}),
             peak_price=fill_price,
             last_price=fill_price,
             dry_live_cost_sol=dry_cost,
@@ -1066,27 +1060,15 @@ def parse_base64_shred_for_pump_events(shred_result: dict[str, Any], tracked_wal
                 curve = get_account_key(keys, accounts, 3)
                 user = get_account_key(keys, accounts, 6) or signer
                 is_buy = disc in {DISC_BUY, DISC_BUY_EXACT_SOL_IN}
-                max_trade_lamports = int(env_float("BIRTH_MAX_DECODED_TRADE_SOL", 250.0) * 1_000_000_000)
                 if disc == DISC_BUY_EXACT_SOL_IN:
-                    first_u64 = int.from_bytes(data[8:16], "little")
-                    second_u64 = int.from_bytes(data[16:24], "little")
-                    if first_u64 > max_trade_lamports and 0 < second_u64 <= max_trade_lamports:
-                        # Some buy-exact variants carry token amount first and
-                        # max SOL second. Do not let the token amount become a
-                        # fake billion-SOL buy in the birth ledger.
-                        token_amount = first_u64
-                        sol_lamports = second_u64
-                    else:
-                        sol_lamports = first_u64
-                        token_amount = second_u64
+                    sol_lamports = int.from_bytes(data[8:16], "little")
+                    token_amount = int.from_bytes(data[16:24], "little")
                     instruction_kind = "buy_exact_sol_in"
                 else:
                     token_amount = int.from_bytes(data[8:16], "little")
                     sol_lamports = int.from_bytes(data[16:24], "little")
                     instruction_kind = "buy" if disc == DISC_BUY else "sell"
                 if not mint or sol_lamports <= 0:
-                    continue
-                if sol_lamports > max_trade_lamports:
                     continue
                 price_hint = 0.0
                 if token_amount > 0 and sol_lamports > 0:
@@ -1735,11 +1717,6 @@ class BirthFirstSniper:
     async def combined_stream_loop(self) -> None:
         if not self.config.st_rpc_ws:
             raise RuntimeError("Missing SOLANATRACKER_RPC_WS or SOLANATRACKER_RPC_KEY")
-        reconnect_base_sec = env_float("BIRTH_RECONNECT_BASE_SEC", 2.0)
-        reconnect_clean_wait_sec = env_float("BIRTH_RECONNECT_CLEAN_WAIT_SEC", 3.0)
-        reconnect_max_sec = env_float("BIRTH_RECONNECT_MAX_SEC", 30.0)
-        reconnect_policy_limit_sec = env_float("BIRTH_RECONNECT_POLICY_LIMIT_SEC", 45.0)
-        reconnect_delay = reconnect_base_sec
         while not self.stop_event.is_set():
             try:
                 async with websockets.connect(
@@ -1781,7 +1758,6 @@ class BirthFirstSniper:
                     self.last_shred_msg_ms = ts
                     self.last_curve_msg_ms = ts
                     log("BIRTH: subscribed to combined pump.fun shreds + BondingCurve cache")
-                    reconnect_delay = reconnect_base_sec
                     while not self.stop_event.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
@@ -1806,33 +1782,19 @@ class BirthFirstSniper:
                                 self.broker.stats.shreds += 1
                                 for event in parse_base64_shred_for_pump_events(result, self.tracked_wallets):
                                     await self.on_event(event)
-                        if "shred" not in method:
-                            stale = max(0.0, (now_ms() - self.last_shred_msg_ms) / 1000.0)
-                            if stale >= self.config.shred_stall_reconnect_sec:
-                                self.broker.stats.reconnects += 1
-                                log(f"BIRTH: shreds stalled for {stale:.1f}s while stream stayed open, reconnecting")
-                                break
-                if not self.stop_event.is_set() and reconnect_clean_wait_sec > 0:
-                    await asyncio.sleep(reconnect_clean_wait_sec)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.broker.stats.reconnects += 1
-                msg = str(exc)
-                if "Connection limit" in msg or "policy violation" in msg or "1008" in msg:
-                    delay = reconnect_policy_limit_sec
-                else:
-                    delay = reconnect_delay
-                    reconnect_delay = min(reconnect_max_sec, max(reconnect_base_sec, reconnect_delay * 1.7))
-                log(f"BIRTH: stream error, reconnecting in {delay:.1f}s: {type(exc).__name__}: {exc}")
-                await asyncio.sleep(max(0.0, delay))
+                log(f"BIRTH: stream error, reconnecting in 2s: {type(exc).__name__}: {exc}")
+                await asyncio.sleep(2)
 
     async def run(self) -> None:
-        if not self.config.paper_trading and not self.config.live_enabled:
+        if not self.config.paper_trading:
             raise RuntimeError(
                 "Live execution is not enabled in this file yet. This bot must pass paper validation first."
             )
-        mode = "PAPER" if self.config.paper_trading else "LIVE"
+        mode = "PAPER" if self.config.paper_trading else "LIVE_GATED"
         log(
             f"BIRTH: starting mode={mode} scout={self.config.scout_sol:.4f} "
             f"max_pos={self.config.max_position_sol:.4f} max_open={self.config.max_open_positions} "

@@ -91,6 +91,149 @@ class SameBlockPiggybackBot(BirthFirstSniper):
     def __init__(self, config: BaseConfig) -> None:
         super().__init__(config)
         self.wave_arms: dict[str, WaveArm] = {}
+        self.position_follow: dict[str, dict[str, Any]] = {}
+        self.profitable_closes: dict[str, dict[str, float]] = {}
+
+    @staticmethod
+    def moonshot_lane(lane: str) -> bool:
+        return lane in {"second_wave_after_cluster", "reclaim_wave"}
+
+    def profit_reentry_blocked(
+        self,
+        mint: str,
+        ts_ms: int,
+        base_move: float,
+        age_ms: int,
+        reclaim_strength: bool,
+        late_reclaim_trigger: bool,
+    ) -> bool:
+        prior = self.profitable_closes.get(mint)
+        if not prior:
+            return False
+        if ts_ms - int(prior["ts_ms"]) > env_int("PIGGY_PROFIT_REENTRY_BLOCK_MS", 900000):
+            return False
+        if (
+            env_bool("PIGGY_PROFIT_REENTRY_LOCK_AFTER_WIN", True)
+            and float(prior.get("pnl_sol") or 0.0) >= env_float("PIGGY_PROFIT_REENTRY_LOCK_MIN_PNL_SOL", 0.025)
+        ):
+            return True
+        overextended = base_move >= env_float("PIGGY_PROFIT_REENTRY_BLOCK_BASE_MOVE", 3.0)
+        reclaim_like = reclaim_strength or late_reclaim_trigger or age_ms > env_int("PIGGY_SECOND_MAX_REGULAR_AGE_MS", 15000)
+        return overextended and reclaim_like
+
+    def probe_entry_sol(self) -> float:
+        default_probe = self.config.scout_sol
+        return min(
+            self.config.max_position_sol,
+            max(0.0005, env_float("PIGGY_PROBE_SOL", default_probe)),
+        )
+
+    @staticmethod
+    def full_entry_reason(
+        lane: str,
+        features: dict[str, Any],
+        fresh700: dict[str, Any],
+        fresh1500: dict[str, Any],
+    ) -> Optional[str]:
+        buy700 = float(fresh700.get("fresh_buy_sol") or 0.0)
+        buy1500 = float(fresh1500.get("fresh_buy_sol") or 0.0)
+        top700 = float(fresh700.get("fresh_top_share") or 1.0)
+        move700 = float(features.get("move700") or 1.0)
+        age_ms = int(features.get("age_ms") or 0)
+        base_move = float(features.get("wave_base_move") or features.get("base_move") or 1.0)
+        if lane == "reclaim_wave":
+            early_absorbed_reclaim = (
+                age_ms <= env_int("PIGGY_FULL_RECLAIM_MAX_AGE_MS", 6000)
+                and int(features.get("last_sell_age_ms") or 999999)
+                <= env_int("PIGGY_FULL_RECLAIM_MAX_LAST_SELL_AGE_MS", 350)
+                and buy700 >= env_float("PIGGY_FULL_MIN_BUY700_SOL", 5.0)
+                and buy1500 >= env_float("PIGGY_FULL_MIN_BUY1500_SOL", 5.0)
+                and top700 <= env_float("PIGGY_FULL_MAX_TOP700", 0.70)
+                and float(features.get("move1500") or 1.0)
+                >= env_float("PIGGY_FULL_RECLAIM_MIN_MOVE1500", 1.15)
+            )
+            if not early_absorbed_reclaim:
+                if (
+                    age_ms >= env_int("PIGGY_FULL_RECLAIM_PROBE_AFTER_AGE_MS", 15000)
+                    or base_move >= env_float("PIGGY_FULL_RECLAIM_PROBE_BASE_MOVE", 2.0)
+                ):
+                    features["entry_size_reason"] = "probe_late_reclaim_confirm"
+                else:
+                    features["entry_size_reason"] = "probe_reclaim_confirm"
+                return None
+        if (
+            buy700 >= env_float("PIGGY_FULL_MIN_BUY700_SOL", 5.0)
+            and buy1500 >= env_float("PIGGY_FULL_MIN_BUY1500_SOL", 5.0)
+            and top700 <= env_float("PIGGY_FULL_MAX_TOP700", 0.70)
+        ):
+            return "full_clean_flow"
+        if (
+            move700 >= env_float("PIGGY_FULL_VELOCITY_MOVE700", 1.25)
+            and buy700 >= env_float("PIGGY_FULL_VELOCITY_BUY700_SOL", 4.0)
+            and top700 <= env_float("PIGGY_FULL_VELOCITY_MAX_TOP700", 0.75)
+        ):
+            return "full_velocity_breakout"
+        if (
+            lane == "reclaim_wave"
+            and buy700 >= env_float("PIGGY_FULL_RECLAIM_MIN_BUY700_SOL", 8.0)
+            and top700 <= env_float("PIGGY_FULL_RECLAIM_MAX_TOP700", 0.45)
+        ):
+            return "full_reclaim_breadth"
+        return None
+
+    def init_position_follow(self, pos: Any, trusted: bool) -> dict[str, Any]:
+        follow = {
+            "opened_ts_ms": pos.opened_ts_ms,
+            "trusted": trusted,
+            "sig_buy_sol": 0.0,
+            "sig_buy_count": 0,
+            "sig_buyers": set(),
+            "last_sig_buy_ms": 0,
+        }
+        self.position_follow[pos.mint] = follow
+        return follow
+
+    def follow_for_position(self, pos: Any) -> dict[str, Any]:
+        follow = self.position_follow.get(pos.mint)
+        if follow is None:
+            follow = self.init_position_follow(pos, trusted=False)
+        return follow
+
+    async def on_event(self, event: PumpEvent) -> None:
+        key = (event.sig, event.mint, event.instruction_kind, event.sol_lamports, event.token_amount)
+        already_seen = key in self.seen_set
+        await super().on_event(event)
+        if already_seen or event.kind != "trade" or not event.is_buy:
+            return
+        pos = self.broker.positions.get(event.mint)
+        if not pos or not self.moonshot_lane(pos.lane):
+            return
+        follow = self.position_follow.get(event.mint)
+        if follow is None:
+            follow = self.init_position_follow(pos, trusted=event.ts_ms <= pos.opened_ts_ms)
+        grace_ms = env_int("PIGGY_FOLLOW_GRACE_MS", 1000)
+        if event.ts_ms < int(follow["opened_ts_ms"]) + grace_ms:
+            return
+        min_sig_sol = env_float("PIGGY_FOLLOW_SIG_BUY_SOL", 0.08)
+        if event.sol < min_sig_sol:
+            return
+        follow["sig_buy_sol"] = float(follow["sig_buy_sol"]) + event.sol
+        follow["sig_buy_count"] = int(follow["sig_buy_count"]) + 1
+        wallet = event.user or event.signer
+        if wallet:
+            follow["sig_buyers"].add(wallet)
+        follow["last_sig_buy_ms"] = event.ts_ms
+
+    def add_follow_features(self, pos: Any, features: dict[str, Any]) -> None:
+        follow = self.follow_for_position(pos)
+        last_sig_buy_ms = int(follow.get("last_sig_buy_ms") or 0)
+        features["post_open_follow_trusted"] = bool(follow.get("trusted", False))
+        features["post_open_sig_buy_sol"] = float(follow.get("sig_buy_sol") or 0.0)
+        features["post_open_sig_buy_count"] = int(follow.get("sig_buy_count") or 0)
+        features["post_open_sig_buyers"] = len(follow.get("sig_buyers") or set())
+        features["last_post_open_sig_buy_age_ms"] = (
+            int(features["ts_ms"]) - last_sig_buy_ms if last_sig_buy_ms else 999999
+        )
 
     def same_slot_cluster(self, mint: str, ts_ms: int) -> dict[str, Any]:
         tape = self.tapes.get(mint)
@@ -326,6 +469,41 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             and fresh1500["fresh_buy_sol"] >= env_float("PIGGY_LATE_RECLAIM_TRIGGER_MIN_FRESH_SOL", 10.0)
             and event.sol >= env_float("PIGGY_LATE_RECLAIM_TRIGGER_MIN_BUY_SOL", 0.10)
         )
+        if self.profit_reentry_blocked(event.mint, event.ts_ms, base_move, age_ms, reclaim_strength, late_reclaim_trigger):
+            return None, "prior_profit_reentry_block"
+        if (
+            env_bool("PIGGY_REJECT_EARLY_VERTICAL_VACUUM", True)
+            and age_ms <= env_int("PIGGY_EARLY_VERTICAL_MAX_AGE_MS", 5000)
+            and features["move700"] >= env_float("PIGGY_EARLY_VERTICAL_MIN_MOVE700", 1.50)
+        ):
+            return None, "early_vertical_vacuum"
+        if (
+            env_bool("PIGGY_REJECT_WEAK_TOP_HEAVY_VACUUM", True)
+            and fresh_buy < env_float("PIGGY_WEAK_TOP_HEAVY_MAX_BUY700_SOL", 1.50)
+            and fresh700["fresh_top_share"] > env_float("PIGGY_WEAK_TOP_HEAVY_MIN_TOP700", 0.75)
+            and features["move700"] < env_float("PIGGY_WEAK_TOP_HEAVY_MAX_MOVE700", 1.08)
+        ):
+            return None, "weak_top_heavy_vacuum"
+        if (
+            env_bool("PIGGY_REJECT_OVEREXTENDED_CLEAN_RECLAIM", True)
+            and reclaim_strength
+            and base_move > env_float("PIGGY_OVEREXTENDED_RECLAIM_BASE_MOVE", 3.0)
+            and fresh700["fresh_top_share"] <= env_float("PIGGY_OVEREXTENDED_RECLAIM_MAX_TOP700", 0.70)
+        ):
+            return None, "overextended_clean_reclaim_vacuum"
+        if (
+            env_bool("PIGGY_REJECT_EXHAUSTED_RECLAIM", True)
+            and late_reclaim_trigger
+            and fresh_buy >= env_float("PIGGY_EXHAUSTED_RECLAIM_MIN_FRESH_SOL", 12.0)
+            and base_move <= env_float("PIGGY_EXHAUSTED_RECLAIM_MAX_BASE_MOVE", 1.42)
+            and features["move700"] >= env_float("PIGGY_EXHAUSTED_RECLAIM_MIN_MOVE700", 1.55)
+        ):
+            return None, "exhausted_reclaim_no_headroom"
+        if (
+            not reclaim_strength
+            and features["move700"] < env_float("PIGGY_SECOND_MIN_NON_RECLAIM_MOVE700", 1.0)
+        ):
+            return None, "non_reclaim_not_marking_up"
         if event.sol < env_float("PIGGY_SECOND_MIN_TRIGGER_BUY_SOL", 0.50) and not late_reclaim_trigger:
             return None, "weak_trigger_buy"
         sells_ok = fresh_sells <= max(0.015, fresh_buy * env_float("PIGGY_SECOND_MAX_FRESH_SELL_RATIO", 0.15))
@@ -385,23 +563,37 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         score += max(0.0, features["move700"] - 1.0) * 280.0
         score -= max(0.0, fresh700["fresh_top_share"] - 0.70) * 45.0
         score -= max(0.0, s1500["sell_sol"] / max(s1500["buy_sol"], 0.001) - 0.08) * 70.0
-        scout = min(
+        lane = "reclaim_wave" if reclaim_strength else "second_wave_after_cluster"
+        full_reason = self.full_entry_reason(lane, features, fresh700, fresh1500)
+        if (
+            not reclaim_strength
+            and not full_reason
+            and score < env_float("PIGGY_SECOND_MIN_NON_RECLAIM_PROBE_SCORE", 180.0)
+        ):
+            return None, "non_reclaim_probe_score_low"
+        full_entry_sol = min(
             self.config.max_position_sol,
             max(
                 self.config.scout_sol,
                 env_float("PIGGY_SECOND_ENTRY_SOL", self.config.max_position_sol),
             ),
         )
+        size_reason = str(features.get("entry_size_reason") or full_reason or "probe_then_confirm")
+        scout = full_entry_sol if full_reason else self.probe_entry_sol()
+        if size_reason == "probe_late_reclaim_confirm":
+            scout = min(scout, env_float("PIGGY_LATE_RECLAIM_PROBE_SOL", max(0.0005, self.config.scout_sol * 0.50)))
+        features["entry_size_reason"] = size_reason
+        features["entry_probe_sol"] = scout
         quality = max(0.0, min(1.0, (score - 90.0) / 55.0))
         target = scout + (self.config.max_position_sol - scout) * max(0.45, quality)
         if base_move >= 1.30 and fresh1500["fresh_buy_sol"] >= 1.25:
             target = max(target, self.config.max_position_sol * 0.78)
-        target = min(self.config.max_position_sol, max(scout, target))
-        lane = "reclaim_wave" if reclaim_strength else "second_wave_after_cluster"
+        target = min(self.config.max_position_sol, max(scout, target, self.config.max_position_sol))
         reason = (
             f"second_wave fresh={fresh_buy:.3f}/{fresh_unique} base={base_move:.2f}x "
             f"m700={features['move700']:.3f} peak_hold={peak_hold:.2f} "
-            f"sell1500={s1500['sell_sol'] / max(s1500['buy_sol'], 0.001):.2f} lane={lane}"
+            f"sell1500={s1500['sell_sol'] / max(s1500['buy_sol'], 0.001):.2f} "
+            f"lane={lane} size={size_reason}"
         )
         plan = StrikePlan(
             mint=event.mint,
@@ -423,6 +615,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 "pre_peak_breakout": pre_peak_breakout,
                 "fresh700": fresh700,
                 "fresh1500": fresh1500,
+                "entry_size_reason": size_reason,
+                "entry_probe_sol": scout,
             }
         )
         return plan, "ready"
@@ -494,7 +688,15 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         self.maybe_arm_first_burst(event, features)
         plan, why = self.second_wave_ready(event, features)
         if not plan:
-            if why in {"arm_expired", "initial_cluster_sold"}:
+            if why in {
+                "arm_expired",
+                "initial_cluster_sold",
+                "exhausted_reclaim_no_headroom",
+                "prior_profit_reentry_block",
+                "early_vertical_vacuum",
+                "weak_top_heavy_vacuum",
+                "overextended_clean_reclaim_vacuum",
+            }:
                 self.logger.decision("wave_disarm", event.mint, {"reason": why, "features": self.slim_features(features)})
             return
         ok, reason = self.broker.can_strike(event.mint, ts_ms)
@@ -520,12 +722,25 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         )
         pos = self.broker.queue_or_fill(plan, float(features.get("price") or 0.0))
         if pos:
+            self.init_position_follow(pos, trusted=True)
             self.logger.decision("open", event.mint, {"lane": plan.lane, "features": self.slim_features(features)})
 
     async def manage_existing(self, mint: str, ts_ms: int) -> None:
         if mint not in self.broker.positions and mint not in self.broker.pending:
             return
         await super().manage_existing(mint, ts_ms)
+
+    def close_position(self, mint: str, ts_ms: int, price: float, reason: str, features: dict[str, Any], killed: bool) -> None:
+        before_pnl = self.broker.stats.realized_pnl_sol
+        super().close_position(mint, ts_ms, price, reason, features, killed)
+        pnl = self.broker.stats.realized_pnl_sol - before_pnl
+        if pnl > env_float("PIGGY_PROFIT_REENTRY_MIN_PNL_SOL", 0.0):
+            self.profitable_closes[mint] = {
+                "ts_ms": float(ts_ms),
+                "pnl_sol": pnl,
+                "peak_mult": float(self.broker.stats.best_mult),
+            }
+        self.position_follow.pop(mint, None)
 
     @staticmethod
     def pending_fill_ready(pending: Any, features: dict[str, Any]) -> tuple[bool, str]:
@@ -545,6 +760,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         mint = pos.mint
         mult = pos.update(price)
         self.broker.stats.best_mult = max(self.broker.stats.best_mult, pos.peak_mult)
+        self.add_follow_features(pos, features)
 
         kill = self.piggy_kill_reason(pos, features)
         if kill:
@@ -555,8 +771,11 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return
 
         if pos.state == "SCOUT":
-            if pos.lane in {"second_wave_after_cluster", "reclaim_wave"}:
+            if self.moonshot_lane(pos.lane):
                 sell_pressure = features["s700"]["sell_sol"] > 0 or features["s1500"]["sell_sol"] / max(features["s1500"]["buy_sol"], 0.001) >= 0.10
+                probe_sized = pos.target_sol > 0 and pos.cost_sol <= (
+                    pos.target_sol * env_float("PIGGY_PROBE_SIZED_MAX_TARGET_RATIO", 0.50)
+                )
                 if pos.peak_mult >= 1.55 and mult <= pos.peak_mult * 0.84:
                     self.close_position(mint, ts_ms, price, "moonshot_decay_55", features, killed=False)
                     return
@@ -565,6 +784,22 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                     return
                 if pos.peak_mult >= 1.08 and sell_pressure and mult >= 1.02:
                     self.close_position(mint, ts_ms, price, "first_pop_sell_exit", features, killed=False)
+                    return
+                if (
+                    probe_sized
+                    and pos.lane == "reclaim_wave"
+                    and int(features.get("age_ms") or 0) >= env_int("PIGGY_LATE_RECLAIM_POP_BANK_AGE_MS", 30000)
+                    and mult >= env_float("PIGGY_LATE_RECLAIM_POP_BANK_MULT", 1.10)
+                ):
+                    self.close_position(mint, ts_ms, price, "late_reclaim_probe_pop_bank", features, killed=False)
+                    return
+                scale = self.scale1_reason(pos, features)
+                if scale:
+                    target_after_scale = min(pos.target_sol, self.config.max_position_sol)
+                    add_sol = max(0.0, target_after_scale - pos.cost_sol)
+                    scaled = self.broker.scale(mint, add_sol, price, "SCALE1", scale)
+                    if scaled:
+                        self.logger.decision("scale1", mint, {"add_sol": add_sol, "reason": scale, "features": self.slim_features(features)})
                     return
                 if pos.age_sec(ts_ms) >= env_float("PIGGY_MOON_FAIL_SEC", 18.0) and pos.peak_mult < 1.18:
                     self.close_position(mint, ts_ms, price, "moonshot_failed_no_pop", features, killed=True)
@@ -625,10 +860,14 @@ class SameBlockPiggybackBot(BirthFirstSniper):
     def piggy_kill_reason(pos: Any, features: dict[str, Any]) -> Optional[str]:
         s250 = features["s250"]
         s700 = features["s700"]
-        if pos.lane in {"second_wave_after_cluster", "reclaim_wave"}:
+        if SameBlockPiggybackBot.moonshot_lane(pos.lane):
+            age_sec = pos.age_sec(features["ts_ms"])
+            full_sized_entry = pos.target_sol > 0 and pos.scout_sol >= (
+                pos.target_sol * env_float("PIGGY_FULL_SIZE_SCOUT_TARGET_RATIO", 0.95)
+            )
             if (
                 pos.state == "SCOUT"
-                and pos.age_sec(features["ts_ms"]) <= env_float("PIGGY_EARLY_FAIL_SEC", 8.0)
+                and age_sec <= env_float("PIGGY_EARLY_FAIL_SEC", 8.0)
                 and pos.peak_mult < env_float("PIGGY_EARLY_FAIL_MIN_PEAK", 1.005)
                 and pos.last_mult <= env_float("PIGGY_EARLY_FAIL_MULT", 0.90)
                 and not features["flow_live"]
@@ -636,7 +875,35 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 and features["s1500"]["sell_sol"] > 0
             ):
                 return "kill_early_entry_failed"
-            if pos.last_mult <= env_float("PIGGY_MOON_HARD_BREAK_MULT", 0.68):
+            if (
+                pos.state == "SCOUT"
+                and full_sized_entry
+                and age_sec >= env_float("PIGGY_FULL_NO_POP_AFTER_SEC", 3.25)
+                and age_sec <= env_float("PIGGY_FULL_NO_POP_UNTIL_SEC", 10.0)
+                and pos.peak_mult < env_float("PIGGY_FULL_NO_POP_MIN_PEAK", 1.035)
+                and pos.last_mult <= env_float("PIGGY_FULL_NO_POP_MULT", 0.995)
+                and (
+                    not features["flow_live"]
+                    or features["last_buy_age_ms"] >= env_int("PIGGY_FULL_NO_POP_MAX_LAST_BUY_AGE_MS", 850)
+                )
+            ):
+                return "kill_full_no_pop"
+            if (
+                pos.state == "SCOUT"
+                and env_bool("PIGGY_NO_FOLLOW_CAP_ON", True)
+                and features.get("post_open_follow_trusted", False)
+                and age_sec >= env_float("PIGGY_NO_FOLLOW_CAP_AFTER_SEC", 6.0)
+                and age_sec <= env_float("PIGGY_NO_FOLLOW_CAP_UNTIL_SEC", 18.0)
+                and pos.peak_mult < env_float("PIGGY_NO_FOLLOW_CAP_MIN_PEAK", 1.08)
+                and features.get("post_open_sig_buy_sol", 0.0) < env_float("PIGGY_NO_FOLLOW_CAP_MIN_SIG_BUY_SOL", 0.10)
+                and pos.last_mult <= env_float("PIGGY_NO_FOLLOW_CAP_MULT", 0.985)
+                and (
+                    pos.last_mult >= env_float("PIGGY_NO_FOLLOW_CAP_BOUNCE_MULT", 0.955)
+                    or age_sec >= env_float("PIGGY_NO_FOLLOW_CAP_FORCE_SEC", 12.0)
+                )
+            ):
+                return "kill_no_followthrough_bounce"
+            if pos.last_mult <= env_float("PIGGY_MOON_HARD_BREAK_MULT", 0.88):
                 return "kill_moon_hard_break"
             return None
         if pos.last_mult <= 0.80:
@@ -664,6 +931,16 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return None
         s250 = features["s250"]
         s700 = features["s700"]
+        probe_sized = pos.target_sol > 0 and pos.cost_sol <= (
+            pos.target_sol * env_float("PIGGY_PROBE_SIZED_MAX_TARGET_RATIO", 0.50)
+        )
+        if probe_sized and SameBlockPiggybackBot.moonshot_lane(pos.lane):
+            if int(features.get("age_ms") or 0) >= env_int("PIGGY_PROBE_SCALE_MAX_TOKEN_AGE_MS", 15000):
+                return None
+            if s700["buy_sol"] < env_float("PIGGY_PROBE_SCALE_MIN_BUY700_SOL", 5.0):
+                return None
+            if s700["unique_buyers"] < env_int("PIGGY_PROBE_SCALE_MIN_BUYERS700", 8):
+                return None
         if (
             pos.age_sec(features["ts_ms"]) <= 2.80
             and pos.last_mult >= 1.075
@@ -725,6 +1002,13 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 "last_sell_age_ms": features.get("last_sell_age_ms", 999999),
                 "buy_stall": features.get("buy_stall", False),
                 "flow_live": features.get("flow_live", False),
+                "post_open_follow_trusted": features.get("post_open_follow_trusted", False),
+                "post_open_sig_buy_sol": features.get("post_open_sig_buy_sol", 0.0),
+                "post_open_sig_buy_count": features.get("post_open_sig_buy_count", 0),
+                "post_open_sig_buyers": features.get("post_open_sig_buyers", 0),
+                "last_post_open_sig_buy_age_ms": features.get("last_post_open_sig_buy_age_ms", 999999),
+                "entry_size_reason": features.get("entry_size_reason", ""),
+                "entry_probe_sol": features.get("entry_probe_sol", 0.0),
                 "wave_armed": features.get("wave_armed", False),
                 "wave_arm_age_ms": features.get("wave_arm_age_ms", 0),
                 "wave_base_move": features.get("wave_base_move", 1.0),
@@ -753,6 +1037,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             f"open={len(self.broker.positions)} [{', '.join(open_bits) if open_bits else 'none'}] "
             f"shreds={st.shreds} bc={self.bc.updates} reconn={st.reconnects}"
         )
+        if env_bool("PIGGY_SAVE_STATE_ON_STATUS", True):
+            self.broker.save_state()
 
     async def run(self) -> None:
         if not self.config.paper_trading:
