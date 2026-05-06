@@ -3413,6 +3413,11 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                             break
             if pos.lane == "raw_momentum" and pos.last_mult <= env_float("PGG2_RAW_MOMENTUM_HARD_BREAK_MULT", 0.95):
                 return "kill_raw_momentum_hard_break"
+            if pos.lane == "priced_snap" and pos.last_mult <= env_float("PGG2_PRICED_SNAP_HARD_BREAK_MULT", 0.92):
+                # PGG2: path tests on attack dry-live tapes showed priced_snap
+                # needs room for shallow dump-then-pump recoveries, but should
+                # not wait for the generic 0.88 rug stop on failed snaps.
+                return "kill_priced_snap_hard_break"
             if pos.lane == "priced_breakout" and pos.last_mult <= env_float("PGG2_PRICED_BREAKOUT_HARD_BREAK_MULT", 0.94):
                 return "kill_priced_breakout_hard_break"
             if pos.lane == "birth_fanout":
