@@ -220,6 +220,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return False
         if reason not in {
             "quote_profit_bank",
+            "quote_profit_runner_bank",
             "quote_loss_clamp",
             "curve_lag_thin_stall_exit",
             "curve_lag_no_follow",
@@ -3824,6 +3825,17 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if quote_loss_clamp and self.moonshot_lane(pos.lane):
             quote_action = quote_loss_clamp(pos, ts_ms)
             if quote_action:
+                if quote_action == "quote_profit_runner_bank":
+                    fraction = env_float("PGG2_LIVE_RUNNER_BANK_SELL_FRACTION", 0.82)
+                    if self.broker.partial(mint, fraction, price, quote_action):
+                        self.logger.decision(
+                            "derisk",
+                            mint,
+                            {"reason": quote_action, "fraction": fraction, "features": self.slim_features(features)},
+                        )
+                        return
+                    self.close_position(mint, ts_ms, price, "quote_profit_bank", features, killed=False)
+                    return
                 if (
                     quote_action == "quote_loss_clamp"
                     and self.curve_lag_broad_quote_grace(pos, features, ts_ms)
@@ -3843,6 +3855,17 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if quote_profit_bank and self.moonshot_lane(pos.lane):
             quote_exit = quote_profit_bank(pos, ts_ms)
             if quote_exit:
+                if quote_exit == "quote_profit_runner_bank":
+                    fraction = env_float("PGG2_LIVE_RUNNER_BANK_SELL_FRACTION", 0.82)
+                    if self.broker.partial(mint, fraction, price, quote_exit):
+                        self.logger.decision(
+                            "derisk",
+                            mint,
+                            {"reason": quote_exit, "fraction": fraction, "features": self.slim_features(features)},
+                        )
+                        return
+                    self.close_position(mint, ts_ms, price, "quote_profit_bank", features, killed=False)
+                    return
                 self.close_position(mint, ts_ms, price, quote_exit, features, killed=False)
                 return
 

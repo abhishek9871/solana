@@ -130,6 +130,50 @@ class RaptorLiveBroker(PaperBroker):
             return None
         return quote, expected_out
 
+    def quote_partial_sell_overhead_sol(self) -> float:
+        return env_float("PGG2_QUOTE_PARTIAL_SELL_OVERHEAD_SOL", 0.00065)
+
+    def runner_bank_fraction(self) -> float:
+        return max(0.05, min(0.95, env_float("PGG2_LIVE_RUNNER_BANK_SELL_FRACTION", 0.90)))
+
+    def runner_bank_enabled_for(self, pos: Position, expected_out: float, executable_pnl: float) -> bool:
+        if not env_bool("PGG2_LIVE_RUNNER_AFTER_GREEN_ENABLED", True):
+            return False
+        if pos.derisk_done or pos.remaining_tokens <= 0:
+            return False
+        lanes = {
+            lane.strip()
+            for lane in env_str("PGG2_LIVE_RUNNER_AFTER_GREEN_LANES", "raw_momentum,priced_snap").split(",")
+            if lane.strip()
+        }
+        if pos.lane not in lanes:
+            return False
+        if executable_pnl < env_float("PGG2_LIVE_RUNNER_BANK_MIN_FULL_PNL_SOL", 0.00075):
+            return False
+        fraction = self.runner_bank_fraction()
+        projected_proceeds = max(0.0, expected_out * fraction - self.quote_partial_sell_overhead_sol())
+        projected_locked_pnl = pos.realized_sol + projected_proceeds - pos.cost_sol
+        return projected_locked_pnl >= env_float("PGG2_LIVE_RUNNER_BANK_MIN_LOCKED_PNL_SOL", 0.00020)
+
+    def token_balance_ui(self, mint: str) -> float:
+        result = self.rpc(
+            "getTokenAccountsByOwner",
+            [
+                self.public_key,
+                {"mint": mint},
+                {"encoding": "jsonParsed", "commitment": "processed"},
+            ],
+        )
+        total = 0.0
+        for item in result.get("value") or []:
+            try:
+                info = (((item.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+                amount = (info.get("tokenAmount") or {}).get("uiAmountString")
+                total += float(amount or 0.0)
+            except Exception:
+                continue
+        return total
+
     @staticmethod
     def load_keypair(path: Path) -> Keypair:
         raw = path.read_text(encoding="utf-8").strip()
@@ -416,6 +460,13 @@ class RaptorLiveBroker(PaperBroker):
                 # while the non-elite raw losers remain blocked by the strict cap.
                 ratio = env_float("PGG2_LIVE_RAW_MOMENTUM_ELITE_MAX_ROUNDTRIP_LOSS_RATIO", 0.085)
                 floor = env_float("PGG2_LIVE_RAW_MOMENTUM_ELITE_ROUNDTRIP_ABS_FLOOR_SOL", 0.00235)
+            if self.raw_momentum_exec_spike_runner_profile(features):
+                # Use this only as a provisional quote window. The refreshed
+                # entry-stability check must turn executable-green before we
+                # actually open. That keeps the 8hYb-style winner and blocks
+                # the 2026-05-07 ShQN/Eus7/9zXB/CwQT red-at-entry losses.
+                ratio = env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_MAX_ROUNDTRIP_LOSS_RATIO", 0.22)
+                floor = env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_ROUNDTRIP_ABS_FLOOR_SOL", 0.00320)
         elif lane == "curve_lag_reveal":
             # Curve-lag is a fast moonshot lane, but live quote-shadow showed its
             # loser already had poor immediate roundtrip economics at entry. Keep
@@ -527,6 +578,34 @@ class RaptorLiveBroker(PaperBroker):
         )
         return broad_1500 or broad_live
 
+    def raw_momentum_exec_spike_runner_profile(self, features: Optional[dict[str, Any]]) -> bool:
+        """High-vSOL exec-spike runners that need a provisional quote window.
+
+        The 2026-05-07 dry-live tape showed raw exec-spike candidates with
+        40+ SOL virtual liquidity and 1.7x+ repricing can flip from red
+        roundtrip to executable-green within one refresh. This profile widens
+        only the initial quote search; final entry still requires a green
+        refreshed direct quote.
+        """
+        feats = features or {}
+        if str(feats.get("raw_profile") or "") != "exec_spike_probe":
+            return False
+        entry_move = float(feats.get("raw_entry_move") or feats.get("wave_base_move") or feats.get("move1500") or 1.0)
+        vsol = float(feats.get("vsol_sol") or 0.0)
+        sell1500 = float(feats.get("sell1500") or 0.0)
+        return (
+            env_bool("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_EXCEPTION_ENABLED", True)
+            and entry_move >= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_MIN_ENTRY_MOVE", 1.70)
+            and entry_move <= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_MAX_ENTRY_MOVE", 3.50)
+            and vsol >= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_MIN_VSOL", 40.0)
+            and sell1500 <= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_MAX_SELL1500", 0.001)
+        )
+
+    def raw_momentum_exec_spike_candidate(self, features: Optional[dict[str, Any]]) -> bool:
+        """Any raw exec-spike probe eligible for green-only quote chasing."""
+        feats = features or {}
+        return str(feats.get("raw_profile") or "") == "exec_spike_probe"
+
     def max_executable_loss_for_lane(
         self,
         lane: str,
@@ -573,6 +652,23 @@ class RaptorLiveBroker(PaperBroker):
             ratio = env_float("PGG2_LIVE_PRICED_SNAP_MAX_EXECUTABLE_LOSS_RATIO", 0.040)
             floor = env_float("PGG2_LIVE_PRICED_SNAP_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00125)
             cap = env_float("PGG2_LIVE_PRICED_SNAP_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00160)
+            if env_bool("PGG2_LIVE_PRICED_SNAP_RUNNER_RECOVERY_EXCEPTION_ENABLED", True):
+                # Stability confirmation now blocks catastrophic priced-snap
+                # collapses before entry. For non-catastrophic red starts, give
+                # the runner a recovery lane; 2fiX was a -0.00166 early quote
+                # loss that later printed ~3x.
+                ratio = env_float("PGG2_LIVE_PRICED_SNAP_RUNNER_MAX_EXECUTABLE_LOSS_RATIO", 0.10)
+                floor = env_float("PGG2_LIVE_PRICED_SNAP_RUNNER_MAX_EXECUTABLE_LOSS_FLOOR_SOL", floor)
+                cap = env_float("PGG2_LIVE_PRICED_SNAP_RUNNER_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00350)
+        elif lane == "raw_momentum":
+            if self.raw_momentum_exec_spike_runner_profile(features):
+                # After a raw exec-spike opens, do not give it the old wide
+                # 0.0032 SOL loss room. The current tape showed red starts
+                # widen immediately. Green-at-entry runners get room to breathe;
+                # red follow-through gets cut at the normal tiny loss cap.
+                ratio = env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_MAX_EXECUTABLE_LOSS_RATIO", 0.10)
+                floor = env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_MAX_EXECUTABLE_LOSS_FLOOR_SOL", floor)
+                cap = env_float("PGG2_LIVE_RAW_EXEC_SPIKE_RUNNER_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00160)
         elif lane == "stealth_arm":
             ratio = env_float("PGG2_LIVE_STEALTH_ARM_MAX_EXECUTABLE_LOSS_RATIO", 0.30)
             floor = env_float("PGG2_LIVE_STEALTH_ARM_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00150)
@@ -733,7 +829,21 @@ class RaptorLiveBroker(PaperBroker):
                         "PGG2_LIVE_RAW_EXEC_SPIKE_ANY_PROFIT_BANK_MIN_PNL_SOL",
                         0.00045,
                     )
-            if env_bool("PGG2_LIVE_QUOTE_ANY_PROFIT_BANK_ENABLED", True) and pnl >= bank_need:
+            if (
+                env_bool("PGG2_LIVE_QUOTE_ANY_PROFIT_BANK_ENABLED", True)
+                and pnl >= bank_need
+                and not (pos.derisk_done and env_bool("PGG2_LIVE_RUNNER_SUPPRESS_ANY_PROFIT_BANK", True))
+            ):
+                if self.runner_bank_enabled_for(pos, expected_out, pnl):
+                    fraction = self.runner_bank_fraction()
+                    projected_proceeds = max(0.0, expected_out * fraction - self.quote_partial_sell_overhead_sol())
+                    projected_locked_pnl = pos.realized_sol + projected_proceeds - pos.cost_sol
+                    log(
+                        f"PGG2-LIVE-QUOTE-RUNNER-BANK {short_addr(pos.mint)} lane={pos.lane} "
+                        f"quote_out={expected_out:.6f} pnl={pnl:+.6f} sell={fraction:.2f} "
+                        f"locked_pnl~={projected_locked_pnl:+.6f}"
+                    )
+                    return "quote_profit_runner_bank"
                 log(
                     f"PGG2-LIVE-QUOTE-ANY-PROFIT-BANK {short_addr(pos.mint)} lane={pos.lane} "
                     f"quote_out={expected_out:.6f} pnl={pnl:+.6f} need={bank_need:.6f}"
@@ -929,6 +1039,10 @@ class RaptorLiveBroker(PaperBroker):
                     f"requested={requested:.6f} chosen={amount:.6f} impact={impact:.4f} "
                     f"roundtrip_loss={roundtrip_loss:.6f}"
                 )
+            stable = self.confirm_entry_stability(plan, amount, quote, impact, roundtrip_loss)
+            if stable is None:
+                return None
+            quote, impact, roundtrip_loss = stable
             return amount, impact, quote, roundtrip_loss
         rt = "" if best_roundtrip_loss == 999.0 else f" best_roundtrip_loss={best_roundtrip_loss:.6f}"
         log(
@@ -936,6 +1050,172 @@ class RaptorLiveBroker(PaperBroker):
             f"requested={requested:.6f} min_trade={min_trade:.6f} "
             f"best_amount={best_amount:.6f} best_impact={best_impact:.4f} "
             f"max_impact={max_impact:.4f}{rt}"
+        )
+        return None
+
+    def confirm_entry_stability(
+        self,
+        plan: StrikePlan,
+        amount: float,
+        original_quote: dict[str, Any],
+        original_impact: float,
+        original_roundtrip_loss: float,
+    ) -> Optional[tuple[dict[str, Any], float, float]]:
+        """Refresh fast lanes once before spending.
+
+        Direct dry-live losses showed the dangerous pattern clearly: the first
+        buy+reverse quote passed, then the executable sell quote collapsed before
+        the first manager tick. This is not a signal gate; it is a final route
+        stability check that returns a fresh buy quote when the route is still
+        executable-green enough.
+        """
+        if not env_bool("PGG2_LIVE_ENTRY_STABILITY_CONFIRM_ENABLED", True):
+            return original_quote, original_impact, original_roundtrip_loss
+        lanes = {
+            lane.strip()
+            for lane in env_str("PGG2_LIVE_ENTRY_STABILITY_CONFIRM_LANES", "priced_snap,raw_momentum").split(",")
+            if lane.strip()
+        }
+        if plan.lane not in lanes:
+            return original_quote, original_impact, original_roundtrip_loss
+        delay_ms = env_int("PGG2_LIVE_ENTRY_STABILITY_DELAY_MS", 450)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+        try:
+            quote = self.build_swap(SOL_MINT, plan.mint, amount, self.buy_slippage)
+            impact = self.rate_price_impact(quote)
+            max_impact = self.max_buy_impact_for_lane(plan.lane)
+            if impact > max_impact:
+                log(
+                    f"PGG2-LIVE-ENTRY-STABILITY-BLOCK {short_addr(plan.mint)} lane={plan.lane} "
+                    f"reason=impact impact={impact:.4f} max={max_impact:.4f} amount={amount:.6f}"
+                )
+                return None
+            quote_tokens = self.rate_amount_out(quote)
+            if quote_tokens <= 0:
+                log(
+                    f"PGG2-LIVE-ENTRY-STABILITY-BLOCK {short_addr(plan.mint)} lane={plan.lane} "
+                    f"reason=no_tokens amount={amount:.6f}"
+                )
+                return None
+            reverse = self.build_swap(plan.mint, SOL_MINT, round(quote_tokens, 9), self.sell_slippage)
+            immediate_out = self.rate_amount_out(reverse)
+            roundtrip_loss = max(0.0, amount - immediate_out + self.quote_roundtrip_overhead_sol)
+            executable_pnl = immediate_out - self.quote_roundtrip_overhead_sol - amount
+            min_pnl = env_float("PGG2_LIVE_ENTRY_STABILITY_MIN_PNL_SOL", -0.00060)
+            if plan.lane == "priced_snap":
+                min_pnl = env_float("PGG2_LIVE_ENTRY_STABILITY_PRICED_SNAP_MIN_PNL_SOL", 0.00020)
+            elif plan.lane == "raw_momentum":
+                min_pnl = env_float("PGG2_LIVE_ENTRY_STABILITY_RAW_MOMENTUM_MIN_PNL_SOL", 0.00010)
+            allowed_loss = self.max_roundtrip_loss_for_lane(plan.lane, amount, plan.features)
+            stability_blocked = executable_pnl < min_pnl
+            if plan.lane != "priced_snap" and roundtrip_loss > allowed_loss:
+                stability_blocked = True
+            if stability_blocked:
+                if (
+                    plan.lane == "raw_momentum"
+                    and executable_pnl < min_pnl
+                    and self.raw_momentum_exec_spike_candidate(plan.features)
+                    and env_bool("PGG2_LIVE_RAW_EXEC_SPIKE_GREEN_CHASE_ENABLED", True)
+                ):
+                    chased = self.chase_raw_exec_spike_until_green(plan, amount, min_pnl, allowed_loss)
+                    if chased is not None:
+                        return chased
+                log(
+                    f"PGG2-LIVE-ENTRY-STABILITY-BLOCK {short_addr(plan.mint)} lane={plan.lane} "
+                    f"quote_out={immediate_out:.6f} pnl={executable_pnl:+.6f} "
+                    f"min_pnl={min_pnl:+.6f} roundtrip_loss={roundtrip_loss:.6f} "
+                    f"max_roundtrip={allowed_loss:.6f} amount={amount:.6f}"
+                )
+                return None
+            log(
+                f"PGG2-LIVE-ENTRY-STABILITY-OK {short_addr(plan.mint)} lane={plan.lane} "
+                f"quote_out={immediate_out:.6f} pnl={executable_pnl:+.6f} "
+                f"roundtrip_loss={roundtrip_loss:.6f} amount={amount:.6f}"
+            )
+            return quote, impact, roundtrip_loss
+        except Exception as exc:
+            log(f"PGG2-LIVE-ENTRY-STABILITY-FAIL {short_addr(plan.mint)} lane={plan.lane} {type(exc).__name__}: {exc}")
+            return None
+
+    def chase_raw_exec_spike_until_green(
+        self,
+        plan: StrikePlan,
+        amount: float,
+        min_pnl: float,
+        allowed_loss: float,
+    ) -> Optional[tuple[dict[str, Any], float, float]]:
+        """Poll a strong raw spike briefly instead of buying an executable-red quote.
+
+        The 2026-05-07 tape exposed both sides of this lane: red-at-entry raw
+        spikes created immediate losses, while some of those same mints later
+        printed 2x-3x curve moves. The live-equivalent compromise is to chase
+        the direct quote, not the paper curve: enter only if the refreshed
+        buy+sell route turns green inside a short window.
+        """
+        deadline = time.time() + env_float("PGG2_LIVE_RAW_EXEC_SPIKE_GREEN_CHASE_MAX_SEC", 8.0)
+        interval_ms = env_int("PGG2_LIVE_RAW_EXEC_SPIKE_GREEN_CHASE_INTERVAL_MS", 350)
+        max_attempts = env_int("PGG2_LIVE_RAW_EXEC_SPIKE_GREEN_CHASE_MAX_ATTEMPTS", 12)
+        required_greens = max(1, env_int("PGG2_LIVE_RAW_EXEC_SPIKE_GREEN_CONFIRMATIONS", 2))
+        best_pnl = -999.0
+        best_out = 0.0
+        attempts = 0
+        green_streak = 0
+        while attempts < max_attempts and time.time() < deadline:
+            attempts += 1
+            if interval_ms > 0:
+                time.sleep(interval_ms / 1000.0)
+            try:
+                quote = self.build_swap(SOL_MINT, plan.mint, amount, self.buy_slippage)
+                impact = self.rate_price_impact(quote)
+                max_impact = self.max_buy_impact_for_lane(plan.lane)
+                if impact > max_impact:
+                    log(
+                        f"PGG2-LIVE-RAW-GREEN-CHASE-SKIP {short_addr(plan.mint)} "
+                        f"reason=impact attempt={attempts} impact={impact:.4f} max={max_impact:.4f}"
+                    )
+                    continue
+                quote_tokens = self.rate_amount_out(quote)
+                if quote_tokens <= 0:
+                    continue
+                reverse = self.build_swap(plan.mint, SOL_MINT, round(quote_tokens, 9), self.sell_slippage)
+                immediate_out = self.rate_amount_out(reverse)
+                roundtrip_loss = max(0.0, amount - immediate_out + self.quote_roundtrip_overhead_sol)
+                executable_pnl = immediate_out - self.quote_roundtrip_overhead_sol - amount
+                if executable_pnl > best_pnl:
+                    best_pnl = executable_pnl
+                    best_out = immediate_out
+                log(
+                    f"PGG2-LIVE-RAW-GREEN-CHASE {short_addr(plan.mint)} attempt={attempts} "
+                    f"quote_out={immediate_out:.6f} pnl={executable_pnl:+.6f} "
+                    f"min_pnl={min_pnl:+.6f} roundtrip_loss={roundtrip_loss:.6f} "
+                    f"max_roundtrip={allowed_loss:.6f}"
+                )
+                if executable_pnl >= min_pnl and roundtrip_loss <= allowed_loss:
+                    green_streak += 1
+                    if green_streak < required_greens:
+                        log(
+                            f"PGG2-LIVE-RAW-GREEN-CHASE-CONFIRM {short_addr(plan.mint)} "
+                            f"attempt={attempts} streak={green_streak}/{required_greens} "
+                            f"quote_out={immediate_out:.6f} pnl={executable_pnl:+.6f}"
+                        )
+                        continue
+                    log(
+                        f"PGG2-LIVE-RAW-GREEN-CHASE-OK {short_addr(plan.mint)} attempt={attempts} "
+                        f"streak={green_streak}/{required_greens} "
+                        f"quote_out={immediate_out:.6f} pnl={executable_pnl:+.6f}"
+                    )
+                    return quote, impact, roundtrip_loss
+                green_streak = 0
+            except Exception as exc:
+                log(
+                    f"PGG2-LIVE-RAW-GREEN-CHASE-ERR {short_addr(plan.mint)} "
+                    f"attempt={attempts} err={type(exc).__name__}: {exc}"
+                )
+                return None
+        log(
+            f"PGG2-LIVE-RAW-GREEN-CHASE-BLOCK {short_addr(plan.mint)} attempts={attempts} "
+            f"best_pnl={best_pnl:+.6f} best_out={best_out:.6f} min_pnl={min_pnl:+.6f}"
         )
         return None
 
@@ -977,6 +1257,8 @@ class RaptorLiveBroker(PaperBroker):
             return ""
         if pos.mint not in self.positions:
             return ""
+        if pos.derisk_done and env_bool("PGG2_LIVE_RUNNER_SUPPRESS_PROFIT_BANK", True):
+            return ""
         age_sec = pos.age_sec(ts_ms)
         if age_sec < env_float("PGG2_LIVE_QUOTE_PROFIT_BANK_MIN_AGE_SEC", 0.35):
             return ""
@@ -1014,6 +1296,16 @@ class RaptorLiveBroker(PaperBroker):
                 f"quote_out={expected_out:.6f} pnl={pnl:+.6f} need={need:.6f}"
             )
             if pnl >= need:
+                if self.runner_bank_enabled_for(pos, expected_out, pnl):
+                    fraction = self.runner_bank_fraction()
+                    projected_proceeds = max(0.0, expected_out * fraction - self.quote_partial_sell_overhead_sol())
+                    projected_locked_pnl = pos.realized_sol + projected_proceeds - pos.cost_sol
+                    log(
+                        f"PGG2-LIVE-QUOTE-RUNNER-BANK {short_addr(pos.mint)} lane={pos.lane} "
+                        f"quote_out={expected_out:.6f} pnl={pnl:+.6f} sell={fraction:.2f} "
+                        f"locked_pnl~={projected_locked_pnl:+.6f}"
+                    )
+                    return "quote_profit_runner_bank"
                 return "quote_profit_bank"
         except Exception as exc:
             log(f"PGG2-LIVE-QUOTE-PROFIT-WARN {short_addr(pos.mint)} {type(exc).__name__}: {exc}")
@@ -1711,8 +2003,87 @@ class RaptorLiveBroker(PaperBroker):
         return None
 
     def partial(self, mint: str, fraction: float, price: float, reason: str) -> Optional[Position]:
-        log(f"PGG2-LIVE-PARTIAL-BLOCKED {short_addr(mint)} fraction={fraction:.2f} reason={reason}")
-        return None
+        pos = self.positions.get(mint)
+        if not pos:
+            return None
+        fraction = max(0.0, min(0.95, fraction))
+        if fraction <= 0.0 or pos.remaining_tokens <= 0.0:
+            return None
+        if price > 0:
+            pos.update(price)
+        self.close_quote_cache.pop(mint, None)
+        try:
+            if self.quote_only and self.quote_shadow_positions:
+                quote_tokens = self.quote_shadow_tokens.get(mint, pos.remaining_tokens)
+                remaining_fraction = pos.remaining_tokens / max(pos.tokens_bought, 1e-18)
+                sell_amount = round(quote_tokens * remaining_fraction * fraction, 9)
+            else:
+                balance = self.token_balance_ui(mint)
+                sell_amount = round(balance * fraction, 9)
+            if sell_amount <= 0:
+                log(f"PGG2-LIVE-PARTIAL-BLOCKED {short_addr(mint)} fraction={fraction:.2f} reason={reason} no_tokens")
+                return None
+            quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
+            expected_out = self.rate_amount_out(quote)
+            if expected_out <= 0:
+                return None
+            overhead = self.quote_partial_sell_overhead_sol() if self.quote_shadow_positions else 0.0
+            projected_proceeds = max(0.0, expected_out - overhead)
+            projected_locked_pnl = pos.realized_sol + projected_proceeds - pos.cost_sol
+            if (
+                reason == "quote_profit_runner_bank"
+                and projected_locked_pnl < env_float("PGG2_LIVE_RUNNER_BANK_MIN_LOCKED_PNL_SOL", 0.00020)
+            ):
+                log(
+                    f"PGG2-LIVE-PARTIAL-HOLD {short_addr(mint)} reason={reason} "
+                    f"quote_out={expected_out:.6f} locked_pnl={projected_locked_pnl:+.6f}"
+                )
+                return None
+            if self.quote_only:
+                if self.quote_simulate and self.keypair:
+                    signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
+                    self.simulate_signed(signed_b64)
+                proceeds = projected_proceeds
+                sold_paper_tokens = pos.remaining_tokens * fraction
+                pos.remaining_tokens = max(0.0, pos.remaining_tokens - sold_paper_tokens)
+                pos.realized_sol += proceeds
+                pos.derisk_done = True
+                pos.state = "RUNNER"
+                self.stats.partials += 1
+                log(
+                    f"PGG2-QUOTE-SHADOW-PARTIAL {short_addr(mint)} reason={reason} "
+                    f"sold={fraction * 100:.1f}% quote_out={expected_out:.6f} "
+                    f"overhead={overhead:.6f} proceeds={proceeds:.6f} "
+                    f"locked_pnl={pos.realized_sol - pos.cost_sol:+.6f} "
+                    f"runner_left={(1.0 - fraction) * 100:.1f}%"
+                )
+                self.save_state()
+                return pos
+            signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
+            if not self.simulate_signed(signed_b64):
+                return None
+            sig = self.send_signed(signed_b64)
+            if not self.wait_confirmed(sig):
+                return None
+            wallet_delta = self.transaction_wallet_delta_sol(sig)
+            proceeds = max(0.0, wallet_delta)
+            sold_paper_tokens = pos.remaining_tokens * fraction
+            pos.remaining_tokens = max(0.0, pos.remaining_tokens - sold_paper_tokens)
+            pos.realized_sol += proceeds
+            pos.derisk_done = True
+            pos.state = "RUNNER"
+            self.stats.partials += 1
+            log(
+                f"PGG2-LIVE-PARTIAL {short_addr(mint)} reason={reason} sig={sig} "
+                f"sold={fraction * 100:.1f}% proceeds={proceeds:.6f} "
+                f"wallet_delta={wallet_delta:+.6f} locked_pnl={pos.realized_sol - pos.cost_sol:+.6f}"
+            )
+            self.save_state()
+            return pos
+        except Exception as exc:
+            log(f"PGG2-LIVE-PARTIAL-FAIL {short_addr(mint)} {type(exc).__name__}: {exc}")
+            self.save_state()
+            return None
 
     def close(self, mint: str, ts_ms: int, price: float, reason: str, killed: bool) -> Optional[float]:
         pos = self.positions.get(mint)
@@ -1742,33 +2113,36 @@ class RaptorLiveBroker(PaperBroker):
                 overhead,
             )
             executable_pnl = pos.realized_sol + expected_out - overhead - pos.cost_sol
-            if (
-                (self.mode == "live" or self.quote_shadow_positions)
-                and self.profit_exit_reason(reason)
-                and expected_out > 0.0
-                and expected_out
-                < pos.cost_sol
-                + min_profit_out
-            ):
-                defensive_sell = (
-                    env_bool("PGG2_LIVE_PROFIT_SIGNAL_DEFENSIVE_SELL_ENABLED", False)
-                    and pos.peak_mult >= env_float("PGG2_LIVE_PROFIT_SIGNAL_DEFENSIVE_MIN_PEAK", 1.25)
-                    and executable_pnl
-                    >= env_float("PGG2_LIVE_PROFIT_SIGNAL_DEFENSIVE_MIN_PNL_SOL", 0.0)
-                )
-                if defensive_sell:
-                    log(
-                        f"PGG2-LIVE-PROFIT-SIGNAL-DEFENSIVE-SELL {short_addr(mint)} reason={reason} "
-                        f"quote_out={expected_out:.6f} pnl={executable_pnl:+.6f} "
-                        f"peak={pos.peak_mult:.3f} need={pos.cost_sol + min_profit_out:.6f}"
+            if (self.mode == "live" or self.quote_shadow_positions) and self.profit_exit_reason(reason) and expected_out > 0.0:
+                if pos.derisk_done:
+                    min_runner_close_pnl = env_float("PGG2_LIVE_RUNNER_MIN_CLOSE_PNL_SOL", 0.00020)
+                    if executable_pnl < min_runner_close_pnl:
+                        log(
+                            f"PGG2-LIVE-RUNNER-SELL-HOLD {short_addr(mint)} reason={reason} "
+                            f"quote_out={expected_out:.6f} cost={pos.cost_sol:.6f} "
+                            f"pnl={executable_pnl:+.6f} need_pnl={min_runner_close_pnl:.6f}"
+                        )
+                        return None
+                elif expected_out < pos.cost_sol + min_profit_out:
+                    defensive_sell = (
+                        env_bool("PGG2_LIVE_PROFIT_SIGNAL_DEFENSIVE_SELL_ENABLED", False)
+                        and pos.peak_mult >= env_float("PGG2_LIVE_PROFIT_SIGNAL_DEFENSIVE_MIN_PEAK", 1.25)
+                        and executable_pnl
+                        >= env_float("PGG2_LIVE_PROFIT_SIGNAL_DEFENSIVE_MIN_PNL_SOL", 0.0)
                     )
-                else:
-                    log(
-                        f"PGG2-LIVE-SELL-HOLD {short_addr(mint)} reason={reason} "
-                        f"quote_out={expected_out:.6f} cost={pos.cost_sol:.6f} "
-                        f"pnl={executable_pnl:+.6f} need={pos.cost_sol + min_profit_out:.6f}"
-                    )
-                    return None
+                    if defensive_sell:
+                        log(
+                            f"PGG2-LIVE-PROFIT-SIGNAL-DEFENSIVE-SELL {short_addr(mint)} reason={reason} "
+                            f"quote_out={expected_out:.6f} pnl={executable_pnl:+.6f} "
+                            f"peak={pos.peak_mult:.3f} need={pos.cost_sol + min_profit_out:.6f}"
+                        )
+                    else:
+                        log(
+                            f"PGG2-LIVE-SELL-HOLD {short_addr(mint)} reason={reason} "
+                            f"quote_out={expected_out:.6f} cost={pos.cost_sol:.6f} "
+                            f"pnl={executable_pnl:+.6f} need={pos.cost_sol + min_profit_out:.6f}"
+                        )
+                        return None
             if self.quote_only:
                 if self.quote_simulate and self.keypair:
                     signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
