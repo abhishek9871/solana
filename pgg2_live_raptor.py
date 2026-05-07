@@ -103,6 +103,7 @@ class RaptorLiveBroker(PaperBroker):
         self.quote_shadow_tokens: dict[str, float] = {}
         self.last_profit_quote_ms: dict[str, int] = {}
         self.last_loss_quote_ms: dict[str, int] = {}
+        self.close_quote_cache: dict[str, tuple[int, dict[str, Any], float]] = {}
         self.fast_paper_accounting = env_bool("PGG2_LIVE_FAST_PAPER_ACCOUNTING", False)
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
@@ -111,6 +112,23 @@ class RaptorLiveBroker(PaperBroker):
             f"reserve={self.min_wallet_reserve_sol:.4f} "
             f"session_loss_cap={self.max_session_loss_sol:.4f}"
         )
+
+    def remember_close_quote(self, mint: str, ts_ms: int, quote: dict[str, Any], expected_out: float) -> None:
+        if not env_bool("PGG2_LIVE_REUSE_EXIT_QUOTE_ENABLED", True):
+            return
+        self.close_quote_cache[mint] = (ts_ms, quote, expected_out)
+
+    def consume_close_quote(self, mint: str, ts_ms: int) -> Optional[tuple[dict[str, Any], float]]:
+        if not env_bool("PGG2_LIVE_REUSE_EXIT_QUOTE_ENABLED", True):
+            return None
+        cached = self.close_quote_cache.pop(mint, None)
+        if not cached:
+            return None
+        quote_ts, quote, expected_out = cached
+        max_age_ms = env_int("PGG2_LIVE_REUSE_EXIT_QUOTE_MAX_AGE_MS", 700)
+        if ts_ms - quote_ts > max_age_ms:
+            return None
+        return quote, expected_out
 
     @staticmethod
     def load_keypair(path: Path) -> Keypair:
@@ -308,6 +326,36 @@ class RaptorLiveBroker(PaperBroker):
         if lane == "preprice_reveal":
             ratio = env_float("PGG2_LIVE_PREPRICE_REVEAL_MAX_ROUNDTRIP_LOSS_RATIO", 0.065)
             floor = env_float("PGG2_LIVE_PREPRICE_REVEAL_ROUNDTRIP_ABS_FLOOR_SOL", 0.00150)
+        elif lane == "priced_snap":
+            feats = features or {}
+            ratio = env_float("PGG2_LIVE_PRICED_SNAP_MAX_ROUNDTRIP_LOSS_RATIO", 0.045)
+            floor = env_float("PGG2_LIVE_PRICED_SNAP_ROUNDTRIP_ABS_FLOOR_SOL", 0.00150)
+            buy1500 = float(feats.get("buy1500") or 0.0)
+            uniq1500 = int(feats.get("uniq1500") or 0)
+            top1500 = float(feats.get("top_share1500") or feats.get("top_share700") or 1.0)
+            sell1500 = float(feats.get("sell1500") or 0.0)
+            entry_move = float(feats.get("priced_snap_entry_move") or feats.get("move1500") or 1.0)
+            age_ms = int(feats.get("age_ms") or 0)
+            broad_snap = (
+                env_bool("PGG2_LIVE_PRICED_SNAP_BROAD_ROUNDTRIP_EXCEPTION_ENABLED", True)
+                and buy1500 >= env_float("PGG2_LIVE_PRICED_SNAP_BROAD_MIN_BUY1500", 10.5)
+                and uniq1500 >= env_int("PGG2_LIVE_PRICED_SNAP_BROAD_MIN_UNIQ1500", 9)
+                and top1500 <= env_float("PGG2_LIVE_PRICED_SNAP_BROAD_MAX_TOP1500", 0.35)
+                and sell1500 <= max(
+                    0.010,
+                    buy1500 * env_float("PGG2_LIVE_PRICED_SNAP_BROAD_MAX_SELL_RATIO1500", 0.015),
+                )
+                and entry_move <= env_float("PGG2_LIVE_PRICED_SNAP_BROAD_MAX_ENTRY_MOVE", 1.25)
+                and age_ms <= env_int("PGG2_LIVE_PRICED_SNAP_BROAD_MAX_AGE_MS", 900)
+            )
+            if broad_snap:
+                # 2026-05-07 live-equivalent tape: p7Ba had 11.2 SOL/11 buyers,
+                # top 0.29, nearly zero sells, was blocked by a 0.00467 SOL
+                # immediate roundtrip drag, then reached 1.65x. Keep the guard
+                # strict for normal priced_snap, but let broad low-sell launch
+                # clusters pay the known direct-route friction.
+                ratio = env_float("PGG2_LIVE_PRICED_SNAP_BROAD_MAX_ROUNDTRIP_LOSS_RATIO", 0.050)
+                floor = env_float("PGG2_LIVE_PRICED_SNAP_BROAD_ROUNDTRIP_ABS_FLOOR_SOL", 0.00200)
         elif lane == "priced_breakout":
             ratio = env_float("PGG2_LIVE_PRICED_BREAKOUT_MAX_ROUNDTRIP_LOSS_RATIO", 0.060)
             floor = env_float("PGG2_LIVE_PRICED_BREAKOUT_ROUNDTRIP_ABS_FLOOR_SOL", 0.00175)
@@ -373,8 +421,12 @@ class RaptorLiveBroker(PaperBroker):
             # loser already had poor immediate roundtrip economics at entry. Keep
             # the signal, block only quotes where execution quality is bad enough
             # that one failed trade can erase multiple small moonshot wins.
-            ratio = env_float("PGG2_LIVE_CURVE_LAG_MAX_ROUNDTRIP_LOSS_RATIO", 0.06)
-            floor = env_float("PGG2_LIVE_CURVE_LAG_ROUNDTRIP_ABS_FLOOR_SOL", 0.00125)
+            if self.curve_lag_clean_profile(features):
+                ratio = env_float("PGG2_LIVE_CURVE_LAG_MAX_ROUNDTRIP_LOSS_RATIO", 0.06)
+                floor = env_float("PGG2_LIVE_CURVE_LAG_ROUNDTRIP_ABS_FLOOR_SOL", 0.00125)
+            else:
+                ratio = env_float("PGG2_LIVE_CURVE_LAG_THIN_MAX_ROUNDTRIP_LOSS_RATIO", 0.040)
+                floor = env_float("PGG2_LIVE_CURVE_LAG_THIN_ROUNDTRIP_ABS_FLOOR_SOL", 0.00125)
         elif lane == "birth_fanout":
             # Birth fanout can identify real pumps, but quote runs showed that
             # high-drag fanout entries turn tiny moves into immediate losses.
@@ -454,6 +506,27 @@ class RaptorLiveBroker(PaperBroker):
         )
         return clean_sells and (strong_breadth or strong_cluster)
 
+    def curve_lag_clean_profile(self, features: Optional[dict[str, Any]]) -> bool:
+        """Profiles that earned normal curve-lag loss room in direct dry-live tape."""
+        feats = features or {}
+        buy1500 = float(feats.get("buy1500") or 0.0)
+        uniq1500 = int(feats.get("uniq1500") or 0)
+        top1500 = float(feats.get("top_share1500") or 1.0)
+        live_buy700 = float(feats.get("curve_lag_live_buy700") or feats.get("buy700") or 0.0)
+        live_uniq700 = int(feats.get("curve_lag_live_unique700") or feats.get("uniq700") or 0)
+        live_top700 = float(feats.get("curve_lag_live_top700") or feats.get("top_share700") or 1.0)
+        broad_1500 = (
+            buy1500 >= env_float("PGG2_LIVE_CURVE_LAG_CLEAN_MIN_BUY1500", 12.0)
+            and uniq1500 >= env_int("PGG2_LIVE_CURVE_LAG_CLEAN_MIN_UNIQ1500", 9)
+            and top1500 <= env_float("PGG2_LIVE_CURVE_LAG_CLEAN_MAX_TOP1500", 0.35)
+        )
+        broad_live = (
+            live_buy700 >= env_float("PGG2_LIVE_CURVE_LAG_CLEAN_MIN_LIVE_BUY700", 12.0)
+            and live_uniq700 >= env_int("PGG2_LIVE_CURVE_LAG_CLEAN_MIN_LIVE_UNIQ700", 10)
+            and live_top700 <= env_float("PGG2_LIVE_CURVE_LAG_CLEAN_MAX_LIVE_TOP700", 0.35)
+        )
+        return broad_1500 or broad_live
+
     def max_executable_loss_for_lane(
         self,
         lane: str,
@@ -492,6 +565,14 @@ class RaptorLiveBroker(PaperBroker):
             ratio = env_float("PGG2_LIVE_BIRTH_FANOUT_MAX_EXECUTABLE_LOSS_RATIO", ratio)
             floor = env_float("PGG2_LIVE_BIRTH_FANOUT_MAX_EXECUTABLE_LOSS_FLOOR_SOL", floor)
             cap = env_float("PGG2_LIVE_BIRTH_FANOUT_MAX_EXECUTABLE_LOSS_CAP_SOL", cap)
+        elif lane == "priced_snap":
+            # Direct dry-live tape exposed the priced_snap failure mode: a broad
+            # launch can look excellent on buyer breadth, but the executable
+            # quote is already red. Keep the lane aggressive, but make the
+            # live-equivalent quote decide the maximum loss room.
+            ratio = env_float("PGG2_LIVE_PRICED_SNAP_MAX_EXECUTABLE_LOSS_RATIO", 0.040)
+            floor = env_float("PGG2_LIVE_PRICED_SNAP_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00125)
+            cap = env_float("PGG2_LIVE_PRICED_SNAP_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00160)
         elif lane == "stealth_arm":
             ratio = env_float("PGG2_LIVE_STEALTH_ARM_MAX_EXECUTABLE_LOSS_RATIO", 0.30)
             floor = env_float("PGG2_LIVE_STEALTH_ARM_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00150)
@@ -500,6 +581,20 @@ class RaptorLiveBroker(PaperBroker):
             ratio = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_RATIO", 0.30)
             floor = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00150)
             cap = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00300)
+        elif lane == "curve_lag_reveal":
+            if self.curve_lag_clean_profile(features):
+                ratio = env_float("PGG2_LIVE_CURVE_LAG_MAX_EXECUTABLE_LOSS_RATIO", ratio)
+                floor = env_float("PGG2_LIVE_CURVE_LAG_MAX_EXECUTABLE_LOSS_FLOOR_SOL", floor)
+                cap = env_float("PGG2_LIVE_CURVE_LAG_MAX_EXECUTABLE_LOSS_CAP_SOL", cap)
+            else:
+                # 8JfT direct dry-live loss: non-elite 9.9 SOL / 6-buyer curve
+                # lag entered with -0.00213 executable roundtrip drag, then
+                # widened to -0.00447 before the old global cap fired. Keep
+                # curve-lag frequency, but make thin profiles cut at first red
+                # executable quote instead of letting one loss erase winners.
+                ratio = env_float("PGG2_LIVE_CURVE_LAG_THIN_MAX_EXECUTABLE_LOSS_RATIO", 0.040)
+                floor = env_float("PGG2_LIVE_CURVE_LAG_THIN_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00125)
+                cap = env_float("PGG2_LIVE_CURVE_LAG_THIN_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00160)
         elif lane in {"reclaim_wave", "second_wave_after_cluster"}:
             feats = features or {}
             buy700 = float(feats.get("buy700") or 0.0)
@@ -593,6 +688,7 @@ class RaptorLiveBroker(PaperBroker):
                 sell_amount = round(quote_tokens * remaining_fraction, 9)
             quote = self.build_swap(pos.mint, SOL_MINT, sell_amount, self.sell_slippage)
             expected_out = self.rate_amount_out(quote)
+            self.remember_close_quote(pos.mint, ts_ms, quote, expected_out)
             overhead = self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0
             pnl = pos.realized_sol + expected_out - overhead - pos.cost_sol
             bank_need = env_float(
@@ -623,6 +719,20 @@ class RaptorLiveBroker(PaperBroker):
                     "PGG2_LIVE_SPARK3_ARM_ANY_PROFIT_BANK_MIN_PNL_SOL",
                     max(bank_need, 0.00250),
                 )
+            elif pos.lane == "raw_momentum":
+                raw_profile = str((getattr(pos, "entry_features", {}) or {}).get("raw_profile") or "")
+                if raw_profile == "exec_spike_probe":
+                    # Exec-spike probes are deliberately tiny and often have no
+                    # broad buyer confirmation. The 2026-05-07 dry-live tape
+                    # showed 7g4D was +0.000478 SOL executable-green on the
+                    # first quote, then snapped to -0.005294 by the next quote.
+                    # Bank the first meaningful green quote for this fragile
+                    # profile; fast re-entry remains enabled if the mint keeps
+                    # running.
+                    bank_need = env_float(
+                        "PGG2_LIVE_RAW_EXEC_SPIKE_ANY_PROFIT_BANK_MIN_PNL_SOL",
+                        0.00045,
+                    )
             if env_bool("PGG2_LIVE_QUOTE_ANY_PROFIT_BANK_ENABLED", True) and pnl >= bank_need:
                 log(
                     f"PGG2-LIVE-QUOTE-ANY-PROFIT-BANK {short_addr(pos.mint)} lane={pos.lane} "
@@ -636,6 +746,24 @@ class RaptorLiveBroker(PaperBroker):
                 entry_features,
                 pos.reason,
             )
+            if (
+                pos.lane == "curve_lag_reveal"
+                and env_bool("PGG2_LIVE_CURVE_LAG_THIN_STALL_EXIT_ENABLED", True)
+                and not self.curve_lag_clean_profile(entry_features)
+                and pos.age_sec(ts_ms) >= env_float("PGG2_LIVE_CURVE_LAG_THIN_STALL_EXIT_AFTER_SEC", 0.75)
+                and pnl <= env_float("PGG2_LIVE_CURVE_LAG_THIN_STALL_EXIT_MAX_PNL_SOL", 0.00005)
+            ):
+                # Direct dry-live tape: GaPF entered curve_lag with marginally red
+                # executable quote (-0.00002 SOL), then widened to -0.00475 SOL
+                # before the regular loss cap fired. Thin curve-lag is not the
+                # raw moonshot lane; if executable PnL has not turned green fast,
+                # cut it at dust instead of letting one lag reveal erase runners.
+                log(
+                    f"PGG2-LIVE-CURVE-LAG-THIN-STALL-EXIT {short_addr(pos.mint)} "
+                    f"quote_out={expected_out:.6f} pnl={pnl:+.6f} max_loss={max_loss:.6f} "
+                    f"age={pos.age_sec(ts_ms):.2f}s"
+                )
+                return "curve_lag_thin_stall_exit"
             if (
                 pos.lane == "priced_breakout"
                 and self.priced_breakout_runner_profile(entry_features, pos.reason)
@@ -668,6 +796,27 @@ class RaptorLiveBroker(PaperBroker):
         does not reopen the same birth entry; it only lets a later confirmed lane
         take over if the mint proves itself.
         """
+        if (
+            env_bool("PGG2_LIVE_ALLOW_FAST_REENTRY_AFTER_DIRECT_RUNNER_CLOSE", True)
+            and pos.lane in {"priced_snap", "curve_lag_reveal", "raw_momentum"}
+            and reason
+            in {
+                "quote_profit_bank",
+                "quote_loss_clamp",
+                "curve_lag_thin_stall_exit",
+                "curve_lag_no_follow",
+                "kill_priced_snap_layered_no_follow",
+                "priced_snap_exec_quote_loss_clamp",
+                "priced_snap_exec_quote_profit_trail",
+            }
+            and pnl >= -env_float("PGG2_RUNNER_REENTRY_UNLOCK_MAX_LOSS_SOL", 0.00165)
+            and pnl <= env_float("PGG2_RUNNER_REENTRY_UNLOCK_MAX_WIN_SOL", 0.00800)
+        ):
+            # The 2026-05-07 direct dry-live tape showed this exact failure mode:
+            # DVZR/HuUQ/bc4m banked tiny executable profit and 7XSd dust-stopped,
+            # then the raw curve still ran 2x+. Keep the loss cap, but do not mark
+            # the mint closed for the stronger later runner lane.
+            return True
         if not env_bool("PGG2_LIVE_ALLOW_FAST_REENTRY_AFTER_BIRTH_CLOSE", True):
             return False
         if pos.lane != "birth_fanout":
@@ -797,6 +946,14 @@ class RaptorLiveBroker(PaperBroker):
             "moonshot_pop_after_sell",
             "moonshot_decay_55",
             "quote_profit_bank",
+            "priced_snap_scout_profit_protect",
+            "priced_snap_scale_profit_protect",
+            "priced_snap_exec_quote_profit_trail",
+            "priced_snap_pop_bank",
+            "priced_breakout_pop_bank",
+            "birth_fanout_pop_bank",
+            "birth_fanout_sell_slam_bank",
+            "whale_spark_pop_bank",
             "late_reclaim_probe_pop_bank",
             "runner_3x_decay",
             "runner_flow_decay",
@@ -840,6 +997,7 @@ class RaptorLiveBroker(PaperBroker):
                 sell_amount = round(quote_tokens * remaining_fraction, 9)
             quote = self.build_swap(pos.mint, SOL_MINT, sell_amount, self.sell_slippage)
             expected_out = self.rate_amount_out(quote)
+            self.remember_close_quote(pos.mint, ts_ms, quote, expected_out)
             overhead = self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0
             pnl = pos.realized_sol + expected_out - overhead - pos.cost_sol
             need = env_float(
@@ -1568,8 +1726,16 @@ class RaptorLiveBroker(PaperBroker):
                 quote_tokens = self.quote_shadow_tokens.get(mint, pos.remaining_tokens)
                 remaining_fraction = pos.remaining_tokens / max(pos.tokens_bought, 1e-18)
                 sell_amount = round(quote_tokens * remaining_fraction, 9)
-            quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
-            expected_out = self.rate_amount_out(quote)
+            cached = self.consume_close_quote(mint, ts_ms)
+            if cached:
+                quote, expected_out = cached
+                log(
+                    f"PGG2-LIVE-REUSE-EXIT-QUOTE {short_addr(mint)} reason={reason} "
+                    f"quote_out={expected_out:.6f}"
+                )
+            else:
+                quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
+                expected_out = self.rate_amount_out(quote)
             overhead = self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0
             min_profit_out = env_float(
                 "PGG2_LIVE_MIN_PROFIT_EXIT_SOL",
@@ -1612,9 +1778,10 @@ class RaptorLiveBroker(PaperBroker):
                     self.quote_shadow_tokens.pop(mint, None)
                     proceeds = max(0.0, expected_out - overhead)
                     pnl = pos.realized_sol + proceeds - pos.cost_sol
+                    effective_killed = bool(killed and pnl < 0)
                     self.stats.realized_pnl_sol += pnl
                     self.stats.closes += 1
-                    if killed:
+                    if effective_killed:
                         self.stats.kills += 1
                     if pnl >= 0:
                         self.stats.wins += 1
@@ -1651,9 +1818,10 @@ class RaptorLiveBroker(PaperBroker):
             proceeds = max(0.0, wallet_delta)
             self.positions.pop(mint, None)
             pnl = pos.realized_sol + proceeds - pos.cost_sol
+            effective_killed = bool(killed and pnl < 0)
             self.stats.realized_pnl_sol += pnl
             self.stats.closes += 1
-            if killed:
+            if effective_killed:
                 self.stats.kills += 1
             if pnl >= 0:
                 self.stats.wins += 1

@@ -122,6 +122,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         self.curve_lag_reveal_seen: set[str] = set()
         self.preprice_reveal_seen: set[str] = set()
         self.priced_snap_seen: set[str] = set()
+        self.live_losscut_logged: set[str] = set()
         self.priced_breakout_watch: dict[str, dict[str, Any]] = {}
         self.priced_breakout_seen: set[str] = set()
         self.late_swarm_seen: set[str] = set()
@@ -151,6 +152,23 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             "raw_momentum",
             "whale_spark",
         }
+
+    def live_entry_losscut_reason(self, buy1500: float, uniq1500: int, score: float) -> Optional[str]:
+        """Live-derived entry reject.
+
+        Validated on direct-live runs after fees/quotes. It skips the weak
+        breadth profile that produced loss without touching broad winners.
+        """
+        if not env_bool("PGG2_LIVE_LOSS_CUTTER_ENABLED", False):
+            return None
+        min_uniq = env_int("PGG2_LIVE_LOSSCUT_MIN_UNIQ1500", 6)
+        low_buy = env_float("PGG2_LIVE_LOSSCUT_LOW_BUY1500", 10.5)
+        low_score = env_float("PGG2_LIVE_LOSSCUT_LOW_SCORE", 150.0)
+        if uniq1500 < min_uniq:
+            return f"uniq1500<{min_uniq}"
+        if buy1500 < low_buy and score < low_score:
+            return f"buy1500<{low_buy:.2f}_score<{low_score:.1f}"
+        return None
 
     def recent_profit_reentry_locked(self, mint: str, ts_ms: int) -> bool:
         prior = self.profitable_closes.get(mint)
@@ -266,6 +284,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             "sig_buyers": set(),
             "last_sig_buy_ms": 0,
             "entry_features": dict(entry_features) if entry_features else {},
+            "defer_logs": set(),
         }
         self.position_follow[pos.mint] = follow
         return follow
@@ -321,6 +340,211 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         features["last_post_open_sig_buy_age_ms"] = (
             int(features["ts_ms"]) - last_sig_buy_ms if last_sig_buy_ms else 999999
         )
+
+    def entry_features_for_position(self, pos: Any) -> dict[str, Any]:
+        follow = self.position_follow.get(pos.mint) or {}
+        entry_features = follow.get("entry_features") or {}
+        if entry_features:
+            return entry_features
+        return getattr(pos, "entry_features", None) or {}
+
+    def log_defer_once(self, pos: Any, key: str, message: str) -> None:
+        follow = self.follow_for_position(pos)
+        logged = follow.setdefault("defer_logs", set())
+        if key in logged:
+            return
+        logged.add(key)
+        log(message)
+
+    def curve_lag_broad_quote_grace(self, pos: Any, features: dict[str, Any], ts_ms: int) -> bool:
+        """Hold broad curve-lag entries through the first executable-loss check."""
+        if not env_bool("PGG2_CURVE_LAG_BROAD_QUOTE_GRACE_ENABLED", True):
+            return False
+        if pos.lane != "curve_lag_reveal":
+            return False
+        age_sec = pos.age_sec(ts_ms)
+        if age_sec >= env_float("PGG2_CURVE_LAG_BROAD_QUOTE_GRACE_SEC", 4.25):
+            return False
+        entry = self.entry_features_for_position(pos)
+        buy1500 = float(entry.get("buy1500") or 0.0)
+        uniq1500 = int(entry.get("uniq1500") or 0)
+        top1500 = float(entry.get("top_share1500") or 1.0)
+        live_buy700 = float(entry.get("curve_lag_live_buy700") or entry.get("buy700") or 0.0)
+        live_uniq700 = int(entry.get("curve_lag_live_unique700") or entry.get("uniq700") or 0)
+        live_top700 = float(entry.get("curve_lag_live_top700") or entry.get("top_share700") or 1.0)
+        broad = (
+            buy1500 >= env_float("PGG2_CURVE_LAG_BROAD_GRACE_MIN_BUY1500", 18.0)
+            and uniq1500 >= env_int("PGG2_CURVE_LAG_BROAD_GRACE_MIN_UNIQ1500", 12)
+            and top1500 <= env_float("PGG2_CURVE_LAG_BROAD_GRACE_MAX_TOP1500", 0.20)
+            and live_buy700 >= env_float("PGG2_CURVE_LAG_BROAD_GRACE_MIN_LIVE_BUY700", 8.0)
+            and live_uniq700 >= env_int("PGG2_CURVE_LAG_BROAD_GRACE_MIN_LIVE_UNIQ700", 5)
+            and live_top700 <= env_float("PGG2_CURVE_LAG_BROAD_GRACE_MAX_LIVE_TOP700", 0.35)
+        )
+        if not broad:
+            return False
+        self.log_defer_once(
+            pos,
+            "curve_lag_broad_quote_grace",
+            f"PGG2-EXIT-DEFER {short_addr(pos.mint)} reason=curve_lag_broad_quote_grace "
+            f"age={age_sec:.2f}s b1500={buy1500:.3f}/{uniq1500} top={top1500:.2f} "
+            f"live700={live_buy700:.3f}/{live_uniq700} top700={live_top700:.2f}",
+        )
+        return True
+
+    def priced_snap_strong_follow_hard_grace(self, pos: Any, features: dict[str, Any], kill: str, ts_ms: int) -> bool:
+        """Defer early priced-snap hard breaks when fresh buyers are still pressing."""
+        if not env_bool("PGG2_PRICED_SNAP_STRONG_FOLLOW_GRACE_ENABLED", True):
+            return False
+        if pos.lane != "priced_snap" or kill != "kill_priced_snap_hard_break":
+            return False
+        age_sec = pos.age_sec(ts_ms)
+        if age_sec >= env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_GRACE_SEC", 75.0):
+            return False
+        entry = self.entry_features_for_position(pos)
+        entry_move = float(entry.get("priced_snap_entry_move") or entry.get("wave_base_move") or 0.0)
+        if entry_move > env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_MAX_ENTRY_MOVE", 1.30):
+            return False
+        follow_window_ms = env_int("PGG2_PRICED_SNAP_STRONG_FOLLOW_WINDOW_MS", 3000)
+        flow = self.event_window_stats(
+            pos.mint,
+            int(pos.opened_ts_ms),
+            min(int(features["ts_ms"]), int(pos.opened_ts_ms) + follow_window_ms),
+        )
+        follow_buy = float(flow.get("buy_sol") or 0.0)
+        follow_uniq = int(flow.get("unique_buyers") or 0)
+        follow_sell = float(flow.get("sell_sol") or 0.0)
+        follow_top = float(flow.get("top_buy_share") or 1.0)
+        sell_ratio = follow_sell / max(follow_buy, 0.001)
+        if not (
+            follow_buy >= env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_MIN_BUY_SOL", 7.5)
+            and follow_uniq >= env_int("PGG2_PRICED_SNAP_STRONG_FOLLOW_MIN_BUYERS", 10)
+            and follow_top <= env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_MAX_TOP", 0.60)
+            and sell_ratio <= env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_MAX_SELL_RATIO700", 0.04)
+            and int(features.get("last_buy_age_ms") or 999999)
+            <= env_int("PGG2_PRICED_SNAP_STRONG_FOLLOW_MAX_LAST_BUY_MS", 350)
+        ):
+            return False
+        self.log_defer_once(
+            pos,
+            "priced_snap_strong_follow_hard_grace",
+            f"PGG2-EXIT-DEFER {short_addr(pos.mint)} reason=priced_snap_strong_follow_hard_grace "
+            f"age={age_sec:.2f}s mult={pos.last_mult:.3f} entry_move={entry_move:.3f} "
+            f"follow={follow_buy:.3f}/{follow_uniq} sell={follow_sell:.3f} "
+            f"top={follow_top:.2f} window_ms={follow_window_ms}",
+        )
+        return True
+
+    def priced_snap_delayed_runway_grace(self, pos: Any, features: dict[str, Any], kill: str, ts_ms: int) -> bool:
+        """Hold the specific priced-snap dip profile that later produces delayed runners."""
+        if not env_bool("PGG2_PRICED_SNAP_DELAYED_RUNWAY_GRACE_ENABLED", True):
+            return False
+        if pos.lane != "priced_snap" or kill != "kill_priced_snap_hard_break":
+            return False
+        age_sec = pos.age_sec(ts_ms)
+        if age_sec >= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_GRACE_SEC", 14.0):
+            return False
+        if pos.last_mult <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_PANIC_MULT", 0.72):
+            return False
+        entry = self.entry_features_for_position(pos)
+        entry_move = float(entry.get("priced_snap_entry_move") or entry.get("wave_base_move") or 0.0)
+        if not (
+            entry_move >= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_ENTRY_MOVE", 1.18)
+            and entry_move <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_ENTRY_MOVE", 1.30)
+        ):
+            return False
+        entry_buy1500 = float(entry.get("buy1500") or 0.0)
+        entry_uniq1500 = int(entry.get("uniq1500") or 0)
+        entry_top1500 = float(entry.get("top_share1500") or 1.0)
+        entry_sell1500 = float(entry.get("sell1500") or 0.0)
+        entry_sell_ratio = entry_sell1500 / max(entry_buy1500, 0.001)
+        if not (
+            entry_buy1500 >= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_BUY1500", 7.5)
+            and entry_uniq1500 >= env_int("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_UNIQ1500", 8)
+            and entry_top1500 <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_TOP1500", 0.30)
+            and entry_sell_ratio <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_ENTRY_SELL_RATIO", 0.01)
+        ):
+            return False
+        window_ms = env_int("PGG2_PRICED_SNAP_DELAYED_RUNWAY_WINDOW_MS", 700)
+        flow = self.event_window_stats(
+            pos.mint,
+            int(pos.opened_ts_ms),
+            int(pos.opened_ts_ms) + window_ms,
+        )
+        follow_buy = float(flow.get("buy_sol") or 0.0)
+        follow_uniq = int(flow.get("unique_buyers") or 0)
+        follow_sell = float(flow.get("sell_sol") or 0.0)
+        follow_top = float(flow.get("top_buy_share") or 1.0)
+        follow_sell_ratio = follow_sell / max(follow_buy, 0.001)
+        if not (
+            follow_buy >= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_FOLLOW_BUY_SOL", 8.0)
+            and follow_uniq >= env_int("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_FOLLOW_BUYERS", 12)
+            and follow_top <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_FOLLOW_TOP", 0.50)
+            and follow_sell_ratio <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_FOLLOW_SELL_RATIO", 0.06)
+        ):
+            return False
+        self.log_defer_once(
+            pos,
+            "priced_snap_delayed_runway_grace",
+            f"PGG2-EXIT-DEFER {short_addr(pos.mint)} reason=priced_snap_delayed_runway_grace "
+            f"age={age_sec:.2f}s mult={pos.last_mult:.3f} entry_move={entry_move:.3f} "
+            f"entry={entry_buy1500:.3f}/{entry_uniq1500} top={entry_top1500:.2f} "
+            f"follow={follow_buy:.3f}/{follow_uniq} sell={follow_sell:.3f} "
+            f"top={follow_top:.2f} window_ms={window_ms}",
+        )
+        return True
+
+    def priced_snap_post_open_loss_cut_reason(self, pos: Any, features: dict[str, Any], ts_ms: int) -> str:
+        """Cut post-entry priced-snap failure modes that validated as loss-only."""
+        if not env_bool("PGG2_PRICED_SNAP_POST_OPEN_LOSS_CUT_ENABLED", True):
+            return ""
+        if pos.lane != "priced_snap":
+            return ""
+        age_sec = pos.age_sec(ts_ms)
+        if age_sec > env_float("PGG2_PRICED_SNAP_POST_OPEN_LOSS_CUT_UNTIL_SEC", 4.0):
+            return ""
+        if pos.peak_mult >= env_float("PGG2_PRICED_SNAP_POST_OPEN_LOSS_CUT_MAX_PEAK", 1.18):
+            return ""
+        window_ms = env_int("PGG2_PRICED_SNAP_POST_OPEN_LOSS_CUT_WINDOW_MS", 700)
+        flow = self.event_window_stats(
+            pos.mint,
+            int(pos.opened_ts_ms),
+            min(int(ts_ms), int(pos.opened_ts_ms) + window_ms),
+        )
+        follow_buy = float(flow.get("buy_sol") or 0.0)
+        follow_sell = float(flow.get("sell_sol") or 0.0)
+        follow_buyers = int(flow.get("unique_buyers") or 0)
+        follow_top = float(flow.get("top_buy_share") or 1.0)
+        sell_ratio = follow_sell / max(follow_buy, 0.001)
+        if (
+            age_sec >= env_float("PGG2_PRICED_SNAP_POST_OPEN_DIST_MIN_AGE_SEC", 0.70)
+            and follow_sell >= env_float("PGG2_PRICED_SNAP_POST_OPEN_DIST_MIN_SELL_SOL", 1.0)
+            and sell_ratio >= env_float("PGG2_PRICED_SNAP_POST_OPEN_DIST_MIN_SELL_RATIO", 0.20)
+        ):
+            self.log_defer_once(
+                pos,
+                "priced_snap_post_open_distribution_cut",
+                f"PGG2-LOSSCUT-EXIT {short_addr(pos.mint)} reason=priced_snap_post_open_distribution "
+                f"age={age_sec:.2f}s mult={pos.last_mult:.3f} peak={pos.peak_mult:.3f} "
+                f"post={follow_buy:.3f}/{follow_buyers} sell={follow_sell:.3f} "
+                f"sellr={sell_ratio:.2f} top={follow_top:.2f}",
+            )
+            return "priced_snap_post_open_distribution"
+        if (
+            age_sec >= env_float("PGG2_PRICED_SNAP_ZERO_FOLLOW_MIN_AGE_SEC", 0.55)
+            and follow_buy <= env_float("PGG2_PRICED_SNAP_ZERO_FOLLOW_MAX_BUY_SOL", 0.20)
+            and follow_sell >= env_float("PGG2_PRICED_SNAP_ZERO_FOLLOW_MIN_SELL_SOL", 0.02)
+            and pos.last_mult <= env_float("PGG2_PRICED_SNAP_ZERO_FOLLOW_MAX_MULT", 0.90)
+        ):
+            self.log_defer_once(
+                pos,
+                "priced_snap_zero_follow_dump_cut",
+                f"PGG2-LOSSCUT-EXIT {short_addr(pos.mint)} reason=priced_snap_zero_follow_dump "
+                f"age={age_sec:.2f}s mult={pos.last_mult:.3f} peak={pos.peak_mult:.3f} "
+                f"post={follow_buy:.3f}/{follow_buyers} sell={follow_sell:.3f} "
+                f"sellr={sell_ratio:.2f} top={follow_top:.2f}",
+            )
+            return "priced_snap_zero_follow_dump"
+        return ""
 
     def same_slot_cluster(self, mint: str, ts_ms: int) -> dict[str, Any]:
         tape = self.tapes.get(mint)
@@ -1561,6 +1785,18 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             + max(0.0, entry_move_from_first - 1.0) * 70.0
             - max(0.0, follow_top - 0.45) * 45.0
         )
+        buy1500 = float(features.get("buy1500") or 0.0)
+        uniq1500 = int(features.get("uniq1500") or 0)
+        losscut_reason = self.live_entry_losscut_reason(buy1500, uniq1500, score)
+        if losscut_reason:
+            if event.mint not in self.live_losscut_logged:
+                self.live_losscut_logged.add(event.mint)
+                log(
+                    f"PGG2-LOSSCUT-SKIP {short_addr(event.mint)} lane=curve_lag_reveal "
+                    f"reason={losscut_reason} b1500={buy1500:.3f}/{uniq1500} "
+                    f"score={score:.1f} live700={live_buy700:.3f}/{live_unique700}"
+                )
+            return None
         reason = (
             f"curve_lag_reveal arm={arm_age_ms}ms first_age={first_price_age_ms}ms "
             f"init={arm.initial_slot_buy_sol:.2f}/{arm.initial_slot_buyers} top={arm.initial_slot_top_share:.2f} "
@@ -1804,6 +2040,38 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             - max(0.0, top1500 - 0.40) * 55.0
             - sell_ratio * 95.0
         )
+        toxic_top = (
+            env_bool("PGG2_PRICED_SNAP_TOXIC_TOP_LOSSCUT_ENABLED", True)
+            and top1500 > env_float("PGG2_PRICED_SNAP_TOXIC_TOP_MAX_TOP1500", 0.365)
+        )
+        thin_delayed_concentration = (
+            env_bool("PGG2_PRICED_SNAP_THIN_DELAYED_CONCENTRATION_SKIP_ENABLED", True)
+            and top1500 > env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MIN_TOP1500", 0.30)
+            and top1500 <= env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MAX_TOP1500", 0.365)
+            and entry_move >= env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MIN_ENTRY_MOVE", 1.18)
+            and entry_move <= env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MAX_ENTRY_MOVE", 1.30)
+            and buy1500 < env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MIN_BUY1500", 8.0)
+        )
+        if toxic_top or thin_delayed_concentration:
+            if event.mint not in self.live_losscut_logged:
+                self.live_losscut_logged.add(event.mint)
+                reason_name = "toxic_top" if toxic_top else "thin_delayed_concentration"
+                log(
+                    f"PGG2-LOSSCUT-SKIP {short_addr(event.mint)} lane=priced_snap "
+                    f"reason={reason_name} b1500={buy1500:.3f}/{uniq1500} "
+                    f"top={top1500:.3f} move={entry_move:.3f}x score={score:.1f}"
+                )
+            return None
+        losscut_reason = self.live_entry_losscut_reason(buy1500, uniq1500, score)
+        if losscut_reason:
+            if event.mint not in self.live_losscut_logged:
+                self.live_losscut_logged.add(event.mint)
+                log(
+                    f"PGG2-LOSSCUT-SKIP {short_addr(event.mint)} lane=priced_snap "
+                    f"reason={losscut_reason} b1500={buy1500:.3f}/{uniq1500} "
+                    f"top={top1500:.2f} score={score:.1f} move={entry_move:.2f}x"
+                )
+            return None
         reason = (
             f"priced_snap move={entry_move:.2f}x age={age_sec:.1f}s "
             f"b1500={buy1500:.2f}/{uniq1500} top={top1500:.2f} "
@@ -3168,6 +3436,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             # Live direct execution can reject or fail an attempted close while
             # the position remains open. Do not emit a fake close decision.
             return
+        killed = bool(killed and pnl < 0)
         self.logger.decision(
             "close",
             mint,
@@ -3211,6 +3480,11 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if quote_loss_clamp and self.moonshot_lane(pos.lane):
             quote_action = quote_loss_clamp(pos, ts_ms)
             if quote_action:
+                if (
+                    quote_action == "quote_loss_clamp"
+                    and self.curve_lag_broad_quote_grace(pos, features, ts_ms)
+                ):
+                    return
                 self.close_position(
                     mint,
                     ts_ms,
@@ -3250,8 +3524,18 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 self.close_position(mint, ts_ms, price, protect_reason, features, killed=False)
                 return
 
+        loss_cut = self.priced_snap_post_open_loss_cut_reason(pos, features, ts_ms)
+        if loss_cut:
+            self.close_position(mint, ts_ms, price, loss_cut, features, killed=True)
+            return
+
         kill = self.piggy_kill_reason(pos, features)
         if kill:
+            if (
+                self.priced_snap_strong_follow_hard_grace(pos, features, kill, ts_ms)
+                or self.priced_snap_delayed_runway_grace(pos, features, kill, ts_ms)
+            ):
+                return
             defer_paper_kill = getattr(self.broker, "defer_paper_kill_reason", None)
             if defer_paper_kill and defer_paper_kill(pos, kill, ts_ms):
                 return

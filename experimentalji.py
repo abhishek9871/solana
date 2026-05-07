@@ -221,6 +221,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if reason not in {
             "quote_profit_bank",
             "quote_loss_clamp",
+            "curve_lag_thin_stall_exit",
             "curve_lag_no_follow",
             "kill_priced_snap_layered_no_follow",
             "priced_snap_exec_quote_loss_clamp",
