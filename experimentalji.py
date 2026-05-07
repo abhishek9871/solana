@@ -2710,15 +2710,31 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             and live_sell_ratio1500 <= env_float("PGG2_EXEC_SPIKE_PROBE_MAX_SELL_RATIO1500", 0.08)
             and features["last_buy_age_ms"] <= env_int("PGG2_EXEC_SPIKE_PROBE_MAX_LAST_BUY_MS", 500)
         )
-        if exec_spike_probe:
+        late_big_buy_probe = (
+            event.mint not in self.raw_exec_spike_seen
+            and env_bool("PGG2_EXEC_SPIKE_LATE_BIG_BUY_ENABLED", True)
+            and age_sec >= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MIN_AGE_SEC", 8.0)
+            and age_sec <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_AGE_SEC", 75.0)
+            and entry_move >= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MIN_ENTRY_MOVE", 2.0)
+            and entry_move <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_ENTRY_MOVE", 3.2)
+            and vsol >= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MIN_VSOL", 55.0)
+            and vsol <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_VSOL", 125.0)
+            and event.sol >= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MIN_CURRENT_BUY_SOL", 0.75)
+            and event.sol <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_CURRENT_BUY_SOL", 2.5)
+            and live_sell_ratio1500 <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_SELL_RATIO1500", 0.08)
+            and features["last_buy_age_ms"] <= env_int("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_LAST_BUY_MS", 500)
+        )
+        if exec_spike_probe or late_big_buy_probe:
             scout = min(
                 self.config.max_position_sol,
                 env_float("PGG2_EXEC_SPIKE_PROBE_SOL", 0.015),
             )
+            variant = "late_big_buy" if late_big_buy_probe and not exec_spike_probe else "standard"
             reason = (
                 f"exec_spike_probe move={entry_move:.2f}x age={age_sec:.2f}s "
                 f"vsol={vsol:.2f} current_buy={event.sol:.3f} "
-                f"live1500={live_b1500:.2f}/{live_u1500} sellr={live_sell_ratio1500:.2f}"
+                f"live1500={live_b1500:.2f}/{live_u1500} sellr={live_sell_ratio1500:.2f} "
+                f"variant={variant}"
             )
             raw_features = self.slim_features(features)
             raw_features.update(
@@ -2732,6 +2748,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                     "raw_sell_ratio_10s": sell_ratio,
                     "raw_entry_move": entry_move,
                     "raw_profile": "exec_spike_probe",
+                    "raw_exec_variant": variant,
                     "entry_size_reason": "exec_spike_probe",
                     "entry_probe_sol": scout,
                 }
@@ -2740,7 +2757,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 f"PGG2-EXEC-SPIKE-PROBE {short_addr(event.mint)} "
                 f"move={entry_move:.2f}x age={age_sec:.2f}s vsol={vsol:.2f} "
                 f"buy={event.sol:.3f} b1500={live_b1500:.2f}/{live_u1500} "
-                f"sellr={live_sell_ratio1500:.2f}"
+                f"sellr={live_sell_ratio1500:.2f} variant={variant}"
             )
             return StrikePlan(
                 mint=event.mint,

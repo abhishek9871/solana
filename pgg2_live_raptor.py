@@ -606,6 +606,64 @@ class RaptorLiveBroker(PaperBroker):
         feats = features or {}
         return str(feats.get("raw_profile") or "") == "exec_spike_probe"
 
+    def raw_momentum_one_green_runner_profile(
+        self,
+        features: Optional[dict[str, Any]],
+        executable_pnl: float,
+        attempt: int,
+    ) -> bool:
+        """Rare raw runners where one strong executable-green tick is enough.
+
+        The 2026-05-07 dry-live tape exposed C9Zi: raw 4x+ runner, move 2.59x,
+        vSOL 76, and a +0.0024 SOL executable-green tick, but it was rejected
+        because the next quote did not stay green. Keep the two-green rule for
+        ordinary probes, but do not throw away this high-conviction profile.
+        """
+        feats = features or {}
+        if str(feats.get("raw_profile") or "") != "exec_spike_probe":
+            return False
+        entry_move = float(feats.get("raw_entry_move") or feats.get("wave_base_move") or feats.get("move1500") or 1.0)
+        vsol = float(feats.get("vsol_sol") or 0.0)
+        sell1500 = float(feats.get("sell1500") or 0.0)
+        return (
+            env_bool("PGG2_LIVE_RAW_EXEC_SPIKE_ONE_GREEN_RUNNER_ENABLED", True)
+            and attempt <= env_int("PGG2_LIVE_RAW_EXEC_SPIKE_ONE_GREEN_MAX_ATTEMPT", 6)
+            and executable_pnl >= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_ONE_GREEN_MIN_PNL_SOL", 0.00150)
+            and entry_move >= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_ONE_GREEN_MIN_ENTRY_MOVE", 2.30)
+            and entry_move <= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_ONE_GREEN_MAX_ENTRY_MOVE", 3.50)
+            and vsol >= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_ONE_GREEN_MIN_VSOL", 65.0)
+            and sell1500 <= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_ONE_GREEN_MAX_SELL1500", 0.001)
+        )
+
+    def raw_momentum_tiny_red_runner_profile(
+        self,
+        features: Optional[dict[str, Any]],
+        executable_pnl: float,
+    ) -> bool:
+        """Exec-spike runners where a tiny red quote is acceptable.
+
+        The direct dry-live tapes exposed a narrow blind spot: high-vSOL raw
+        runners that later print multi-x moves often begin with only fixed-fee
+        drag on the executable quote. This is not a broad relaxation; it only
+        applies to no-sell exec-spikes that are already strongly repriced, and
+        the final commit quote must still remain inside the tiny-red cap.
+        """
+        feats = features or {}
+        if str(feats.get("raw_profile") or "") != "exec_spike_probe":
+            return False
+        entry_move = float(feats.get("raw_entry_move") or feats.get("wave_base_move") or feats.get("move1500") or 1.0)
+        vsol = float(feats.get("vsol_sol") or 0.0)
+        sell1500 = float(feats.get("sell1500") or 0.0)
+        min_pnl = env_float("PGG2_LIVE_RAW_EXEC_SPIKE_TINY_RED_MIN_PNL_SOL", -0.00110)
+        return (
+            env_bool("PGG2_LIVE_RAW_EXEC_SPIKE_TINY_RED_RUNNER_ENABLED", True)
+            and executable_pnl >= min_pnl
+            and entry_move >= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_TINY_RED_MIN_ENTRY_MOVE", 2.30)
+            and entry_move <= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_TINY_RED_MAX_ENTRY_MOVE", 3.10)
+            and vsol >= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_TINY_RED_MIN_VSOL", 60.0)
+            and sell1500 <= env_float("PGG2_LIVE_RAW_EXEC_SPIKE_TINY_RED_MAX_SELL1500", 0.001)
+        )
+
     def max_executable_loss_for_lane(
         self,
         lane: str,
@@ -1073,12 +1131,18 @@ class RaptorLiveBroker(PaperBroker):
             return original_quote, original_impact, original_roundtrip_loss
         lanes = {
             lane.strip()
-            for lane in env_str("PGG2_LIVE_ENTRY_STABILITY_CONFIRM_LANES", "priced_snap,raw_momentum").split(",")
+            for lane in env_str("PGG2_LIVE_ENTRY_STABILITY_CONFIRM_LANES", "priced_snap").split(",")
             if lane.strip()
         }
         if plan.lane not in lanes:
             return original_quote, original_impact, original_roundtrip_loss
         delay_ms = env_int("PGG2_LIVE_ENTRY_STABILITY_DELAY_MS", 450)
+        if plan.lane == "raw_momentum":
+            delay_ms = env_int("PGG2_LIVE_ENTRY_STABILITY_RAW_MOMENTUM_DELAY_MS", 0)
+        elif plan.lane == "priced_snap":
+            delay_ms = env_int("PGG2_LIVE_ENTRY_STABILITY_PRICED_SNAP_DELAY_MS", delay_ms)
+        elif plan.lane == "curve_lag_reveal":
+            delay_ms = env_int("PGG2_LIVE_ENTRY_STABILITY_CURVE_LAG_DELAY_MS", delay_ms)
         if delay_ms > 0:
             time.sleep(delay_ms / 1000.0)
         try:
@@ -1118,6 +1182,13 @@ class RaptorLiveBroker(PaperBroker):
                     and self.raw_momentum_exec_spike_candidate(plan.features)
                     and env_bool("PGG2_LIVE_RAW_EXEC_SPIKE_GREEN_CHASE_ENABLED", True)
                 ):
+                    if self.raw_momentum_tiny_red_runner_profile(plan.features, executable_pnl):
+                        log(
+                            f"PGG2-LIVE-RAW-TINY-RED-RUNNER-OK {short_addr(plan.mint)} "
+                            f"quote_out={immediate_out:.6f} pnl={executable_pnl:+.6f} "
+                            f"roundtrip_loss={roundtrip_loss:.6f}"
+                        )
+                        return quote, impact, roundtrip_loss
                     chased = self.chase_raw_exec_spike_until_green(plan, amount, min_pnl, allowed_loss)
                     if chased is not None:
                         return chased
@@ -1193,6 +1264,16 @@ class RaptorLiveBroker(PaperBroker):
                 )
                 if executable_pnl >= min_pnl and roundtrip_loss <= allowed_loss:
                     green_streak += 1
+                    if (
+                        green_streak == 1
+                        and required_greens > 1
+                        and self.raw_momentum_one_green_runner_profile(plan.features, executable_pnl, attempts)
+                    ):
+                        log(
+                            f"PGG2-LIVE-RAW-GREEN-CHASE-ONE-GREEN-RUNNER-OK {short_addr(plan.mint)} "
+                            f"attempt={attempts} quote_out={immediate_out:.6f} pnl={executable_pnl:+.6f}"
+                        )
+                        return quote, impact, roundtrip_loss
                     if green_streak < required_greens:
                         log(
                             f"PGG2-LIVE-RAW-GREEN-CHASE-CONFIRM {short_addr(plan.mint)} "
@@ -1897,9 +1978,11 @@ class RaptorLiveBroker(PaperBroker):
                 return None
             amount, impact, quote, roundtrip_loss = candidate
             quote_tokens = self.rate_amount_out(quote)
+            final_out = 0.0
             if env_bool("PGG2_LIVE_FINAL_ENTRY_GUARD_ENABLED", True) and quote_tokens > 0:
                 reverse = self.build_swap(plan.mint, SOL_MINT, round(quote_tokens, 9), self.sell_slippage)
                 immediate_out = self.rate_amount_out(reverse)
+                final_out = immediate_out
                 overhead = self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0
                 immediate_pnl = immediate_out - overhead - amount
                 max_loss = self.max_executable_loss_for_lane(plan.lane, amount, plan.features, plan.reason)
@@ -1910,6 +1993,50 @@ class RaptorLiveBroker(PaperBroker):
                         f"pnl={immediate_pnl:+.6f} max_loss={max_loss:.6f}"
                     )
                     return None
+            commit_lanes = {
+                lane.strip()
+                for lane in env_str(
+                    "PGG2_LIVE_FINAL_ENTRY_COMMIT_CONFIRM_LANES",
+                    "raw_momentum,priced_snap,curve_lag_reveal",
+                ).split(",")
+                if lane.strip()
+            }
+            if (
+                env_bool("PGG2_LIVE_FINAL_ENTRY_COMMIT_CONFIRM_ENABLED", True)
+                and plan.lane in commit_lanes
+                and quote_tokens > 0
+            ):
+                delay_ms = env_int("PGG2_LIVE_FINAL_ENTRY_COMMIT_CONFIRM_DELAY_MS", 0)
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+                reverse = self.build_swap(plan.mint, SOL_MINT, round(quote_tokens, 9), self.sell_slippage)
+                commit_out = self.rate_amount_out(reverse)
+                overhead = self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0
+                commit_pnl = commit_out - overhead - amount
+                min_commit_pnl = env_float("PGG2_LIVE_FINAL_ENTRY_COMMIT_MIN_PNL_SOL", 0.00010)
+                if plan.lane == "priced_snap":
+                    min_commit_pnl = env_float("PGG2_LIVE_FINAL_ENTRY_COMMIT_PRICED_SNAP_MIN_PNL_SOL", 0.00050)
+                elif plan.lane == "curve_lag_reveal":
+                    min_commit_pnl = env_float("PGG2_LIVE_FINAL_ENTRY_COMMIT_CURVE_LAG_MIN_PNL_SOL", 0.00075)
+                elif plan.lane == "raw_momentum":
+                    min_commit_pnl = env_float("PGG2_LIVE_FINAL_ENTRY_COMMIT_RAW_MOMENTUM_MIN_PNL_SOL", 0.00010)
+                    if self.raw_momentum_tiny_red_runner_profile(plan.features, commit_pnl):
+                        min_commit_pnl = env_float("PGG2_LIVE_FINAL_ENTRY_COMMIT_RAW_TINY_RED_MIN_PNL_SOL", -0.00060)
+                min_retention = env_float("PGG2_LIVE_FINAL_ENTRY_COMMIT_MIN_RETENTION", 0.82)
+                retention_ok = final_out <= 0 or commit_out >= final_out * min_retention
+                if commit_pnl < min_commit_pnl or not retention_ok:
+                    log(
+                        f"PGG2-LIVE-FINAL-COMMIT-BLOCK {short_addr(plan.mint)} lane={plan.lane} "
+                        f"amount={amount:.6f} quote_out={commit_out:.6f} "
+                        f"pnl={commit_pnl:+.6f} min_pnl={min_commit_pnl:+.6f} "
+                        f"prev_out={final_out:.6f} retention={min_retention:.2f}"
+                    )
+                    return None
+                log(
+                    f"PGG2-LIVE-FINAL-COMMIT-OK {short_addr(plan.mint)} lane={plan.lane} "
+                    f"quote_out={commit_out:.6f} pnl={commit_pnl:+.6f} "
+                    f"prev_out={final_out:.6f}"
+                )
             if amount < requested or plan.lane == "birth_fanout":
                 target_sol = amount
             if self.quote_only:
