@@ -691,12 +691,16 @@ class PaperBroker:
         self.dry_live_close_account_fee_sol = env_float("PGG2_DRY_LIVE_CLOSE_ACCOUNT_FEE_SOL", 0.000005)
         default_platform_bps = 0.0 if self.dry_live_direct_execution else 50.0
         self.dry_live_platform_fee_bps = env_float("PGG2_DRY_LIVE_PLATFORM_FEE_BPS", default_platform_bps)
+        self.dry_live_protocol_fee_bps = env_float("PGG2_DRY_LIVE_PROTOCOL_FEE_BPS", 0.0)
+        self.dry_live_protocol_fee_label = env_str("PGG2_DRY_LIVE_PROTOCOL_FEE_LABEL", "none")
         self.dry_live_extra_fee_bps = env_float("PGG2_DRY_LIVE_EXTRA_FEE_BPS", 0.0)
         if self.dry_live_enabled:
             log(
                 "DRY-LIVE-COST: "
                 f"drag_bps={self.config.paper_drag_bps:.1f} direct={int(self.dry_live_direct_execution)} "
-                f"platform_bps={self.dry_live_platform_fee_bps:.1f} extra_bps={self.dry_live_extra_fee_bps:.1f} "
+                f"platform_bps={self.dry_live_platform_fee_bps:.1f} "
+                f"protocol_bps={self.dry_live_protocol_fee_bps:.1f} protocol={self.dry_live_protocol_fee_label} "
+                f"extra_bps={self.dry_live_extra_fee_bps:.1f} "
                 f"tx_fee={self.dry_live_tx_fee_sol():.9f} ata_rent={self.dry_live_ata_rent_sol:.9f} "
                 f"recover_ata={int(self.dry_live_recover_ata_rent)}"
             )
@@ -712,7 +716,12 @@ class PaperBroker:
     def dry_live_percent_fee(self, amount_sol: float) -> float:
         if not self.dry_live_enabled:
             return 0.0
-        bps = max(0.0, self.dry_live_platform_fee_bps + self.dry_live_extra_fee_bps)
+        bps = max(
+            0.0,
+            self.dry_live_platform_fee_bps
+            + self.dry_live_protocol_fee_bps
+            + self.dry_live_extra_fee_bps,
+        )
         return max(0.0, amount_sol) * bps / 10000.0
 
     def dry_live_buy_costs(self, amount_sol: float) -> tuple[float, float]:

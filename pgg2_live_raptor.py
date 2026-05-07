@@ -133,7 +133,14 @@ class RaptorLiveBroker(PaperBroker):
             raise RuntimeError(f"failed to load keypair {path}: {type(exc).__name__}") from exc
 
     def headers(self) -> dict[str, str]:
-        headers = {"accept": "application/json"}
+        headers = {
+            "accept": "application/json",
+            "user-agent": env_str(
+                "PGG2_HTTP_USER_AGENT",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            ),
+        }
         if self.api_key:
             headers["x-api-key"] = self.api_key
             headers["authorization"] = f"Bearer {self.api_key}"
@@ -156,18 +163,31 @@ class RaptorLiveBroker(PaperBroker):
         if body is not None:
             data = json.dumps(body, separators=(",", ":")).encode("utf-8")
             merged_headers.setdefault("content-type", "application/json")
-        req = Request(url, data=data, headers=merged_headers, method=method.upper())
-        try:
-            with urlopen(req, timeout=self.timeout_sec) as resp:
-                raw = resp.read().decode("utf-8")
-        except HTTPError as exc:
-            body_text = exc.read().decode("utf-8", "replace")[:500]
-            raise RuntimeError(f"http {exc.code} {exc.reason}: {body_text}") from exc
-        return json.loads(raw) if raw else {}
+        retries = max(0, env_int("PGG2_LIVE_HTTP_RETRIES", 2))
+        base_sleep = max(0.0, env_float("PGG2_LIVE_HTTP_RETRY_BASE_SEC", 0.25))
+        last_exc: Optional[HTTPError] = None
+        for attempt in range(retries + 1):
+            req = Request(url, data=data, headers=merged_headers, method=method.upper())
+            try:
+                with urlopen(req, timeout=self.timeout_sec) as resp:
+                    raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+            except HTTPError as exc:
+                last_exc = exc
+                if exc.code not in {429, 500, 502, 503, 504} or attempt >= retries:
+                    body_text = exc.read().decode("utf-8", "replace")[:500]
+                    raise RuntimeError(f"http {exc.code} {exc.reason}: {body_text}") from exc
+                time.sleep(base_sleep * (2 ** attempt))
+        if last_exc:
+            body_text = last_exc.read().decode("utf-8", "replace")[:500]
+            raise RuntimeError(f"http {last_exc.code} {last_exc.reason}: {body_text}") from last_exc
+        return {}
 
     def rpc(self, method: str, params: list[Any]) -> Any:
         payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params}
-        out = self.request_json("POST", self.rpc_url, body=payload, headers={"content-type": "application/json"})
+        headers = self.headers()
+        headers["content-type"] = "application/json"
+        out = self.request_json("POST", self.rpc_url, body=payload, headers=headers)
         if "error" in out:
             raise RuntimeError(f"rpc {method} error: {out['error']}")
         return out.get("result")
@@ -878,7 +898,7 @@ class RaptorLiveBroker(PaperBroker):
             signed_b64,
             {
                 "encoding": "base64",
-                "skipPreflight": False,
+                "skipPreflight": env_bool("PGG2_LIVE_SKIP_PREFLIGHT", False),
                 "preflightCommitment": "confirmed",
                 "maxRetries": env_int("PGG2_LIVE_MAX_RETRIES", 3),
             },
@@ -1602,7 +1622,8 @@ class RaptorLiveBroker(PaperBroker):
                     else:
                         self.stats.losses += 1
                         self.consecutive_losses += 1
-                    self.stats.best_mult = max(self.stats.best_mult, pos.peak_mult)
+                    exec_mult = proceeds / max(pos.cost_sol, 1e-18)
+                    self.stats.best_mult = max(self.stats.best_mult, pos.peak_mult, exec_mult)
                     if self.allow_fast_reentry_after_close(pos, reason, pnl):
                         log(
                             f"PGG2-LIVE-FAST-REENTRY-UNLOCK {short_addr(mint)} "
@@ -1613,7 +1634,7 @@ class RaptorLiveBroker(PaperBroker):
                     log(
                         f"PGG2-QUOTE-SHADOW-SELL {short_addr(mint)} reason={reason} "
                         f"quote_out={expected_out:.6f} overhead={overhead:.6f} "
-                        f"proceeds={proceeds:.6f} pnl={pnl:+.6f} "
+                        f"proceeds={proceeds:.6f} mult={exec_mult:.3f} pnl={pnl:+.6f} "
                         f"session={self.stats.realized_pnl_sol:+.6f}"
                     )
                     self.save_state()
@@ -1640,7 +1661,8 @@ class RaptorLiveBroker(PaperBroker):
             else:
                 self.stats.losses += 1
                 self.consecutive_losses += 1
-            self.stats.best_mult = max(self.stats.best_mult, pos.peak_mult)
+            exec_mult = proceeds / max(pos.cost_sol, 1e-18)
+            self.stats.best_mult = max(self.stats.best_mult, pos.peak_mult, exec_mult)
             if self.allow_fast_reentry_after_close(pos, reason, pnl):
                 log(
                     f"PGG2-LIVE-FAST-REENTRY-UNLOCK {short_addr(mint)} "
@@ -1651,7 +1673,7 @@ class RaptorLiveBroker(PaperBroker):
             log(
                 f"PGG2-LIVE-SELL {short_addr(mint)} reason={reason} sig={sig} "
                 f"proceeds={proceeds:.6f} wallet_delta={wallet_delta:+.6f} "
-                f"pnl={pnl:+.6f} session={self.stats.realized_pnl_sol:+.6f}"
+                f"mult={exec_mult:.3f} pnl={pnl:+.6f} session={self.stats.realized_pnl_sol:+.6f}"
             )
             self.save_state()
             return pnl

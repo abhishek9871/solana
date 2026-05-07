@@ -99,9 +99,15 @@ class SameBlockPiggybackBot(BirthFirstSniper):
     def __init__(self, config: BaseConfig) -> None:
         super().__init__(config)
         if not config.paper_trading:
-            from pgg2_live_raptor import RaptorLiveBroker
+            live_broker = env_str("PGG2_LIVE_BROKER", "raptor").lower()
+            if live_broker in {"direct", "direct_pump", "pump"}:
+                from pgg2_direct_pump import DirectPumpQuoteBroker
 
-            self.broker = RaptorLiveBroker(config)
+                self.broker = DirectPumpQuoteBroker(config)
+            else:
+                from pgg2_live_raptor import RaptorLiveBroker
+
+                self.broker = RaptorLiveBroker(config)
         self.wave_arms: dict[str, WaveArm] = {}
         self.position_follow: dict[str, dict[str, Any]] = {}
         self.profitable_closes: dict[str, dict[str, float]] = {}
@@ -283,9 +289,19 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if follow is None:
             follow = self.init_position_follow(pos, trusted=event.ts_ms <= pos.opened_ts_ms)
         grace_ms = env_int("PIGGY_FOLLOW_GRACE_MS", 1000)
+        if (
+            env_bool("PGG2_LAYERED_RISK_ENABLED", False)
+            and pos.lane in {"priced_snap", "birth_fanout"}
+        ):
+            grace_ms = env_int("PGG2_LAYERED_FOLLOW_GRACE_MS", 0)
         if event.ts_ms < int(follow["opened_ts_ms"]) + grace_ms:
             return
         min_sig_sol = env_float("PIGGY_FOLLOW_SIG_BUY_SOL", 0.08)
+        if (
+            env_bool("PGG2_LAYERED_RISK_ENABLED", False)
+            and pos.lane in {"priced_snap", "birth_fanout"}
+        ):
+            min_sig_sol = env_float("PGG2_LAYERED_FOLLOW_MIN_BUY_SOL", 0.08)
         if event.sol < min_sig_sol:
             return
         follow["sig_buy_sol"] = float(follow["sig_buy_sol"]) + event.sol
@@ -1088,7 +1104,11 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             )
             if not full_follow_ok:
                 scout = min(scout, env_float("PGG2_BIRTH_FANOUT_FOLLOW_WEAK_SOL", 0.020))
-        scout = min(self.config.max_position_sol, max(0.0005, scout))
+        full_scout = min(self.config.max_position_sol, max(0.0005, scout))
+        scout = full_scout
+        target = full_scout
+        if env_bool("PGG2_LAYERED_RISK_ENABLED", False):
+            scout = max(0.0005, full_scout * env_float("PGG2_LAYERED_ENTRY_FRACTION", 0.80))
         score = (
             120.0
             + min(60.0, float(ctx.get("birth1500_buy_sol") or ctx["post1500_buy_sol"]) * 5.0)
@@ -1114,7 +1134,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             reason=reason,
             score=score,
             scout_sol=scout,
-            target_sol=scout,
+            target_sol=target,
             price=price,
             needs_curve_fill=False,
             features=self.slim_features(features),
@@ -1748,7 +1768,34 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if min_vsol > 0 and vsol < min_vsol:
             return None
 
-        scout = min(self.config.max_position_sol, env_float("PGG2_PRICED_SNAP_SOL", self.config.scout_sol))
+        full_scout = min(self.config.max_position_sol, env_float("PGG2_PRICED_SNAP_SOL", self.config.scout_sol))
+        scout = full_scout
+        target = full_scout
+        slot_buy_sol = float(features.get("slot_buy_sol") or 0.0)
+        slot_buyers = int(features.get("slot_buyers") or 0)
+        slot_top_share = float(features.get("slot_top_share") or 1.0)
+        vertical_snap = (
+            slot_buy_sol >= env_float("PGG2_PRICED_SNAP_VERTICAL_MIN_SLOT_BUY_SOL", 5.0)
+            and slot_buyers >= env_int("PGG2_PRICED_SNAP_VERTICAL_MIN_SLOT_BUYERS", 4)
+            and float(features.get("move700") or 0.0) >= env_float("PGG2_PRICED_SNAP_VERTICAL_MIN_MOVE700", 1.0)
+            and slot_top_share <= env_float("PGG2_PRICED_SNAP_VERTICAL_MAX_SLOT_TOP", 0.58)
+        )
+        elite_snap = (
+            buy1500 >= env_float("PGG2_PRICED_SNAP_ELITE_MIN_BUY1500", 999999.0)
+            and uniq1500 >= env_int("PGG2_PRICED_SNAP_ELITE_MIN_UNIQ1500", 999999)
+            and top1500 <= env_float("PGG2_PRICED_SNAP_ELITE_MAX_TOP1500", 0.0)
+            and age_sec <= env_float("PGG2_PRICED_SNAP_ELITE_MAX_AGE_SEC", 0.0)
+            and slot_top_share <= env_float("PGG2_PRICED_SNAP_ELITE_MAX_SLOT_TOP", 1.0)
+        )
+        if env_bool("PGG2_LAYERED_RISK_ENABLED", False):
+            entry_fraction = env_float("PGG2_LAYERED_ENTRY_FRACTION", 0.80)
+            if vertical_snap:
+                entry_fraction = env_float("PGG2_PRICED_SNAP_VERTICAL_ENTRY_FRACTION", 0.30)
+            if elite_snap:
+                entry_fraction = env_float("PGG2_PRICED_SNAP_ELITE_ENTRY_FRACTION", entry_fraction)
+            else:
+                entry_fraction = env_float("PGG2_PRICED_SNAP_STANDARD_ENTRY_FRACTION", entry_fraction)
+            scout = max(0.0005, full_scout * entry_fraction)
         score = (
             150.0
             + min(55.0, buy1500 * 5.5)
@@ -1772,6 +1819,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 "priced_snap_entry_move": entry_move,
                 "priced_snap_age_sec": age_sec,
                 "priced_snap_sell_ratio1500": sell_ratio,
+                "priced_snap_vertical": vertical_snap,
+                "priced_snap_elite": elite_snap,
             }
         )
         return StrikePlan(
@@ -1781,7 +1830,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             reason=reason,
             score=score,
             scout_sol=scout,
-            target_sol=scout,
+            target_sol=target,
             price=price,
             needs_curve_fill=False,
             features=snap_features,
@@ -3114,7 +3163,16 @@ class SameBlockPiggybackBot(BirthFirstSniper):
 
     def close_position(self, mint: str, ts_ms: int, price: float, reason: str, features: dict[str, Any], killed: bool) -> None:
         before_pnl = self.broker.stats.realized_pnl_sol
-        super().close_position(mint, ts_ms, price, reason, features, killed)
+        pnl = self.broker.close(mint, ts_ms, price, reason, killed)
+        if pnl is None:
+            # Live direct execution can reject or fail an attempted close while
+            # the position remains open. Do not emit a fake close decision.
+            return
+        self.logger.decision(
+            "close",
+            mint,
+            {"reason": reason, "pnl_sol": pnl, "killed": killed, "features": self.slim_features(features)},
+        )
         if mint in self.broker.positions:
             # Live/quote mode can reject a paper sell signal when the executable
             # Raptor quote is not good enough yet. Keep the follow state intact
@@ -3168,6 +3226,28 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             quote_exit = quote_profit_bank(pos, ts_ms)
             if quote_exit:
                 self.close_position(mint, ts_ms, price, quote_exit, features, killed=False)
+                return
+
+        if (
+            pos.lane == "priced_snap"
+            and pos.state in {"SCOUT", "SCALE1"}
+        ):
+            if pos.state == "SCALE1":
+                protect_peak = env_float("PGG2_PRICED_SNAP_SCALE_PROTECT_PEAK", 1.25)
+                protect_min_mult = env_float("PGG2_PRICED_SNAP_SCALE_PROTECT_MIN_MULT", 1.10)
+                protect_trail = env_float("PGG2_PRICED_SNAP_SCALE_PROTECT_TRAIL", 0.90)
+                protect_reason = "priced_snap_scale_profit_protect"
+            else:
+                protect_peak = env_float("PGG2_PRICED_SNAP_SCOUT_PROTECT_PEAK", 1.18)
+                protect_min_mult = env_float("PGG2_PRICED_SNAP_SCOUT_PROTECT_MIN_MULT", 1.08)
+                protect_trail = env_float("PGG2_PRICED_SNAP_SCOUT_PROTECT_TRAIL", 0.92)
+                protect_reason = "priced_snap_scout_profit_protect"
+            if (
+                pos.peak_mult >= protect_peak
+                and mult >= protect_min_mult
+                and mult <= pos.peak_mult * protect_trail
+            ):
+                self.close_position(mint, ts_ms, price, protect_reason, features, killed=False)
                 return
 
         kill = self.piggy_kill_reason(pos, features)
@@ -3418,6 +3498,25 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 # needs room for shallow dump-then-pump recoveries, but should
                 # not wait for the generic 0.88 rug stop on failed snaps.
                 return "kill_priced_snap_hard_break"
+            if env_bool("PGG2_LAYERED_RISK_ENABLED", False):
+                if (
+                    pos.lane == "priced_snap"
+                    and age_sec >= env_float("PGG2_PRICED_SNAP_LAYERED_FAIL_AFTER_SEC", 4.0)
+                    and pos.peak_mult <= env_float("PGG2_PRICED_SNAP_LAYERED_FAIL_MAX_PEAK", 1.12)
+                    and pos.last_mult <= env_float("PGG2_PRICED_SNAP_LAYERED_FAIL_MAX_MULT", 0.99)
+                    and features.get("last_post_open_sig_buy_age_ms", 999999)
+                    >= env_int("PGG2_PRICED_SNAP_LAYERED_FAIL_MIN_LAST_BUY_MS", 400)
+                ):
+                    return "kill_priced_snap_layered_no_follow"
+                if (
+                    pos.lane == "birth_fanout"
+                    and age_sec >= env_float("PGG2_BIRTH_FANOUT_LAYERED_FAIL_AFTER_SEC", 0.75)
+                    and pos.peak_mult <= env_float("PGG2_BIRTH_FANOUT_LAYERED_FAIL_MAX_PEAK", 1.03)
+                    and pos.last_mult <= env_float("PGG2_BIRTH_FANOUT_LAYERED_FAIL_MAX_MULT", 1.05)
+                    and features.get("last_post_open_sig_buy_age_ms", 999999)
+                    >= env_int("PGG2_BIRTH_FANOUT_LAYERED_FAIL_MIN_LAST_BUY_MS", 400)
+                ):
+                    return "kill_birth_fanout_layered_no_follow"
             if pos.lane == "priced_breakout" and pos.last_mult <= env_float("PGG2_PRICED_BREAKOUT_HARD_BREAK_MULT", 0.94):
                 return "kill_priced_breakout_hard_break"
             if pos.lane == "birth_fanout":
@@ -3523,6 +3622,18 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return None
         s250 = features["s250"]
         s700 = features["s700"]
+        if (
+            env_bool("PGG2_LAYERED_RISK_ENABLED", False)
+            and pos.lane in {"priced_snap", "birth_fanout"}
+            and pos.target_sol > 0
+            and pos.cost_sol < pos.target_sol * env_float("PGG2_LAYERED_SCALE_MIN_REMAINING_RATIO", 0.995)
+            and pos.age_sec(features["ts_ms"]) <= env_float("PGG2_LAYERED_SCALE_MAX_AGE_SEC", 8.0)
+            and pos.peak_mult >= env_float("PGG2_LAYERED_SCALE_MIN_PEAK", 1.0)
+            and pos.last_mult >= env_float("PGG2_LAYERED_SCALE_MIN_MULT", 1.0)
+            and features.get("post_open_sig_buy_sol", 0.0) >= env_float("PGG2_LAYERED_SCALE_MIN_POST_BUY_SOL", 0.25)
+            and features.get("post_open_sig_buy_count", 0) >= env_int("PGG2_LAYERED_SCALE_MIN_POST_BUY_COUNT", 2)
+        ):
+            return "layered_post_entry_follow_confirm"
         entry_features = (self.position_follow.get(pos.mint) or {}).get("entry_features") or {}
         if entry_features and SameBlockPiggybackBot.moonshot_lane(pos.lane):
             # PGG2 precision guard: do not convert a scout into a full-size
