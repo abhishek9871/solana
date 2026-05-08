@@ -580,6 +580,8 @@ class Position:
     moonshot_mode: bool = False
     moonshot_arm_ts: int = 0
     moonshot_arm_peak: float = 0.0
+    scale_out_step: int = 0
+    peak_advance_ts: int = 0
 
     def age_sec(self, ts_ms: int) -> float:
         return max(0.0, (ts_ms - self.opened_ts_ms) / 1000.0)
@@ -1157,6 +1159,53 @@ class BirthFirstSniper:
         ts = now_ms()
         self.last_shred_msg_ms = ts
         self.last_curve_msg_ms = ts
+        # Phase 11 2026-05-08: smart-wallet WS tracker. Subscribes to PumpPortal
+        # subscribeAccountTrade for known alpha wallets. Provides the missing
+        # coordinated-buy signal — when 1+ smart wallet buys a mint we're
+        # evaluating, that's a strong moonshot pre-confirmation per Marino paper.
+        self.smart_wallet_tracker = None
+        if env_bool("SMART_WALLET_WS_ENABLED", True):
+            try:
+                from pumpportal_smart_wallet import SmartWalletTracker
+                self.smart_wallet_tracker = SmartWalletTracker(
+                    log_fn=log,
+                    window_sec=env_float("SMART_WALLET_WINDOW_SEC", 30.0),
+                )
+                log(f"PHASE11: SmartWalletTracker initialized with {len(self.smart_wallet_tracker.wallets)} wallets")
+            except Exception as exc:
+                log(f"PHASE11: smart-wallet tracker init failed {type(exc).__name__}: {exc}")
+                self.smart_wallet_tracker = None
+        # Phase 15 2026-05-08: signal-scraping layer.
+        # (A) RugCheck pre-buy gate: rejects rug-pattern tokens before strike.
+        # (B) Pump.fun engagement poller: livestream viewers + reply count
+        #     signals retail bots can't compute from raw on-chain data.
+        self.rugcheck_client = None
+        if env_bool("RUGCHECK_ENABLED", True):
+            try:
+                from rugcheck_client import RugCheckClient
+                self.rugcheck_client = RugCheckClient(
+                    log_fn=log,
+                    reject_score=env_int("RUGCHECK_REJECT_SCORE", 4),
+                    timeout_sec=env_float("RUGCHECK_TIMEOUT_SEC", 0.45),
+                    cache_ttl_sec=env_float("RUGCHECK_CACHE_TTL_SEC", 300.0),
+                )
+                log(f"PHASE15A: RugCheckClient initialized reject_score={self.rugcheck_client.reject_score}")
+            except Exception as exc:
+                log(f"PHASE15A: RugCheck init failed {type(exc).__name__}: {exc}")
+                self.rugcheck_client = None
+        self.engagement_poller = None
+        if env_bool("ENGAGEMENT_POLL_ENABLED", True):
+            try:
+                from pumpfun_engagement import PumpfunEngagementPoller
+                self.engagement_poller = PumpfunEngagementPoller(
+                    log_fn=log,
+                    poll_sec=env_float("ENGAGEMENT_POLL_SEC", 4.0),
+                    limit=env_int("ENGAGEMENT_POLL_LIMIT", 50),
+                )
+                log(f"PHASE15B: EngagementPoller initialized poll={self.engagement_poller.poll_sec}s")
+            except Exception as exc:
+                log(f"PHASE15B: engagement poller init failed {type(exc).__name__}: {exc}")
+                self.engagement_poller = None
 
     @staticmethod
     def load_tracked(path: Path) -> set[str]:
@@ -1866,6 +1915,19 @@ class BirthFirstSniper:
             asyncio.create_task(self.heartbeat_loop()),
             asyncio.create_task(self.combined_stream_loop()),
         ]
+        if self.smart_wallet_tracker is not None:
+            tasks.append(asyncio.create_task(self.smart_wallet_tracker.run()))
+            tasks.append(asyncio.create_task(self.smart_wallet_tracker.prune()))
+        if self.engagement_poller is not None:
+            tasks.append(asyncio.create_task(self.engagement_poller.run()))
+        # Phase 20C 2026-05-08: register optional subclass loops by name probe.
+        # Lets PGG2.py add poll-driven strike + management loops without
+        # needing to override run() (which would duplicate this whole block).
+        for fn_name in ("engagement_poll_strike_loop", "engagement_manage_loop"):
+            fn = getattr(self, fn_name, None)
+            if fn is not None and asyncio.iscoroutinefunction(fn):
+                tasks.append(asyncio.create_task(fn()))
+                log(f"PHASE20C: registered subclass loop {fn_name}")
         deadline = time.time() + self.config.run_seconds if self.config.run_seconds > 0 else None
         try:
             while not self.stop_event.is_set():

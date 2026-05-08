@@ -1553,8 +1553,98 @@ class RaptorLiveBroker(PaperBroker):
         return None
 
     def partial(self, mint: str, fraction: float, price: float, reason: str) -> Optional[Position]:
-        log(f"PGG2-LIVE-PARTIAL-BLOCKED {short_addr(mint)} fraction={fraction:.2f} reason={reason}")
-        return None
+        """Phase 18 2026-05-08: REAL partial sell. Was blocked, breaking scale-out
+        in live and dry-live modes. Now sells `fraction` of remaining tokens via
+        the same quote/build path as close, decrements remaining_tokens, banks
+        proceeds. Position stays open with smaller stake."""
+        pos = self.positions.get(mint)
+        if not pos:
+            return None
+        if price > 0:
+            pos.update(price)
+        # Clamp fraction to (0, 0.99) — full liquidation should use close()
+        fraction = max(0.0, min(0.99, fraction))
+        if fraction <= 0:
+            return None
+        if pos.remaining_tokens <= 0:
+            return None
+        try:
+            if self.quote_only and self.quote_shadow_positions:
+                quote_tokens = self.quote_shadow_tokens.get(mint, pos.remaining_tokens)
+                remaining_fraction = pos.remaining_tokens / max(pos.tokens_bought, 1e-18)
+                full_sell_tokens = quote_tokens * remaining_fraction
+                sell_amount: Any = round(full_sell_tokens * fraction, 9)
+                if isinstance(sell_amount, (int, float)) and sell_amount <= 0:
+                    return None
+            else:
+                # Live mode: pass UI amount as fraction-of-tokens; broker computes
+                sell_amount = round(pos.remaining_tokens * fraction, 9)
+                if sell_amount <= 0:
+                    return None
+            quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
+            expected_out = self.rate_amount_out(quote)
+            # Partial keeps the ATA open — half the round-trip overhead applies
+            overhead = (self.quote_roundtrip_overhead_sol or 0.0) * 0.5 if self.quote_shadow_positions else 0.0
+            proceeds = max(0.0, expected_out - overhead)
+
+            if self.quote_only:
+                if self.quote_simulate and self.keypair:
+                    signed_b64, _ = self.sign_transaction(str(quote["txn"]))
+                    self.simulate_signed(signed_b64)
+                if self.quote_shadow_positions:
+                    tokens_sold = pos.remaining_tokens * fraction
+                    pos.remaining_tokens -= tokens_sold
+                    pos.realized_sol += proceeds
+                    if mint in self.quote_shadow_tokens:
+                        self.quote_shadow_tokens[mint] = max(
+                            0.0, self.quote_shadow_tokens[mint] - sell_amount
+                        )
+                    pos.derisk_done = True
+                    if pos.state == "SCOUT":
+                        pos.state = "RUNNER"
+                    self.stats.partials += 1
+                    pos.update(price)
+                    log(
+                        f"PGG2-LIVE-PARTIAL-SHADOW {short_addr(mint)} reason={reason} "
+                        f"fraction={fraction:.2f} sold_tokens={tokens_sold:.0f} "
+                        f"proceeds={proceeds:.6f} realized={pos.realized_sol:.6f} "
+                        f"remaining_tokens={pos.remaining_tokens:.0f}"
+                    )
+                    self.save_state()
+                    return pos
+                log(f"PGG2-LIVE-QUOTE-ONLY-PARTIAL {short_addr(mint)} reason={reason}")
+                return None
+
+            # Real live mode (mode == "live", not quote_only)
+            signed_b64, _ = self.sign_transaction(str(quote["txn"]))
+            if not self.simulate_signed(signed_b64):
+                log(f"PGG2-LIVE-PARTIAL-SIM-FAIL {short_addr(mint)} reason={reason}")
+                return None
+            sig = self.send_signed(signed_b64)
+            if not self.wait_confirmed(sig):
+                log(f"PGG2-LIVE-PARTIAL-CONFIRM-FAIL {short_addr(mint)} reason={reason}")
+                return None
+            # Update position state on successful sell
+            tokens_sold = pos.remaining_tokens * fraction
+            pos.remaining_tokens -= tokens_sold
+            pos.realized_sol += proceeds
+            pos.derisk_done = True
+            if pos.state == "SCOUT":
+                pos.state = "RUNNER"
+            self.stats.partials += 1
+            pos.update(price)
+            log(
+                f"PGG2-LIVE-PARTIAL {short_addr(mint)} reason={reason} "
+                f"fraction={fraction:.2f} sig={sig} proceeds={proceeds:.6f}"
+            )
+            self.save_state()
+            return pos
+        except Exception as exc:
+            log(
+                f"PGG2-LIVE-PARTIAL-ERROR {short_addr(mint)} reason={reason} "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
 
     def close(self, mint: str, ts_ms: int, price: float, reason: str, killed: bool) -> Optional[float]:
         pos = self.positions.get(mint)
