@@ -254,20 +254,26 @@ export PIGGY_FULL_NO_POP_MIN_BUYS=2
 export PGG2_LIVE_BIRTH_FANOUT_NO_FOLLOW_SEC=10.0    # birth_fanout was killing at 2.8s on layered_no_follow
 
 # ============================================================================
-# PHASE 25 — UNIVERSAL REAL-PRICE EXIT GOVERNOR
+# PHASE 26 — LANE-WEIGHTED SIZING + SMARTER UNIVERSAL EXIT
 # ============================================================================
-# Replaces OG kill_* and broker simulated-quote exits with deterministic
-# real-price-only exit logic. Bounds every loss at ~-$1.40, rides real
-# winners with 6% peak trail. Ignores buy-flow death noise that was
-# closing positions at -$2-6 during 2-30s holds.
+# Phase 25 dissection: curve_lag_reveal 3/3 (100%) +$15.42, others bleeding.
+# Bias capital toward proven lane; tighten exit so small peaks don't trail-close.
 export PGG2_PHASE25_UNIVERSAL_EXIT_ENABLED=1
 export PGG2_PHASE25_STOP_MULT=0.95              # -5% real price stop
 export PGG2_PHASE25_CATASTROPHIC_MULT=0.60      # -40% rug guard
-export PGG2_PHASE25_TRAIL_ARM_PEAK=1.08         # arm trail once peak >= +8% real
-export PGG2_PHASE25_TRAIL_DROP=0.94             # close on 6% drop from peak
-export PGG2_PHASE25_MIN_HOLD_SEC=4.0            # 4s settle window before exits
-export PGG2_PHASE25_TIMEBOX_SEC=60.0            # 60s timebox
-export PGG2_PHASE25_TIMEBOX_MIN_MULT=1.02       # accept small loss at 60s if no pop
+export PGG2_PHASE25_TRAIL_ARM_PEAK=1.15         # only trail real pumps (was 1.08 — fired on noise)
+export PGG2_PHASE25_TRAIL_DROP=0.88             # 12% drop from peak (was 6% — too tight)
+export PGG2_PHASE25_MIN_HOLD_SEC=4.0            # 4s settle window
+export PGG2_PHASE25_TIMEBOX_SEC=60.0
+export PGG2_PHASE25_TIMEBOX_MIN_MULT=1.02
+
+# Phase 26: per-lane position sizing — bias capital by lane track record
+export PGG2_CURVE_LAG_SOL=0.080                 # 100% W/L star lane — biggest stake
+export PGG2_RAW_MOMENTUM_SOL=0.045              # 40% W/L mid
+export PGG2_PRICED_BREAKOUT_SOL=0.030           # declining lane — smaller stake
+export PGG2_PRICED_SNAP_SOL=0.025               # weak lane — smallest
+export PGG2_BIRTH_FANOUT_SOL=0.030
+# bounce_buy already at 0.040 from earlier phase
 
 mkdir -p /root/piggy/logs /root/piggy/data
 RUNID="${PGG2_RUN_PREFIX}_$(date -u +%Y%m%d_%H%M%S)"
