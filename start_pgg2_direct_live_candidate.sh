@@ -75,4 +75,67 @@ export PGG2_LIVE_MAX_CONSECUTIVE_LOSSES="${PGG2_LIVE_MAX_CONSECUTIVE_LOSSES:-999
 export PGG2_LIVE_HTTP_RETRIES="${PGG2_LIVE_HTTP_RETRIES:-2}"
 export PGG2_LIVE_HTTP_RETRY_BASE_SEC="${PGG2_LIVE_HTTP_RETRY_BASE_SEC:-0.25}"
 
+# =============================================================================
+# Phase 2A 2026-05-08 — adaptive guards + filter pruning based on cross-run validation
+# of 22 OG live runs (483 trades). Walk-forward verdict:
+# - 8 filters OVERFIT (helped May 6 / hurt May 7-8): E2, N1, N2, N3, F9, F10, F11, F14
+# - 10 filters GENERALIZE: E1, F6, F7, F8, F12, F13, F15v2, F16, F17, F18 (kept)
+# - Hours 18:00-20:00 UTC consistently bad across all runs (-$2.06 combined)
+# - Run 191401 had 12-15 consecutive-loss streaks costing $0.30-$0.81 per streak
+# =============================================================================
+# 1. DISABLE 8 overfit filters by setting env vars to no-op thresholds.
+#    N1 was worst — sacrificed +$21 of winners including DY9TMGKg (+$7.50).
+export PGG2_PRICED_SNAP_BLOCK_TOP700=1.01                    # disable E2 (top never > 1.01)
+export PGG2_LIVE_BLOCK_HHI700_BELOW=-1                       # disable N1 (hhi never < -1)
+export PGG2_PRICED_SNAP_BLOCK_MOVE700_BELOW=-1               # disable N2
+export PGG2_PRICED_SNAP_BLOCK_MOVE1500_BELOW=-1              # disable N3
+export PGG2_PRICED_SNAP_BLOCK_SCORE_PER_BUYER_ABOVE=99999    # disable F9
+export PGG2_PRICED_SNAP_BLOCK_AVG_BUY_7_BELOW=-1             # disable F10
+export PGG2_PRICED_SNAP_BLOCK_AVG_BUY_7_TIGHT=-1             # disable F11
+export PGG2_PRICED_SNAP_BLOCK_SCORE_BELOW=0                  # disable F14 (score never < 0)
+# 2. ADAPTIVE: hour-of-day block (UTC). 18-20 UTC are consistently hostile across
+#    22 runs (-$2.06 combined). Allow 21:00 (OG winner ran partly here).
+export PGG2_BLOCK_HOURS_UTC="${PGG2_BLOCK_HOURS_UTC:-18,19,20}"
+# 3. ADAPTIVE: consecutive-loss circuit breaker. Run 191401 had 5 streaks of 10+
+#    consecutive losses each costing $0.30-0.81. After 5 losses in a row, pause
+#    the bot for 5 minutes to break the bad-tape streak.
+export PGG2_CIRCUIT_BREAKER_LOSSES="${PGG2_CIRCUIT_BREAKER_LOSSES:-5}"
+export PGG2_CIRCUIT_BREAKER_PAUSE_SEC="${PGG2_CIRCUIT_BREAKER_PAUSE_SEC:-300}"
+
+# =============================================================================
+# Phase 3 2026-05-08 — strategic redesign for "destined to win big" outcomes
+# Per cross-run validation (483 trades, 22 OG runs):
+# - curve_lag_reveal lane was NET NEGATIVE: 30% win rate, lost more than it won
+# - hard_break fired -$23.46 net on trades that had peaked at 1.428x avg
+# - scout_profit_protect fired -$20.69 net (replaced with PEAK-LOCK)
+# - quote_profit_bank was the +95% winner (+$37.74) — preserve at all costs
+# =============================================================================
+# 4. DISABLE curve_lag_reveal lane entirely. priced_snap stays as the only entry.
+export PGG2_CURVE_LAG_REVEAL_ENABLED="${PGG2_CURVE_LAG_REVEAL_ENABLED:-0}"
+# 5. PEAK-LOCK trailing stop (replaces scout_profit_protect). Three tiers:
+#    - low:  peak >= 1.18 → floor = max(1.05, peak*0.92) → lock 5%+
+#    - mid:  peak >= 1.30 → floor = max(1.15, peak*0.88) → lock 15%+
+#    - high: peak >= 1.60 → floor = max(1.30, peak*0.85) → lock 30%+
+export PGG2_PEAK_LOCK_ENABLED="${PGG2_PEAK_LOCK_ENABLED:-1}"
+export PGG2_PEAK_LOCK_LOW_PEAK="${PGG2_PEAK_LOCK_LOW_PEAK:-1.18}"
+export PGG2_PEAK_LOCK_LOW_FLOOR="${PGG2_PEAK_LOCK_LOW_FLOOR:-1.05}"
+export PGG2_PEAK_LOCK_LOW_TRAIL="${PGG2_PEAK_LOCK_LOW_TRAIL:-0.92}"
+export PGG2_PEAK_LOCK_MID_PEAK="${PGG2_PEAK_LOCK_MID_PEAK:-1.30}"
+export PGG2_PEAK_LOCK_MID_FLOOR="${PGG2_PEAK_LOCK_MID_FLOOR:-1.15}"
+export PGG2_PEAK_LOCK_MID_TRAIL="${PGG2_PEAK_LOCK_MID_TRAIL:-0.88}"
+export PGG2_PEAK_LOCK_HIGH_PEAK="${PGG2_PEAK_LOCK_HIGH_PEAK:-1.60}"
+export PGG2_PEAK_LOCK_HIGH_FLOOR="${PGG2_PEAK_LOCK_HIGH_FLOOR:-1.30}"
+export PGG2_PEAK_LOCK_HIGH_TRAIL="${PGG2_PEAK_LOCK_HIGH_TRAIL:-0.85}"
+# 6. CONDITION hard_break: only fire when peak never reached PEAK-LOCK low tier.
+#    Trades that peaked above 1.18 are governed by PEAK-LOCK exclusively.
+export PGG2_HARD_BREAK_REQUIRE_PEAK_BELOW="${PGG2_HARD_BREAK_REQUIRE_PEAK_BELOW:-1.18}"
+# 7. ANTI-MARTINGALE stake scaling. After 2+ consecutive losses, scale stake DOWN
+#    to 50%; after 2+ consecutive wins, scale UP to 130%. Caps at min/max trade
+#    SOL bounds. Disabled by default at launch — enable after live validation.
+export PGG2_ANTI_MARTINGALE_ENABLED="${PGG2_ANTI_MARTINGALE_ENABLED:-1}"
+export PGG2_ANTI_MARTINGALE_LOSS_STREAK="${PGG2_ANTI_MARTINGALE_LOSS_STREAK:-2}"
+export PGG2_ANTI_MARTINGALE_LOSS_SCALE="${PGG2_ANTI_MARTINGALE_LOSS_SCALE:-0.50}"
+export PGG2_ANTI_MARTINGALE_WIN_STREAK="${PGG2_ANTI_MARTINGALE_WIN_STREAK:-2}"
+export PGG2_ANTI_MARTINGALE_WIN_SCALE="${PGG2_ANTI_MARTINGALE_WIN_SCALE:-1.30}"
+
 exec ./start_pgg2_attack_paper.sh

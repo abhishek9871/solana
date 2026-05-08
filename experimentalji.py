@@ -220,9 +220,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return False
         if reason not in {
             "quote_profit_bank",
-            "quote_profit_runner_bank",
             "quote_loss_clamp",
-            "curve_lag_thin_stall_exit",
             "curve_lag_no_follow",
             "kill_priced_snap_layered_no_follow",
             "priced_snap_exec_quote_loss_clamp",
@@ -2710,31 +2708,15 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             and live_sell_ratio1500 <= env_float("PGG2_EXEC_SPIKE_PROBE_MAX_SELL_RATIO1500", 0.08)
             and features["last_buy_age_ms"] <= env_int("PGG2_EXEC_SPIKE_PROBE_MAX_LAST_BUY_MS", 500)
         )
-        late_big_buy_probe = (
-            event.mint not in self.raw_exec_spike_seen
-            and env_bool("PGG2_EXEC_SPIKE_LATE_BIG_BUY_ENABLED", True)
-            and age_sec >= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MIN_AGE_SEC", 8.0)
-            and age_sec <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_AGE_SEC", 75.0)
-            and entry_move >= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MIN_ENTRY_MOVE", 2.0)
-            and entry_move <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_ENTRY_MOVE", 3.2)
-            and vsol >= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MIN_VSOL", 55.0)
-            and vsol <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_VSOL", 125.0)
-            and event.sol >= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MIN_CURRENT_BUY_SOL", 0.75)
-            and event.sol <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_CURRENT_BUY_SOL", 2.5)
-            and live_sell_ratio1500 <= env_float("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_SELL_RATIO1500", 0.08)
-            and features["last_buy_age_ms"] <= env_int("PGG2_EXEC_SPIKE_LATE_BIG_BUY_MAX_LAST_BUY_MS", 500)
-        )
-        if exec_spike_probe or late_big_buy_probe:
+        if exec_spike_probe:
             scout = min(
                 self.config.max_position_sol,
                 env_float("PGG2_EXEC_SPIKE_PROBE_SOL", 0.015),
             )
-            variant = "late_big_buy" if late_big_buy_probe and not exec_spike_probe else "standard"
             reason = (
                 f"exec_spike_probe move={entry_move:.2f}x age={age_sec:.2f}s "
                 f"vsol={vsol:.2f} current_buy={event.sol:.3f} "
-                f"live1500={live_b1500:.2f}/{live_u1500} sellr={live_sell_ratio1500:.2f} "
-                f"variant={variant}"
+                f"live1500={live_b1500:.2f}/{live_u1500} sellr={live_sell_ratio1500:.2f}"
             )
             raw_features = self.slim_features(features)
             raw_features.update(
@@ -2748,7 +2730,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                     "raw_sell_ratio_10s": sell_ratio,
                     "raw_entry_move": entry_move,
                     "raw_profile": "exec_spike_probe",
-                    "raw_exec_variant": variant,
                     "entry_size_reason": "exec_spike_probe",
                     "entry_probe_sol": scout,
                 }
@@ -2757,7 +2738,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 f"PGG2-EXEC-SPIKE-PROBE {short_addr(event.mint)} "
                 f"move={entry_move:.2f}x age={age_sec:.2f}s vsol={vsol:.2f} "
                 f"buy={event.sol:.3f} b1500={live_b1500:.2f}/{live_u1500} "
-                f"sellr={live_sell_ratio1500:.2f} variant={variant}"
+                f"sellr={live_sell_ratio1500:.2f}"
             )
             return StrikePlan(
                 mint=event.mint,
@@ -3842,17 +3823,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if quote_loss_clamp and self.moonshot_lane(pos.lane):
             quote_action = quote_loss_clamp(pos, ts_ms)
             if quote_action:
-                if quote_action == "quote_profit_runner_bank":
-                    fraction = env_float("PGG2_LIVE_RUNNER_BANK_SELL_FRACTION", 0.82)
-                    if self.broker.partial(mint, fraction, price, quote_action):
-                        self.logger.decision(
-                            "derisk",
-                            mint,
-                            {"reason": quote_action, "fraction": fraction, "features": self.slim_features(features)},
-                        )
-                        return
-                    self.close_position(mint, ts_ms, price, "quote_profit_bank", features, killed=False)
-                    return
                 if (
                     quote_action == "quote_loss_clamp"
                     and self.curve_lag_broad_quote_grace(pos, features, ts_ms)
@@ -3872,17 +3842,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if quote_profit_bank and self.moonshot_lane(pos.lane):
             quote_exit = quote_profit_bank(pos, ts_ms)
             if quote_exit:
-                if quote_exit == "quote_profit_runner_bank":
-                    fraction = env_float("PGG2_LIVE_RUNNER_BANK_SELL_FRACTION", 0.82)
-                    if self.broker.partial(mint, fraction, price, quote_exit):
-                        self.logger.decision(
-                            "derisk",
-                            mint,
-                            {"reason": quote_exit, "fraction": fraction, "features": self.slim_features(features)},
-                        )
-                        return
-                    self.close_position(mint, ts_ms, price, "quote_profit_bank", features, killed=False)
-                    return
                 self.close_position(mint, ts_ms, price, quote_exit, features, killed=False)
                 return
 

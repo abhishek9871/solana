@@ -1,3 +1,3 @@
 @echo off
-title Experimentalji Dry-Live Tail - Hetzner
-ssh -i C:\Users\VASU\.ssh\hetzner_sniper -o StrictHostKeyChecking=no root@87.99.151.70 "cd /root/piggy; RUNID=$(cat /root/piggy/current_pgg2_runid.txt); echo RUN_ID=$RUNID; echo LOG=/root/piggy/logs/${RUNID}.log; tail -f /root/piggy/logs/${RUNID}.log"
+title *** OG WINNER PURE 7128dc7 - REAL SOL - pgg2_direct_live_20260507_191401 ***
+ssh -i C:\Users\VASU\.ssh\hetzner_sniper -o StrictHostKeyChecking=no root@87.99.151.70 "tail -F /root/piggy/logs/pgg2_direct_live_20260507_191401.log"

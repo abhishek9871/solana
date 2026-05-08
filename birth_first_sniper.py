@@ -577,6 +577,9 @@ class Position:
     derisk_done: bool = False
     dry_live_cost_sol: float = 0.0
     dry_live_locked_rent_sol: float = 0.0
+    moonshot_mode: bool = False
+    moonshot_arm_ts: int = 0
+    moonshot_arm_peak: float = 0.0
 
     def age_sec(self, ts_ms: int) -> float:
         return max(0.0, (ts_ms - self.opened_ts_ms) / 1000.0)

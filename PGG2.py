@@ -120,9 +120,16 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         self.spark3_breakout_watch: dict[str, dict[str, Any]] = {}
         self.spark3_breakout_seen: set[str] = set()
         self.curve_lag_reveal_seen: set[str] = set()
+        # Phase 2A 2026-05-08: adaptive guards (consecutive-loss circuit breaker).
+        # State tracks: how many losses in a row, and when bot is paused-until.
+        self.consecutive_losses: int = 0
+        self.circuit_breaker_until_ts: int = 0
+        # Phase 3 2026-05-08: anti-martingale stake scaling.
+        # consecutive_wins ratchets stake UP after streaks; reset on any loss.
+        # consecutive_losses (above) ratchets stake DOWN; reset on any win.
+        self.consecutive_wins: int = 0
         self.preprice_reveal_seen: set[str] = set()
         self.priced_snap_seen: set[str] = set()
-        self.live_losscut_logged: set[str] = set()
         self.priced_breakout_watch: dict[str, dict[str, Any]] = {}
         self.priced_breakout_seen: set[str] = set()
         self.late_swarm_seen: set[str] = set()
@@ -152,23 +159,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             "raw_momentum",
             "whale_spark",
         }
-
-    def live_entry_losscut_reason(self, buy1500: float, uniq1500: int, score: float) -> Optional[str]:
-        """Live-derived entry reject.
-
-        Validated on direct-live runs after fees/quotes. It skips the weak
-        breadth profile that produced loss without touching broad winners.
-        """
-        if not env_bool("PGG2_LIVE_LOSS_CUTTER_ENABLED", False):
-            return None
-        min_uniq = env_int("PGG2_LIVE_LOSSCUT_MIN_UNIQ1500", 6)
-        low_buy = env_float("PGG2_LIVE_LOSSCUT_LOW_BUY1500", 10.5)
-        low_score = env_float("PGG2_LIVE_LOSSCUT_LOW_SCORE", 150.0)
-        if uniq1500 < min_uniq:
-            return f"uniq1500<{min_uniq}"
-        if buy1500 < low_buy and score < low_score:
-            return f"buy1500<{low_buy:.2f}_score<{low_score:.1f}"
-        return None
 
     def recent_profit_reentry_locked(self, mint: str, ts_ms: int) -> bool:
         prior = self.profitable_closes.get(mint)
@@ -284,7 +274,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             "sig_buyers": set(),
             "last_sig_buy_ms": 0,
             "entry_features": dict(entry_features) if entry_features else {},
-            "defer_logs": set(),
         }
         self.position_follow[pos.mint] = follow
         return follow
@@ -340,211 +329,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         features["last_post_open_sig_buy_age_ms"] = (
             int(features["ts_ms"]) - last_sig_buy_ms if last_sig_buy_ms else 999999
         )
-
-    def entry_features_for_position(self, pos: Any) -> dict[str, Any]:
-        follow = self.position_follow.get(pos.mint) or {}
-        entry_features = follow.get("entry_features") or {}
-        if entry_features:
-            return entry_features
-        return getattr(pos, "entry_features", None) or {}
-
-    def log_defer_once(self, pos: Any, key: str, message: str) -> None:
-        follow = self.follow_for_position(pos)
-        logged = follow.setdefault("defer_logs", set())
-        if key in logged:
-            return
-        logged.add(key)
-        log(message)
-
-    def curve_lag_broad_quote_grace(self, pos: Any, features: dict[str, Any], ts_ms: int) -> bool:
-        """Hold broad curve-lag entries through the first executable-loss check."""
-        if not env_bool("PGG2_CURVE_LAG_BROAD_QUOTE_GRACE_ENABLED", True):
-            return False
-        if pos.lane != "curve_lag_reveal":
-            return False
-        age_sec = pos.age_sec(ts_ms)
-        if age_sec >= env_float("PGG2_CURVE_LAG_BROAD_QUOTE_GRACE_SEC", 4.25):
-            return False
-        entry = self.entry_features_for_position(pos)
-        buy1500 = float(entry.get("buy1500") or 0.0)
-        uniq1500 = int(entry.get("uniq1500") or 0)
-        top1500 = float(entry.get("top_share1500") or 1.0)
-        live_buy700 = float(entry.get("curve_lag_live_buy700") or entry.get("buy700") or 0.0)
-        live_uniq700 = int(entry.get("curve_lag_live_unique700") or entry.get("uniq700") or 0)
-        live_top700 = float(entry.get("curve_lag_live_top700") or entry.get("top_share700") or 1.0)
-        broad = (
-            buy1500 >= env_float("PGG2_CURVE_LAG_BROAD_GRACE_MIN_BUY1500", 18.0)
-            and uniq1500 >= env_int("PGG2_CURVE_LAG_BROAD_GRACE_MIN_UNIQ1500", 12)
-            and top1500 <= env_float("PGG2_CURVE_LAG_BROAD_GRACE_MAX_TOP1500", 0.20)
-            and live_buy700 >= env_float("PGG2_CURVE_LAG_BROAD_GRACE_MIN_LIVE_BUY700", 8.0)
-            and live_uniq700 >= env_int("PGG2_CURVE_LAG_BROAD_GRACE_MIN_LIVE_UNIQ700", 5)
-            and live_top700 <= env_float("PGG2_CURVE_LAG_BROAD_GRACE_MAX_LIVE_TOP700", 0.35)
-        )
-        if not broad:
-            return False
-        self.log_defer_once(
-            pos,
-            "curve_lag_broad_quote_grace",
-            f"PGG2-EXIT-DEFER {short_addr(pos.mint)} reason=curve_lag_broad_quote_grace "
-            f"age={age_sec:.2f}s b1500={buy1500:.3f}/{uniq1500} top={top1500:.2f} "
-            f"live700={live_buy700:.3f}/{live_uniq700} top700={live_top700:.2f}",
-        )
-        return True
-
-    def priced_snap_strong_follow_hard_grace(self, pos: Any, features: dict[str, Any], kill: str, ts_ms: int) -> bool:
-        """Defer early priced-snap hard breaks when fresh buyers are still pressing."""
-        if not env_bool("PGG2_PRICED_SNAP_STRONG_FOLLOW_GRACE_ENABLED", True):
-            return False
-        if pos.lane != "priced_snap" or kill != "kill_priced_snap_hard_break":
-            return False
-        age_sec = pos.age_sec(ts_ms)
-        if age_sec >= env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_GRACE_SEC", 75.0):
-            return False
-        entry = self.entry_features_for_position(pos)
-        entry_move = float(entry.get("priced_snap_entry_move") or entry.get("wave_base_move") or 0.0)
-        if entry_move > env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_MAX_ENTRY_MOVE", 1.30):
-            return False
-        follow_window_ms = env_int("PGG2_PRICED_SNAP_STRONG_FOLLOW_WINDOW_MS", 3000)
-        flow = self.event_window_stats(
-            pos.mint,
-            int(pos.opened_ts_ms),
-            min(int(features["ts_ms"]), int(pos.opened_ts_ms) + follow_window_ms),
-        )
-        follow_buy = float(flow.get("buy_sol") or 0.0)
-        follow_uniq = int(flow.get("unique_buyers") or 0)
-        follow_sell = float(flow.get("sell_sol") or 0.0)
-        follow_top = float(flow.get("top_buy_share") or 1.0)
-        sell_ratio = follow_sell / max(follow_buy, 0.001)
-        if not (
-            follow_buy >= env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_MIN_BUY_SOL", 7.5)
-            and follow_uniq >= env_int("PGG2_PRICED_SNAP_STRONG_FOLLOW_MIN_BUYERS", 10)
-            and follow_top <= env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_MAX_TOP", 0.60)
-            and sell_ratio <= env_float("PGG2_PRICED_SNAP_STRONG_FOLLOW_MAX_SELL_RATIO700", 0.04)
-            and int(features.get("last_buy_age_ms") or 999999)
-            <= env_int("PGG2_PRICED_SNAP_STRONG_FOLLOW_MAX_LAST_BUY_MS", 350)
-        ):
-            return False
-        self.log_defer_once(
-            pos,
-            "priced_snap_strong_follow_hard_grace",
-            f"PGG2-EXIT-DEFER {short_addr(pos.mint)} reason=priced_snap_strong_follow_hard_grace "
-            f"age={age_sec:.2f}s mult={pos.last_mult:.3f} entry_move={entry_move:.3f} "
-            f"follow={follow_buy:.3f}/{follow_uniq} sell={follow_sell:.3f} "
-            f"top={follow_top:.2f} window_ms={follow_window_ms}",
-        )
-        return True
-
-    def priced_snap_delayed_runway_grace(self, pos: Any, features: dict[str, Any], kill: str, ts_ms: int) -> bool:
-        """Hold the specific priced-snap dip profile that later produces delayed runners."""
-        if not env_bool("PGG2_PRICED_SNAP_DELAYED_RUNWAY_GRACE_ENABLED", True):
-            return False
-        if pos.lane != "priced_snap" or kill != "kill_priced_snap_hard_break":
-            return False
-        age_sec = pos.age_sec(ts_ms)
-        if age_sec >= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_GRACE_SEC", 14.0):
-            return False
-        if pos.last_mult <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_PANIC_MULT", 0.72):
-            return False
-        entry = self.entry_features_for_position(pos)
-        entry_move = float(entry.get("priced_snap_entry_move") or entry.get("wave_base_move") or 0.0)
-        if not (
-            entry_move >= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_ENTRY_MOVE", 1.18)
-            and entry_move <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_ENTRY_MOVE", 1.30)
-        ):
-            return False
-        entry_buy1500 = float(entry.get("buy1500") or 0.0)
-        entry_uniq1500 = int(entry.get("uniq1500") or 0)
-        entry_top1500 = float(entry.get("top_share1500") or 1.0)
-        entry_sell1500 = float(entry.get("sell1500") or 0.0)
-        entry_sell_ratio = entry_sell1500 / max(entry_buy1500, 0.001)
-        if not (
-            entry_buy1500 >= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_BUY1500", 7.5)
-            and entry_uniq1500 >= env_int("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_UNIQ1500", 8)
-            and entry_top1500 <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_TOP1500", 0.30)
-            and entry_sell_ratio <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_ENTRY_SELL_RATIO", 0.01)
-        ):
-            return False
-        window_ms = env_int("PGG2_PRICED_SNAP_DELAYED_RUNWAY_WINDOW_MS", 700)
-        flow = self.event_window_stats(
-            pos.mint,
-            int(pos.opened_ts_ms),
-            int(pos.opened_ts_ms) + window_ms,
-        )
-        follow_buy = float(flow.get("buy_sol") or 0.0)
-        follow_uniq = int(flow.get("unique_buyers") or 0)
-        follow_sell = float(flow.get("sell_sol") or 0.0)
-        follow_top = float(flow.get("top_buy_share") or 1.0)
-        follow_sell_ratio = follow_sell / max(follow_buy, 0.001)
-        if not (
-            follow_buy >= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_FOLLOW_BUY_SOL", 8.0)
-            and follow_uniq >= env_int("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MIN_FOLLOW_BUYERS", 12)
-            and follow_top <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_FOLLOW_TOP", 0.50)
-            and follow_sell_ratio <= env_float("PGG2_PRICED_SNAP_DELAYED_RUNWAY_MAX_FOLLOW_SELL_RATIO", 0.06)
-        ):
-            return False
-        self.log_defer_once(
-            pos,
-            "priced_snap_delayed_runway_grace",
-            f"PGG2-EXIT-DEFER {short_addr(pos.mint)} reason=priced_snap_delayed_runway_grace "
-            f"age={age_sec:.2f}s mult={pos.last_mult:.3f} entry_move={entry_move:.3f} "
-            f"entry={entry_buy1500:.3f}/{entry_uniq1500} top={entry_top1500:.2f} "
-            f"follow={follow_buy:.3f}/{follow_uniq} sell={follow_sell:.3f} "
-            f"top={follow_top:.2f} window_ms={window_ms}",
-        )
-        return True
-
-    def priced_snap_post_open_loss_cut_reason(self, pos: Any, features: dict[str, Any], ts_ms: int) -> str:
-        """Cut post-entry priced-snap failure modes that validated as loss-only."""
-        if not env_bool("PGG2_PRICED_SNAP_POST_OPEN_LOSS_CUT_ENABLED", True):
-            return ""
-        if pos.lane != "priced_snap":
-            return ""
-        age_sec = pos.age_sec(ts_ms)
-        if age_sec > env_float("PGG2_PRICED_SNAP_POST_OPEN_LOSS_CUT_UNTIL_SEC", 4.0):
-            return ""
-        if pos.peak_mult >= env_float("PGG2_PRICED_SNAP_POST_OPEN_LOSS_CUT_MAX_PEAK", 1.18):
-            return ""
-        window_ms = env_int("PGG2_PRICED_SNAP_POST_OPEN_LOSS_CUT_WINDOW_MS", 700)
-        flow = self.event_window_stats(
-            pos.mint,
-            int(pos.opened_ts_ms),
-            min(int(ts_ms), int(pos.opened_ts_ms) + window_ms),
-        )
-        follow_buy = float(flow.get("buy_sol") or 0.0)
-        follow_sell = float(flow.get("sell_sol") or 0.0)
-        follow_buyers = int(flow.get("unique_buyers") or 0)
-        follow_top = float(flow.get("top_buy_share") or 1.0)
-        sell_ratio = follow_sell / max(follow_buy, 0.001)
-        if (
-            age_sec >= env_float("PGG2_PRICED_SNAP_POST_OPEN_DIST_MIN_AGE_SEC", 0.70)
-            and follow_sell >= env_float("PGG2_PRICED_SNAP_POST_OPEN_DIST_MIN_SELL_SOL", 1.0)
-            and sell_ratio >= env_float("PGG2_PRICED_SNAP_POST_OPEN_DIST_MIN_SELL_RATIO", 0.20)
-        ):
-            self.log_defer_once(
-                pos,
-                "priced_snap_post_open_distribution_cut",
-                f"PGG2-LOSSCUT-EXIT {short_addr(pos.mint)} reason=priced_snap_post_open_distribution "
-                f"age={age_sec:.2f}s mult={pos.last_mult:.3f} peak={pos.peak_mult:.3f} "
-                f"post={follow_buy:.3f}/{follow_buyers} sell={follow_sell:.3f} "
-                f"sellr={sell_ratio:.2f} top={follow_top:.2f}",
-            )
-            return "priced_snap_post_open_distribution"
-        if (
-            age_sec >= env_float("PGG2_PRICED_SNAP_ZERO_FOLLOW_MIN_AGE_SEC", 0.55)
-            and follow_buy <= env_float("PGG2_PRICED_SNAP_ZERO_FOLLOW_MAX_BUY_SOL", 0.20)
-            and follow_sell >= env_float("PGG2_PRICED_SNAP_ZERO_FOLLOW_MIN_SELL_SOL", 0.02)
-            and pos.last_mult <= env_float("PGG2_PRICED_SNAP_ZERO_FOLLOW_MAX_MULT", 0.90)
-        ):
-            self.log_defer_once(
-                pos,
-                "priced_snap_zero_follow_dump_cut",
-                f"PGG2-LOSSCUT-EXIT {short_addr(pos.mint)} reason=priced_snap_zero_follow_dump "
-                f"age={age_sec:.2f}s mult={pos.last_mult:.3f} peak={pos.peak_mult:.3f} "
-                f"post={follow_buy:.3f}/{follow_buyers} sell={follow_sell:.3f} "
-                f"sellr={sell_ratio:.2f} top={follow_top:.2f}",
-            )
-            return "priced_snap_zero_follow_dump"
-        return ""
 
     def same_slot_cluster(self, mint: str, ts_ms: int) -> dict[str, Any]:
         tape = self.tapes.get(mint)
@@ -1690,6 +1474,31 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         )
         return None
 
+    def _trade_guards_pass(self, event: "PumpEvent") -> bool:
+        """Phase 2A adaptive guards. Return False to block this entry attempt.
+
+        Two guards:
+        1. Hour-block: PGG2_BLOCK_HOURS_UTC = "18,19,20" — comma list of UTC hours
+           where the bot will refuse new entries. Phase 1 hourly heatmap showed
+           18:00-21:00 UTC are the worst hours (-$2.91 combined across 22 runs).
+        2. Circuit breaker: paused until self.circuit_breaker_until_ts. Set on a
+           streak of consecutive losses by the close handler.
+        """
+        block_hours_str = env_str("PGG2_BLOCK_HOURS_UTC", "")
+        if block_hours_str:
+            try:
+                block_hours = {int(h.strip()) for h in block_hours_str.split(",") if h.strip()}
+                if block_hours:
+                    from datetime import datetime, timezone
+                    current_hour = datetime.fromtimestamp(event.ts_ms / 1000, tz=timezone.utc).hour
+                    if current_hour in block_hours:
+                        return False
+            except Exception:
+                pass
+        if self.circuit_breaker_until_ts and event.ts_ms < self.circuit_breaker_until_ts:
+            return False
+        return True
+
     def curve_lag_reveal_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
         """PGG2 curve-lag reveal lane.
 
@@ -1703,6 +1512,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         That keeps it distinct from the noisy fast-probe idea.
         """
         if not env_bool("PGG2_CURVE_LAG_REVEAL_ENABLED", True):
+            return None
+        if not self._trade_guards_pass(event):
             return None
         if not event.is_buy or event.mint in self.curve_lag_reveal_seen:
             return None
@@ -1785,18 +1596,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             + max(0.0, entry_move_from_first - 1.0) * 70.0
             - max(0.0, follow_top - 0.45) * 45.0
         )
-        buy1500 = float(features.get("buy1500") or 0.0)
-        uniq1500 = int(features.get("uniq1500") or 0)
-        losscut_reason = self.live_entry_losscut_reason(buy1500, uniq1500, score)
-        if losscut_reason:
-            if event.mint not in self.live_losscut_logged:
-                self.live_losscut_logged.add(event.mint)
-                log(
-                    f"PGG2-LOSSCUT-SKIP {short_addr(event.mint)} lane=curve_lag_reveal "
-                    f"reason={losscut_reason} b1500={buy1500:.3f}/{uniq1500} "
-                    f"score={score:.1f} live700={live_buy700:.3f}/{live_unique700}"
-                )
-            return None
         reason = (
             f"curve_lag_reveal arm={arm_age_ms}ms first_age={first_price_age_ms}ms "
             f"init={arm.initial_slot_buy_sol:.2f}/{arm.initial_slot_buyers} top={arm.initial_slot_top_share:.2f} "
@@ -1954,6 +1753,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         """
         if not env_bool("PGG2_PRICED_SNAP_ENABLED", False):
             return None
+        if not self._trade_guards_pass(event):
+            return None
         if not event.is_buy or event.mint in self.priced_snap_seen:
             return None
         if self.recent_profit_reentry_locked(event.mint, event.ts_ms):
@@ -2032,6 +1833,32 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             else:
                 entry_fraction = env_float("PGG2_PRICED_SNAP_STANDARD_ENTRY_FRACTION", entry_fraction)
             scout = max(0.0005, full_scout * entry_fraction)
+        # Phase 3 2026-05-08: anti-martingale stake scaling.
+        # After consecutive losses, scale stake DOWN (preserve capital during bad
+        # tape). After consecutive wins, scale stake UP (compound during good
+        # tape). Edge cases handled:
+        #   - exactly at threshold: scaling fires (>=, not >)
+        #   - both streaks zero: no-op (factor = 1.0)
+        #   - circuit breaker pre-empts entry; this only runs if guards pass
+        #   - clamp to [PGG2_LIVE_MIN_TRADE_SOL, PGG2_LIVE_MAX_TRADE_SOL] so the
+        #     final stake never under/overflows live execution bounds
+        am_factor = 1.0
+        am_label = ""
+        if env_bool("PGG2_ANTI_MARTINGALE_ENABLED", False):
+            loss_streak_n = env_int("PGG2_ANTI_MARTINGALE_LOSS_STREAK", 2)
+            win_streak_n = env_int("PGG2_ANTI_MARTINGALE_WIN_STREAK", 2)
+            if loss_streak_n > 0 and self.consecutive_losses >= loss_streak_n:
+                am_factor = env_float("PGG2_ANTI_MARTINGALE_LOSS_SCALE", 0.50)
+                am_label = f"loss_streak_{self.consecutive_losses}"
+            elif win_streak_n > 0 and self.consecutive_wins >= win_streak_n:
+                am_factor = env_float("PGG2_ANTI_MARTINGALE_WIN_SCALE", 1.30)
+                am_label = f"win_streak_{self.consecutive_wins}"
+        if am_factor != 1.0:
+            scaled = scout * am_factor
+            am_min = env_float("PGG2_LIVE_MIN_TRADE_SOL", 0.0005)
+            am_max = env_float("PGG2_LIVE_MAX_TRADE_SOL", self.config.max_position_sol)
+            scout = max(am_min, min(scaled, am_max))
+            target = max(am_min, min(target * am_factor, am_max))
         score = (
             150.0
             + min(55.0, buy1500 * 5.5)
@@ -2040,38 +1867,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             - max(0.0, top1500 - 0.40) * 55.0
             - sell_ratio * 95.0
         )
-        toxic_top = (
-            env_bool("PGG2_PRICED_SNAP_TOXIC_TOP_LOSSCUT_ENABLED", True)
-            and top1500 > env_float("PGG2_PRICED_SNAP_TOXIC_TOP_MAX_TOP1500", 0.365)
-        )
-        thin_delayed_concentration = (
-            env_bool("PGG2_PRICED_SNAP_THIN_DELAYED_CONCENTRATION_SKIP_ENABLED", True)
-            and top1500 > env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MIN_TOP1500", 0.30)
-            and top1500 <= env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MAX_TOP1500", 0.365)
-            and entry_move >= env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MIN_ENTRY_MOVE", 1.18)
-            and entry_move <= env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MAX_ENTRY_MOVE", 1.30)
-            and buy1500 < env_float("PGG2_PRICED_SNAP_THIN_DELAYED_MIN_BUY1500", 8.0)
-        )
-        if toxic_top or thin_delayed_concentration:
-            if event.mint not in self.live_losscut_logged:
-                self.live_losscut_logged.add(event.mint)
-                reason_name = "toxic_top" if toxic_top else "thin_delayed_concentration"
-                log(
-                    f"PGG2-LOSSCUT-SKIP {short_addr(event.mint)} lane=priced_snap "
-                    f"reason={reason_name} b1500={buy1500:.3f}/{uniq1500} "
-                    f"top={top1500:.3f} move={entry_move:.3f}x score={score:.1f}"
-                )
-            return None
-        losscut_reason = self.live_entry_losscut_reason(buy1500, uniq1500, score)
-        if losscut_reason:
-            if event.mint not in self.live_losscut_logged:
-                self.live_losscut_logged.add(event.mint)
-                log(
-                    f"PGG2-LOSSCUT-SKIP {short_addr(event.mint)} lane=priced_snap "
-                    f"reason={losscut_reason} b1500={buy1500:.3f}/{uniq1500} "
-                    f"top={top1500:.2f} score={score:.1f} move={entry_move:.2f}x"
-                )
-            return None
         reason = (
             f"priced_snap move={entry_move:.2f}x age={age_sec:.1f}s "
             f"b1500={buy1500:.2f}/{uniq1500} top={top1500:.2f} "
@@ -2089,6 +1884,10 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 "priced_snap_sell_ratio1500": sell_ratio,
                 "priced_snap_vertical": vertical_snap,
                 "priced_snap_elite": elite_snap,
+                "anti_martingale_factor": am_factor,
+                "anti_martingale_label": am_label,
+                "consecutive_losses": self.consecutive_losses,
+                "consecutive_wins": self.consecutive_wins,
             }
         )
         return StrikePlan(
@@ -3436,7 +3235,6 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             # Live direct execution can reject or fail an attempted close while
             # the position remains open. Do not emit a fake close decision.
             return
-        killed = bool(killed and pnl < 0)
         self.logger.decision(
             "close",
             mint,
@@ -3454,6 +3252,31 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 "pnl_sol": pnl,
                 "peak_mult": float(self.broker.stats.best_mult),
             }
+        # Phase 2A 2026-05-08: consecutive-loss circuit breaker. Tracks losing
+        # streaks and triggers a session pause to break out of bad-tape windows.
+        # Phase 1 analysis showed run 191401 had 12-15 consecutive losses streaks
+        # (e.g. 20:09-20:22 lost 0.089 SOL in 12 trades) — a circuit breaker
+        # would have caught these and saved several SOL.
+        if pnl < 0:
+            self.consecutive_losses += 1
+            # Phase 3 2026-05-08: any loss resets the win streak. A scratch (pnl
+            # ~0) counts as neither — only strict positive PnL increments wins.
+            self.consecutive_wins = 0
+            max_losses = env_int("PGG2_CIRCUIT_BREAKER_LOSSES", 0)
+            pause_sec = env_int("PGG2_CIRCUIT_BREAKER_PAUSE_SEC", 0)
+            if max_losses > 0 and pause_sec > 0 and self.consecutive_losses >= max_losses:
+                self.circuit_breaker_until_ts = ts_ms + pause_sec * 1000
+                log(
+                    f"PGG2-CIRCUIT-BREAKER tripped after {self.consecutive_losses} "
+                    f"consecutive losses, pausing for {pause_sec}s"
+                )
+        elif pnl > 0:
+            if self.consecutive_losses > 0:
+                self.consecutive_losses = 0
+            self.consecutive_wins += 1
+        # pnl == 0 (true scratch): leave both streaks unchanged. This keeps the
+        # anti-martingale state stable through pure round-trip break-evens that
+        # quote_profit_bank/min-out can occasionally produce.
         self.position_follow.pop(mint, None)
 
     @staticmethod
@@ -3476,15 +3299,187 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         self.broker.stats.best_mult = max(self.broker.stats.best_mult, pos.peak_mult)
         self.add_follow_features(pos, features)
 
+        # Phase 6 2026-05-08: MINIMUM-HOLD floor.
+        # Phase 5 autopsy on 5 losses: every loss had the same signature —
+        # bot entered, price stalled or dipped within 0.7-5.2s, ZERO buyer
+        # activity in last 1.5s, bot panicked out, mint then pumped 1.5-5.5x
+        # in the next 60s. The killer case: 2QzC17Tx exited via quote_loss_clamp
+        # at 0.71s for -$0.30, mint went 5.474x post-close. quote_loss_clamp
+        # at sub-second is structurally broken — cost model can't possibly
+        # know the trade's fate that early.
+        #
+        # Fix: for priced_snap and curve_lag_reveal positions, enforce a min
+        # hold time. The moonshot LATCH still runs during min-hold (so a fast
+        # pump can take over and trail). Only panic-dump or migration closes
+        # the position during the hold. All other exits are deferred.
+        in_min_hold = False
+        if env_bool("PGG2_MIN_HOLD_ENABLED", True) and pos.lane in {"priced_snap", "curve_lag_reveal"}:
+            # Phase 7 2026-05-08: TIERED hold based on early signal.
+            # Phase 6 autopsy: 2iStU7GGt8b1sY peaked 1.16x at 5.7s, then exited
+            # at 17s. The mint's TRUE peak was 7.97x at 276s post-entry. The 12s
+            # min-hold was 4 minutes too short. Solution: if position shows life
+            # (peak >= 1.10) within first 10s, extend hold to 90s; otherwise
+            # cut at standard 12s as a dud. This catches multi-minute pumps
+            # that grind up after initial flat consolidation.
+            base_hold = env_float("PGG2_MIN_HOLD_SEC", 12.0)
+            life_window = env_float("PGG2_MIN_HOLD_LIFE_WINDOW_SEC", 10.0)
+            life_peak = env_float("PGG2_MIN_HOLD_LIFE_PEAK", 1.10)
+            extended_hold = env_float("PGG2_MIN_HOLD_EXTENDED_SEC", 90.0)
+            age_sec_check = pos.age_sec(ts_ms)
+            # Decide effective hold: extended if life-shown by life_window, else base.
+            effective_hold = base_hold
+            if age_sec_check >= life_window:
+                # Past the life-window: lock the decision based on whether peak
+                # crossed life_peak by now.
+                if pos.peak_mult >= life_peak:
+                    effective_hold = extended_hold
+            else:
+                # Still inside the life-window: tentatively extend if already showing life.
+                if pos.peak_mult >= life_peak:
+                    effective_hold = extended_hold
+            if age_sec_check < effective_hold:
+                in_min_hold = True
+                panic_floor = env_float("PGG2_MIN_HOLD_PANIC_FLOOR", 0.50)
+                if mult <= panic_floor:
+                    self.close_position(
+                        mint, ts_ms, price,
+                        f"min_hold_panic mult={mult:.3f} age={age_sec_check:.1f}s",
+                        features, killed=False,
+                    )
+                    return
+                if features["complete"]:
+                    self.close_position(mint, ts_ms, price, "min_hold_migration", features, killed=False)
+                    return
+                # During min-hold: latch moonshot mode early if peak crosses,
+                # so the rider can take over with its own exits. If not latched,
+                # we'll skip all other exit checks below and just hold.
+                if env_bool("PGG2_MOONSHOT_RIDE_ENABLED", True) and not pos.moonshot_mode:
+                    arm_peak_mh = env_float("PGG2_MOONSHOT_RIDE_PEAK", 1.30)
+                    arm_window_mh = env_float("PGG2_MOONSHOT_RIDE_WINDOW_SEC", 30.0)
+                    if (
+                        pos.peak_mult >= arm_peak_mh
+                        and pos.age_sec(ts_ms) <= arm_window_mh
+                    ):
+                        pos.moonshot_mode = True
+                        pos.moonshot_arm_ts = ts_ms
+                        pos.moonshot_arm_peak = pos.peak_mult
+                        log(
+                            f"PGG2-MOONSHOT-RIDE-ARMED mint={mint[:8]} lane={pos.lane} "
+                            f"peak={pos.peak_mult:.3f} mult={mult:.3f} age={pos.age_sec(ts_ms):.1f}s (in_min_hold)"
+                        )
+                # If we latched during min-hold, fall through to the moonshot
+                # rider block below — it has its own trail/timeout logic.
+                if pos.moonshot_mode:
+                    pass  # fall through to moonshot rider
+                # Phase 7+ 2026-05-08: ONLY block exits for trades that have
+                # actually shown life. Phase 7 LOSS #1 (ZYLhenuGv) had peak < 1.10
+                # and dumped to 0.413 within 5s — min-hold blocked hard_break,
+                # turning a -$0.50 loss into -$2.00. Hard_break already has
+                # peak < 1.18 gate + buyer-grace, so for true duds it fires
+                # exactly when it should. Only protect trades showing life.
+                elif pos.peak_mult >= life_peak:
+                    # Showing life but not yet latched: let it develop. Block
+                    # all other exits, hold the position.
+                    return
+                # else: peak < life_peak — let hard_break / quote_loss_clamp /
+                # layered_no_follow do their normal job. They'll catch duds
+                # at -8% to -10% loss instead of waiting for -50% panic floor.
+
+        # Phase 3+ 2026-05-08: MOONSHOT-RIDER.
+        # Trajectory audit across 22 live runs (483 trades): 97 mints ran 2x+
+        # post-bot-exit, 43 ran 3x+, ALL of which the bot left on the table.
+        # quote_profit_bank cashes at avg 1.39x peak while mints avg-3x post-close.
+        # priced_snap_scout_profit_protect locks 1.29 from 1.43 peak; mints go to 1.72 avg.
+        # Even the best winning lane (moonshot_pop_after_sell) exits at 1.4x while mints avg 3x post.
+        #
+        # Fix: once peak crosses 1.30x within the first 30s, LATCH moonshot mode.
+        # In moonshot mode, replace ALL small-profit exits with a single wide trail
+        # (close when last_mult <= peak_mult * 0.50). Migration and a hard 90s
+        # timeout remain as safety nets. This rides the rare 3x-8x runners.
+        #
+        # Edge cases:
+        # - Whipsaw 1.30 → 0.65: trail catches at 0.65 (50% of peak). One bad case.
+        # - Stuck at peak: 90s safety timeout closes flat-ish.
+        # - Re-pump 1.30 → 1.50 → 1.80: peak ratchets, trail follows (0.90 floor at 1.80).
+        # - Mega rug from 1.30 to 0.10: trail catches at 0.65 first.
+        # - Peak < 1.30 forever: moonshot never latches, normal exits apply.
+        if env_bool("PGG2_MOONSHOT_RIDE_ENABLED", True):
+            arm_peak = env_float("PGG2_MOONSHOT_RIDE_PEAK", 1.30)
+            arm_window = env_float("PGG2_MOONSHOT_RIDE_WINDOW_SEC", 30.0)
+            if (
+                not pos.moonshot_mode
+                and pos.peak_mult >= arm_peak
+                and pos.age_sec(ts_ms) <= arm_window
+            ):
+                pos.moonshot_mode = True
+                pos.moonshot_arm_ts = ts_ms
+                pos.moonshot_arm_peak = pos.peak_mult
+                log(
+                    f"PGG2-MOONSHOT-RIDE-ARMED mint={mint[:8]} lane={pos.lane} "
+                    f"peak={pos.peak_mult:.3f} mult={mult:.3f} age={pos.age_sec(ts_ms):.1f}s"
+                )
+            if pos.moonshot_mode:
+                # Tiered trail: peak >= 3.0 → 0.40 (lock 60%+) | peak >= 2.0 → 0.50
+                # | peak >= 1.60 → 0.80 | peak < 1.60 (1.30-1.60) → 0.85.
+                # Phase 5 2026-05-08: tier1 widened from 0.70 → 0.80. Phase 4 ride
+                # of ARzYXByc exited at peak*0.70 dip; mint went on to 3.97x. Wider
+                # trail for the 1.60-2.00 band catches more upside.
+                peak = pos.peak_mult
+                if peak >= env_float("PGG2_MOONSHOT_RIDE_TIER3_PEAK", 3.0):
+                    trail_frac = env_float("PGG2_MOONSHOT_RIDE_TIER3_TRAIL", 0.40)
+                elif peak >= env_float("PGG2_MOONSHOT_RIDE_TIER2_PEAK", 2.0):
+                    trail_frac = env_float("PGG2_MOONSHOT_RIDE_TIER2_TRAIL", 0.50)
+                elif peak >= env_float("PGG2_MOONSHOT_RIDE_TIER1_PEAK", 1.60):
+                    trail_frac = env_float("PGG2_MOONSHOT_RIDE_TIER1_TRAIL", 0.80)
+                else:
+                    trail_frac = env_float("PGG2_MOONSHOT_RIDE_TIER0_TRAIL", 0.85)
+                trail_floor = peak * trail_frac
+                age_sec = pos.age_sec(ts_ms)
+                hard_timeout = env_float("PGG2_MOONSHOT_RIDE_HARD_TIMEOUT_SEC", 90.0)
+                # Phase 5 2026-05-08: min-hold post-latch. After the latch fires,
+                # ignore the regular trail for `min_hold_sec` to avoid a tight dip
+                # immediately after latch from triggering exit. Only a panic dump
+                # (mult <= peak * panic_trail) breaks the min-hold.
+                min_hold_sec = env_float("PGG2_MOONSHOT_RIDE_MIN_HOLD_SEC", 5.0)
+                panic_trail = env_float("PGG2_MOONSHOT_RIDE_PANIC_TRAIL", 0.30)
+                time_since_latch = (ts_ms - pos.moonshot_arm_ts) / 1000.0
+                if time_since_latch < min_hold_sec:
+                    # In min-hold window: only exit on extreme dump or migration.
+                    if mult <= peak * panic_trail:
+                        self.close_position(
+                            mint, ts_ms, price,
+                            f"moonshot_panic peak={peak:.2f} mult={mult:.2f}",
+                            features, killed=False,
+                        )
+                        return
+                    if features["complete"]:
+                        self.close_position(mint, ts_ms, price, "moonshot_migration_complete", features, killed=False)
+                        return
+                    return
+                if mult <= trail_floor:
+                    self.close_position(
+                        mint, ts_ms, price,
+                        f"moonshot_trail peak={peak:.2f} trail={trail_frac:.2f} mult={mult:.2f}",
+                        features, killed=False,
+                    )
+                    return
+                if features["complete"]:
+                    self.close_position(mint, ts_ms, price, "moonshot_migration_complete", features, killed=False)
+                    return
+                if age_sec >= hard_timeout:
+                    self.close_position(
+                        mint, ts_ms, price,
+                        f"moonshot_hard_timeout peak={peak:.2f}",
+                        features, killed=False,
+                    )
+                    return
+                # In moonshot mode: bypass all other exit checks, let the trade run.
+                return
+
         quote_loss_clamp = getattr(self.broker, "quote_loss_clamp_reason", None)
         if quote_loss_clamp and self.moonshot_lane(pos.lane):
             quote_action = quote_loss_clamp(pos, ts_ms)
             if quote_action:
-                if (
-                    quote_action == "quote_loss_clamp"
-                    and self.curve_lag_broad_quote_grace(pos, features, ts_ms)
-                ):
-                    return
                 self.close_position(
                     mint,
                     ts_ms,
@@ -3505,37 +3500,52 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if (
             pos.lane == "priced_snap"
             and pos.state in {"SCOUT", "SCALE1"}
+            and env_bool("PGG2_PEAK_LOCK_ENABLED", True)
         ):
-            if pos.state == "SCALE1":
-                protect_peak = env_float("PGG2_PRICED_SNAP_SCALE_PROTECT_PEAK", 1.25)
-                protect_min_mult = env_float("PGG2_PRICED_SNAP_SCALE_PROTECT_MIN_MULT", 1.10)
-                protect_trail = env_float("PGG2_PRICED_SNAP_SCALE_PROTECT_TRAIL", 0.90)
-                protect_reason = "priced_snap_scale_profit_protect"
+            # Phase 3 2026-05-08: PEAK-LOCK trailing stop — ratchets a profit floor
+            # upward as peak rises. Replaces the old scout_profit_protect / scale_profit_protect
+            # which had a "min_mult >= 1.08" gate that DIDN'T fire when peak retreated
+            # past that floor — so price could fall from 1.43x peak through 1.08 and
+            # only exit via hard_break at 0.92, becoming a loss despite hitting 1.43x.
+            # Phase 2B data: 67 scout_profit_protect trades exited at LOSS despite avg
+            # peak of 1.428x. PEAK-LOCK preserves capital once profit is seen.
+            #
+            # Edge cases handled:
+            # - Peak never reaches lock_low_peak: this block doesn't fire, hard_break catches
+            # - Peak reaches 1.18 then drops fast: floor = max(1.05, peak*0.92) = 1.085, exit there
+            # - Peak reaches 2.0 then drops: floor = max(1.30, 2.0*0.85) = 1.70, lock 70% profit
+            # - Peak reaches 1.30 then re-pumps to 1.50: peak_mult tracks max, floor ratchets up
+            # - mult fluctuates around floor: exit on first cross-below, no whipsaw re-entry
+            peak = pos.peak_mult
+            if peak >= env_float("PGG2_PEAK_LOCK_HIGH_PEAK", 1.60):
+                floor = max(
+                    env_float("PGG2_PEAK_LOCK_HIGH_FLOOR", 1.30),
+                    peak * env_float("PGG2_PEAK_LOCK_HIGH_TRAIL", 0.85),
+                )
+                lock_tier = "high"
+            elif peak >= env_float("PGG2_PEAK_LOCK_MID_PEAK", 1.30):
+                floor = max(
+                    env_float("PGG2_PEAK_LOCK_MID_FLOOR", 1.15),
+                    peak * env_float("PGG2_PEAK_LOCK_MID_TRAIL", 0.88),
+                )
+                lock_tier = "mid"
+            elif peak >= env_float("PGG2_PEAK_LOCK_LOW_PEAK", 1.18):
+                floor = max(
+                    env_float("PGG2_PEAK_LOCK_LOW_FLOOR", 1.05),
+                    peak * env_float("PGG2_PEAK_LOCK_LOW_TRAIL", 0.92),
+                )
+                lock_tier = "low"
             else:
-                protect_peak = env_float("PGG2_PRICED_SNAP_SCOUT_PROTECT_PEAK", 1.18)
-                protect_min_mult = env_float("PGG2_PRICED_SNAP_SCOUT_PROTECT_MIN_MULT", 1.08)
-                protect_trail = env_float("PGG2_PRICED_SNAP_SCOUT_PROTECT_TRAIL", 0.92)
-                protect_reason = "priced_snap_scout_profit_protect"
-            if (
-                pos.peak_mult >= protect_peak
-                and mult >= protect_min_mult
-                and mult <= pos.peak_mult * protect_trail
-            ):
-                self.close_position(mint, ts_ms, price, protect_reason, features, killed=False)
+                floor = 0.0  # no lock active — trade hasn't shown profit yet
+                lock_tier = ""
+            if floor > 0 and mult < floor:
+                state_tag = "scale" if pos.state == "SCALE1" else "scout"
+                reason = f"priced_snap_{state_tag}_peak_lock_{lock_tier}"
+                self.close_position(mint, ts_ms, price, reason, features, killed=False)
                 return
-
-        loss_cut = self.priced_snap_post_open_loss_cut_reason(pos, features, ts_ms)
-        if loss_cut:
-            self.close_position(mint, ts_ms, price, loss_cut, features, killed=True)
-            return
 
         kill = self.piggy_kill_reason(pos, features)
         if kill:
-            if (
-                self.priced_snap_strong_follow_hard_grace(pos, features, kill, ts_ms)
-                or self.priced_snap_delayed_runway_grace(pos, features, kill, ts_ms)
-            ):
-                return
             defer_paper_kill = getattr(self.broker, "defer_paper_kill_reason", None)
             if defer_paper_kill and defer_paper_kill(pos, kill, ts_ms):
                 return
@@ -3781,7 +3791,27 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 # PGG2: path tests on attack dry-live tapes showed priced_snap
                 # needs room for shallow dump-then-pump recoveries, but should
                 # not wait for the generic 0.88 rug stop on failed snaps.
-                return "kill_priced_snap_hard_break"
+                # Phase 3 2026-05-08: only fire hard_break when trade never showed
+                # profit (peak < PEAK-LOCK low tier 1.18). PEAK-LOCK takes over for
+                # trades that ratcheted up — analysis showed hard_break was -$23.46
+                # net because it fired on trades after they had peaked at 1.428x avg.
+                # Phase 5 2026-05-08: ALSO defer hard_break for the first N seconds
+                # if buyers are still actively adding (last_buy_age_ms <= window).
+                # Phase 4 dry data: 3 of 6 losses had post-exit peaks of 3.06x, 3.65x,
+                # and 3.82x — bot exited the dip at -$0.40 each, then mint pumped 3-4x.
+                # Buyer flow during that dip would have signaled "hold" if measured.
+                peak_floor = env_float("PGG2_HARD_BREAK_REQUIRE_PEAK_BELOW", 1.18)
+                if pos.peak_mult < peak_floor:
+                    grace_enabled = env_bool("PGG2_HARD_BREAK_GRACE_ENABLED", True)
+                    grace_sec = env_float("PGG2_HARD_BREAK_GRACE_SEC", 8.0)
+                    grace_buy_window_ms = env_int("PGG2_HARD_BREAK_GRACE_BUY_AGE_MS", 1500)
+                    if grace_enabled and age_sec < grace_sec:
+                        last_buy_ms = features.get("last_buy_age_ms", 999999)
+                        # Buyer activity within grace_buy_window means flow is alive,
+                        # the dip is just a pullback. Don't kill.
+                        if last_buy_ms is not None and last_buy_ms <= grace_buy_window_ms:
+                            return None
+                    return "kill_priced_snap_hard_break"
             if env_bool("PGG2_LAYERED_RISK_ENABLED", False):
                 if (
                     pos.lane == "priced_snap"
