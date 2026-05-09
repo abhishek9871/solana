@@ -91,6 +91,18 @@ export PGG2_BLOCK_MAX_TOP1500=0.50
 export PGG2_BLOCK_MIN_MOVE250=0.92
 export PGG2_BLOCK_MAX_SELL_RATIO_1500=0.50
 export PGG2_BLOCK_TOP700_SINGLE_BUYER=0.95
+# Phase 27 — chase-late blockers from 19:00-19:23 UTC dissection (W/L=2/13)
+# Losses had move700>1.30 OR move1500>1.25; wins had move <= 1.15
+export PGG2_BLOCK_MAX_MOVE700=1.30
+export PGG2_BLOCK_MAX_MOVE1500=1.25
+export PGG2_BLOCK_MAX_TOP700=0.55                   # tighter whale filter than the single-buyer one
+
+# Phase 28 — overnight dissection (152 trades, W/L=58/94, +$54): the bug is ENTRY
+# 66% of trades closed in <2s with 26% win rate. Trades >2s had 60%+ win rate.
+# Winners had buy/buyer ratio ~2 SOL (whale-led); losers ~1 SOL (retail clusters).
+# Winners came from fresher mints (median 3.5s vs losers 4.3s).
+export PGG2_BLOCK_MIN_BUY_PER_BUYER_700=1.5         # whale-led only (block retail clusters)
+export PGG2_BLOCK_MAX_AGE_MS=10000                  # Phase 29: was 6s, too tight; loosen to 10s
 
 # ============================================================================
 # PHASE 23 — DISABLE QUOTE_LOSS_CLAMP (DRY-LIVE ARTIFACT, not real loss)
@@ -185,16 +197,24 @@ export PGG2_DRY_LIVE_MODE=1
 export PIGGY_PAPER_TRADING=0
 export PGG2_LIVE_BROKER=direct_pump
 
-# Phase 21 re-assert (sourcing OG configs may have reset)
-export PGG2_PRICED_SNAP_ENABLED=1
-export PGG2_PRICED_BREAKOUT_ENABLED=1
+# Phase 29 — also disable priced_snap (3W/7L=30%, -$2.31)
+# It was firing BEFORE curve_lag_reveal in maybe_plan_strike order, stealing
+# matches from the better lane. Now only the proven winners fire.
+#   curve_lag_reveal: 52% W, +$40.66  ← KEEP
+#   raw_momentum:     39% W, +$31.59  ← KEEP
+#   priced_snap:      30% W,  -$2.31  ← DISABLE
+#   bounce_buy:       18% W,  -$3.09  ← DISABLE
+#   birth_fanout:     35% W,  -$3.68  ← DISABLE
+#   priced_breakout:   7% W, -$11.12  ← DISABLE
+export PGG2_PRICED_SNAP_ENABLED=0
+export PGG2_PRICED_BREAKOUT_ENABLED=0
 export PGG2_CURVE_LAG_REVEAL_ENABLED=1
 export PGG2_RAW_MOMENTUM_ENABLED=1
-export PGG2_BIRTH_FANOUT_ENABLED=1
+export PGG2_BIRTH_FANOUT_ENABLED=0
 export PGG2_ENGAGEMENT_DRIVEN_ENABLED=0
 export PGG2_ENGAGEMENT_POLL_STRIKE_ENABLED=0
 export PGG2_ENGAGEMENT_MANAGE_LOOP_ENABLED=0
-export PGG2_BOUNCE_BUY_ENABLED=1
+export PGG2_BOUNCE_BUY_ENABLED=0
 
 # Phase 21: re-enable OG bot's exit logic (moonshot rider + scale-out)
 # These are battle-tested for the OG fresh-mint lanes. Bounce_buy and the old
@@ -207,11 +227,12 @@ export PGG2_MIN_HOLD_ENABLED=1
 export PGG2_PEAK_LOCK_ENABLED=1
 
 # Phase 20G: bigger stake to make small wins meaningful — also lift broker cap
-export PIGGY_SCOUT_SOL=0.060
-export PIGGY_MAX_POSITION_SOL=0.060
+# Phase 27: smaller stake — bound max single-trade loss to ~$1 instead of ~$3
+export PIGGY_SCOUT_SOL=0.030
+export PIGGY_MAX_POSITION_SOL=0.030
 export PIGGY_PROBE_SOL=0.060
 export PIGGY_MAX_OPEN=5
-export PGG2_LIVE_MAX_TRADE_SOL=0.060
+export PGG2_LIVE_MAX_TRADE_SOL=0.030
 export PGG2_LIVE_MIN_TRADE_SOL=0.030
 
 # Strip overfit blocks (won't matter for engagement lane but tidy)
@@ -259,11 +280,11 @@ export PGG2_LIVE_BIRTH_FANOUT_NO_FOLLOW_SEC=10.0    # birth_fanout was killing a
 # Phase 25 dissection: curve_lag_reveal 3/3 (100%) +$15.42, others bleeding.
 # Bias capital toward proven lane; tighten exit so small peaks don't trail-close.
 export PGG2_PHASE25_UNIVERSAL_EXIT_ENABLED=1
-export PGG2_PHASE25_STOP_MULT=0.95              # -5% real price stop
-export PGG2_PHASE25_CATASTROPHIC_MULT=0.60      # -40% rug guard
-export PGG2_PHASE25_TRAIL_ARM_PEAK=1.15         # only trail real pumps (was 1.08 — fired on noise)
-export PGG2_PHASE25_TRAIL_DROP=0.88             # 12% drop from peak (was 6% — too tight)
-export PGG2_PHASE25_MIN_HOLD_SEC=4.0            # 4s settle window
+export PGG2_PHASE25_STOP_MULT=0.96              # Phase 29: -4% real stop (was -5%; tighter loss bound)
+export PGG2_PHASE25_CATASTROPHIC_MULT=0.70      # Phase 27: tighter rug guard (was -40%, now -30%)
+export PGG2_PHASE25_TRAIL_ARM_PEAK=1.10         # Phase 29: arm at +10% (was 1.15) — catch medium peaks
+export PGG2_PHASE25_TRAIL_DROP=0.92             # Phase 29: 8% drop from peak — bank earlier (was 12%)
+export PGG2_PHASE25_MIN_HOLD_SEC=2.5            # Phase 29: 2.5s (was 1.5s) — let real moves develop past noise
 export PGG2_PHASE25_TIMEBOX_SEC=60.0
 export PGG2_PHASE25_TIMEBOX_MIN_MULT=1.02
 

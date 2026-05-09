@@ -3187,6 +3187,10 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         - sell_ratio_1500 > 0.30 = sells dominating buys (toxic flow)
         - uniq700 < 2 + top700 = 1.0 = single-buyer pump artifact
 
+        Phase 27 2026-05-09 additions from 19:00-19:23 UTC dissection (W/L=2/13):
+        - move700 > 1.30 was in losses (chase), wins had move700 <= 1.20
+        - move1500 > 1.25 was in losses (chase deep), wins had <= 1.15
+
         These run AHEAD of every lane probe so we don't even consider entries
         with terminal-loss features.
         """
@@ -3195,6 +3199,34 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         top_share1500 = float(features.get("top_share1500") or 0.0)
         if top_share1500 > max_top1500:
             return f"top1500={top_share1500:.2f}>{max_top1500:.2f}"
+        # Phase 27: chase late filter — high recent move = price already at peak
+        max_move700 = env_float("PGG2_BLOCK_MAX_MOVE700", 1.30)
+        move700 = float(features.get("move700") or 1.0)
+        if max_move700 > 0 and move700 > max_move700:
+            return f"chase_move700={move700:.2f}>{max_move700:.2f}"
+        # Phase 28: whale-led buy filter — winners had ~2 SOL/buyer, losers ~1 SOL/buyer.
+        # Retail-cluster buys are floors that collapse; whale-led buys carry the move.
+        min_buy_per_buyer = env_float("PGG2_BLOCK_MIN_BUY_PER_BUYER_700", 1.5)
+        buy700 = float(features.get("buy700") or 0.0)
+        uniq700 = int(features.get("uniq700") or 0)
+        if min_buy_per_buyer > 0 and uniq700 >= 1:
+            avg_buy = buy700 / max(uniq700, 1)
+            if avg_buy < min_buy_per_buyer:
+                return f"retail_cluster avg_buy_700={avg_buy:.2f}<{min_buy_per_buyer:.2f}"
+        # Phase 28: fresh-mint age cap — winners median 3.5s, losers 4.3s mint age
+        max_age_ms = env_int("PGG2_BLOCK_MAX_AGE_MS", 6000)
+        age_ms = int(features.get("age_ms") or 0)
+        if max_age_ms > 0 and age_ms > max_age_ms:
+            return f"stale_mint age={age_ms}ms>{max_age_ms}ms"
+        max_move1500 = env_float("PGG2_BLOCK_MAX_MOVE1500", 1.25)
+        move1500 = float(features.get("move1500") or 1.0)
+        if max_move1500 > 0 and move1500 > max_move1500:
+            return f"chase_move1500={move1500:.2f}>{max_move1500:.2f}"
+        # Phase 27: high whale concentration in 700ms (single buyer pumping)
+        max_top700 = env_float("PGG2_BLOCK_MAX_TOP700", 0.55)
+        top700 = float(features.get("top_share700") or 0.0)
+        if max_top700 > 0 and top700 > max_top700:
+            return f"top700={top700:.2f}>{max_top700:.2f}"
         # Already dumping in last 250ms (caught the top)
         min_move250 = env_float("PGG2_BLOCK_MIN_MOVE250", 0.92)
         move250 = float(features.get("move250") or 1.0)
