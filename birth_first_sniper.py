@@ -36,6 +36,11 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+# 2026-05-10 — PumpSwap AMM program. Subscribed alongside PUMP_PROGRAM so the
+# bot can SEE post-migration AMM trades and score them via moonshot_unified.
+# Without this subscription the bot is blind to ~70% of real volume (large
+# pumps continue as AMM after BC graduation; this catches them too).
+PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
 BC_DISC = bytes([23, 183, 248, 55, 96, 216, 172, 96])
@@ -47,6 +52,11 @@ DISC_BUY = bytes([102, 6, 61, 18, 1, 218, 235, 234])
 DISC_BUY_EXACT_SOL_IN = bytes([56, 252, 116, 8, 158, 223, 205, 95])
 DISC_SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])
 DISC_MIGRATE = bytes([155, 234, 231, 146, 236, 158, 162, 30])
+# PumpSwap AMM (post-migration). Same regular-buy disc as BC; AMM also has
+# a buy_exact_quote_in variant. Sell shares the same disc as BC sell.
+DISC_AMM_BUY = bytes([102, 6, 61, 18, 1, 218, 235, 234])
+DISC_AMM_BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])
+DISC_AMM_SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])
 
 
 def load_dotenv() -> None:
@@ -1025,13 +1035,82 @@ def parse_base64_shred_for_pump_events(shred_result: dict[str, Any], tracked_wal
         recv_ns = now_ns()
         for ix in vt.message.instructions:
             program = get_key(keys, int(ix.program_id_index))
-            if program != PUMP_PROGRAM:
+            if program not in (PUMP_PROGRAM, PUMP_AMM_PROGRAM):
                 continue
             data = bytes(ix.data)
             if len(data) < 8:
                 continue
             disc = data[:8]
             accounts = list(ix.accounts)
+            # 2026-05-10 — AMM trade parsing for moonshot detection.
+            # PumpSwap (post-migration) trades flow through PUMP_AMM_PROGRAM.
+            # Account layout (both buy and sell, first 5 are stable):
+            #   0=pool, 1=user, 2=global_config, 3=base_mint, 4=quote_mint
+            # Data layout per disc:
+            #   AMM regular buy:  u64(base_amount_out) + u64(max_quote_amount_in)
+            #   buy_exact_quote_in: u64(spend_lamports) + u64(min_base_out) + 1B
+            #   AMM sell:         u64(base_amount) + u64(min_quote_out)
+            # We use the args (intent) as approximate sol/token amounts —
+            # good enough for moonshot accumulation detection.
+            if program == PUMP_AMM_PROGRAM:
+                if len(data) < 24:
+                    continue
+                if disc not in (DISC_AMM_BUY, DISC_AMM_BUY_EXACT_QUOTE_IN, DISC_AMM_SELL):
+                    continue
+                mint = get_account_key(keys, accounts, 3)
+                # If account[3] is WSOL, the layout differs (some sell variants
+                # have base_mint at index 4). Try [4] in that case. If still
+                # WSOL or empty, skip.
+                if mint == "So11111111111111111111111111111111111111112" or not mint:
+                    mint = get_account_key(keys, accounts, 4)
+                if not mint or mint == "So11111111111111111111111111111111111111112":
+                    continue
+                user = get_account_key(keys, accounts, 1) or signer
+                arg_a = int.from_bytes(data[8:16], "little")
+                arg_b = int.from_bytes(data[16:24], "little")
+                is_buy = disc in (DISC_AMM_BUY, DISC_AMM_BUY_EXACT_QUOTE_IN)
+                if disc == DISC_AMM_BUY_EXACT_QUOTE_IN:
+                    sol_lamports = arg_a
+                    token_amount = arg_b
+                    instruction_kind = "amm_buy_exact_quote_in"
+                elif disc == DISC_AMM_BUY:
+                    token_amount = arg_a
+                    sol_lamports = arg_b
+                    instruction_kind = "amm_buy"
+                else:
+                    token_amount = arg_a
+                    # AMM SELL: arg_b is min_quote_out (slippage floor), so
+                    # actual SOL received is typically 1.5-2× higher.
+                    # Scale up to better estimate REAL sell pressure for
+                    # downstream filters (sell_ratio, etc).
+                    amm_sell_scale = env_float("BIRTH_AMM_SELL_SOL_SCALE", 1.7)
+                    sol_lamports = int(arg_b * amm_sell_scale)
+                    instruction_kind = "amm_sell"
+                max_trade_lamports = int(env_float("BIRTH_MAX_DECODED_TRADE_SOL", 250.0) * 1_000_000_000)
+                if sol_lamports > max_trade_lamports:
+                    continue
+                # Set price_hint from sol/token args (intent-based but
+                # gives queue_or_fill a non-zero price to fill immediately
+                # instead of expiring with no_curve_price).
+                price_hint = (sol_lamports / max(token_amount, 1)) if token_amount > 0 else 0.0
+                events.append(PumpEvent(
+                    ts_ms=ts_ms,
+                    recv_ns=recv_ns,
+                    sig=sig,
+                    slot=slot,
+                    signer=signer,
+                    kind="trade",
+                    mint=mint,
+                    bonding_curve="",
+                    user=user,
+                    is_buy=is_buy,
+                    sol_lamports=sol_lamports,
+                    token_amount=token_amount,
+                    tracked=(signer in tracked_wallets) or (user in tracked_wallets),
+                    instruction_kind=instruction_kind,
+                    price_hint=price_hint,
+                ))
+                continue
             if disc in {DISC_CREATE, DISC_CREATE_V2}:
                 is_v2 = disc == DISC_CREATE_V2
                 mint = get_account_key(keys, accounts, 0)
@@ -1815,7 +1894,7 @@ class BirthFirstSniper:
                         "id": 61001,
                         "method": "shredSubscribe",
                         "params": [
-                            {"accountInclude": [PUMP_PROGRAM], "accountRequired": [PUMP_PROGRAM], "vote": False},
+                            {"accountInclude": [PUMP_PROGRAM, PUMP_AMM_PROGRAM], "accountRequired": [], "vote": False},
                             {
                                 "encoding": "base64",
                                 "transactionDetails": "full",

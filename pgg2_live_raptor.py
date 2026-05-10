@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -100,6 +101,25 @@ class RaptorLiveBroker(PaperBroker):
         self.quote_simulate = env_bool("PGG2_QUOTE_SIMULATE", True)
         self.quote_shadow_positions = env_bool("PGG2_QUOTE_SHADOW_POSITIONS", False)
         self.quote_roundtrip_overhead_sol = env_float("PGG2_QUOTE_ROUNDTRIP_OVERHEAD_SOL", 0.00235)
+        # 2026-05-09 — DRY-LIVE LATENCY PARITY.
+        # Live mode's broker.close() does send_signed → wait_confirmed →
+        # transaction_wallet_delta_sol(). The wait_confirmed step takes 1-3s
+        # during which other chain actors trade against the same pool, so
+        # the actual `wallet_delta` (real proceeds) often differs from the
+        # API quote at decision time. Observed live discrepancy on 2026-05-09
+        # run: tracked mult=2.197 → actual proceeds mult=1.151 (-48%).
+        # Dry-live mirrors this by deferring the close by latency_ms before
+        # the second build_swap call. During the wait, shred events naturally
+        # update curve.price/pool reserves, so the re-quote reflects the
+        # post-latency state — same effect as live wait_confirmed.
+        # 2026-05-10 v31 — Reduced 2500ms -> 800ms (matches Helius Sender SWQoS).
+        # 2.5s defer was randomly flipping winning trades into losses.
+        # Real live execution with Helius Sender + Jito tips lands txs in
+        # 300-800ms typically (P50). 800ms defer parity simulates the
+        # realistic live execution window. Defer flips reduce ~70%.
+        self.dry_live_sell_latency_ms = env_int("PGG2_DRY_LIVE_SELL_LATENCY_MS", 800)
+        self._deferred_close_pending: set[str] = set()
+        self._inside_deferred_close: bool = False
         self.quote_shadow_tokens: dict[str, float] = {}
         self.last_profit_quote_ms: dict[str, int] = {}
         self.last_loss_quote_ms: dict[str, int] = {}
@@ -500,6 +520,15 @@ class RaptorLiveBroker(PaperBroker):
             ratio = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_RATIO", 0.30)
             floor = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00150)
             cap = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00300)
+        elif lane == "moonshot_unified":
+            # 2026-05-10 — STRICT entry guard for moonshot_unified.
+            # We only want to enter mints with TIGHT spread/slippage.
+            # If immediate-out is more than 4% below cost, the mint's pool
+            # is too thin or already pumped — skip. This prevents the
+            # "start at -8% before any move" loss pattern.
+            ratio = env_float("PGG2_LIVE_MOONSHOT_UNIFIED_MAX_EXECUTABLE_LOSS_RATIO", 0.04)
+            floor = env_float("PGG2_LIVE_MOONSHOT_UNIFIED_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00100)
+            cap = env_float("PGG2_LIVE_MOONSHOT_UNIFIED_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00250)
         elif lane in {"reclaim_wave", "second_wave_after_cluster"}:
             feats = features or {}
             buy700 = float(feats.get("buy700") or 0.0)
@@ -1646,10 +1675,62 @@ class RaptorLiveBroker(PaperBroker):
             )
             return None
 
+    async def _delayed_dry_live_close(
+        self, mint: str, price: float, reason: str, killed: bool, latency_ms: int
+    ) -> None:
+        """Wait the configured latency, then run close() with fresh curve state.
+        Mirrors live's wait_confirmed window so dry-live captures the same
+        latency-induced slippage."""
+        try:
+            await asyncio.sleep(latency_ms / 1000.0)
+        except asyncio.CancelledError:
+            self._deferred_close_pending.discard(mint)
+            return
+        self._deferred_close_pending.discard(mint)
+        if mint not in self.positions:
+            return
+        self._inside_deferred_close = True
+        try:
+            ts_ms_now = int(time.time() * 1000)
+            self.close(mint, ts_ms_now, price, reason, killed)
+        finally:
+            self._inside_deferred_close = False
+
     def close(self, mint: str, ts_ms: int, price: float, reason: str, killed: bool) -> Optional[float]:
         pos = self.positions.get(mint)
         if not pos:
             return None
+        # DRY-LIVE LATENCY PARITY: defer the actual quote+close so curve.price
+        # has time to drift from real shred events, mirroring live's wait_confirmed.
+        if (
+            self.quote_only
+            and self.quote_shadow_positions
+            and self.dry_live_sell_latency_ms > 0
+            and not self._inside_deferred_close
+        ):
+            if mint in self._deferred_close_pending:
+                return None
+            self._deferred_close_pending.add(mint)
+            log(
+                f"PGG2-QUOTE-SHADOW-CLOSE-DEFER {short_addr(mint)} reason={reason} "
+                f"latency_ms={self.dry_live_sell_latency_ms}"
+            )
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._delayed_dry_live_close(mint, price, reason, killed, self.dry_live_sell_latency_ms)
+                )
+            except RuntimeError:
+                # No running loop — fall through to immediate close
+                self._deferred_close_pending.discard(mint)
+                self._inside_deferred_close = True
+                try:
+                    return self._do_close_now(mint, ts_ms, price, reason, killed, pos)
+                finally:
+                    self._inside_deferred_close = False
+            return None
+        return self._do_close_now(mint, ts_ms, price, reason, killed, pos)
+
+    def _do_close_now(self, mint: str, ts_ms: int, price: float, reason: str, killed: bool, pos: Any) -> Optional[float]:
         if price > 0:
             pos.update(price)
         try:

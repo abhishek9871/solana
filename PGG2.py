@@ -29,6 +29,7 @@ from birth_first_sniper import (
     BirthFirstSniper,
     CurvePoint,
     PumpEvent,
+    SOL_MINT,
     StrikePlan,
     asdict,
     env_bool,
@@ -211,6 +212,8 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         self.consecutive_wins: int = 0
         self.preprice_reveal_seen: set[str] = set()
         self.priced_snap_seen: set[str] = set()
+        # 2026-05-10 — moonshot_unified lane state
+        self.moonshot_unified_seen: set[str] = set()
         self.priced_breakout_watch: dict[str, dict[str, Any]] = {}
         self.priced_breakout_seen: set[str] = set()
         self.late_swarm_seen: set[str] = set()
@@ -944,13 +947,21 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         return features
 
     async def on_event(self, event: PumpEvent) -> None:
-        if event.kind == "trade" and event.price_hint > 0 and env_bool("PGG2_USE_PRICE_HINTS", False):
-            # Off by default. buy_exact_sol_in carries a min-out style token
-            # field on many pump.fun transactions, so treating it as executed
-            # token amount creates fake trillion-x price moves. Only enable this
-            # manually for controlled parser tests.
-            tape = self.tape_for(event.mint)
-            tape.add_price(event.ts_ms, event.price_hint, self.config.max_tape_age_sec)
+        if event.kind == "trade" and event.price_hint > 0:
+            # AMM mints have NO BC curve. We feed price_hint so the tape has
+            # a non-zero last_price → features["price"] > 0 → queue_or_fill
+            # opens the position immediately instead of expiring on
+            # no_curve_price. Enabled by default for AMM only.
+            # BC mints: keep this OFF (price_hint is intent, causes phantom
+            # peaks per 2026-05-09 bug investigation).
+            is_amm = (event.instruction_kind or "").startswith("amm_")
+            should_feed = (
+                (is_amm and env_bool("PGG2_USE_PRICE_HINTS_AMM", True))
+                or ((not is_amm) and env_bool("PGG2_USE_PRICE_HINTS", False))
+            )
+            if should_feed:
+                tape = self.tape_for(event.mint)
+                tape.add_price(event.ts_ms, event.price_hint, self.config.max_tape_age_sec)
         await super().on_event(event)
 
     @staticmethod
@@ -1579,6 +1590,380 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if self.circuit_breaker_until_ts and event.ts_ms < self.circuit_breaker_until_ts:
             return False
         return True
+
+    def _moonshot_diag_maybe_log(self) -> None:
+        """Log diagnostic counters every N checks so we can see what's blocking."""
+        d = getattr(self, "_moonshot_diag", None)
+        if not d:
+            return
+        n = d["checks"]
+        every = env_int("PGG2_MOONSHOT_UNIFIED_DIAG_EVERY", 200)
+        if n % every == 0:
+            log(
+                f"PGG2-MOONSHOT-DIAG checks={d['checks']} fired={d['fired']} "
+                f"rej_buy={d['rej_buy']} rej_buyers={d['rej_buyers']} "
+                f"rej_top={d['rej_top']} rej_sell={d['rej_sell']} "
+                f"rej_age={d['rej_age']} rej_recent={d['rej_recent']} "
+                f"rej_v30={d['rej_velocity']} rej_v15={d.get('rej_v15', 0)} "
+                f"rej_v5={d.get('rej_v5', 0)} rej_score={d['rej_score']}"
+            )
+
+    def moonshot_unified_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
+        """Moonshot accumulation detector (2026-05-10 v2).
+
+        v2: Uses 60s primary window (pumps build over minutes, not 15s).
+        Lowered thresholds based on real data — typical pump has ~10-30 unique
+        buyers and 5-20 SOL accumulated in any 60s slice. The 15s and 5s
+        sub-windows confirm momentum/recency.
+        """
+        if not env_bool("PGG2_MOONSHOT_UNIFIED_ENABLED", True):
+            return None
+        if not event.is_buy or event.mint in self.moonshot_unified_seen:
+            return None
+        tape = self.tapes.get(event.mint)
+        if not tape:
+            return None
+        ts_ms = event.ts_ms
+
+        # Wider windows. Pumps build over 1-3 minutes typically.
+        s5 = tape.stats(5000, ts_ms)
+        s15 = tape.stats(15000, ts_ms)
+        s30 = tape.stats(30000, ts_ms)
+        s60 = tape.stats(60000, ts_ms)
+
+        cum_buy_60 = s60.buy_sol
+        unique_buyers_60 = s60.unique_buyers
+        top_share_60 = s60.top_buy_share
+        sell_ratio_60 = s60.sell_sol / max(s60.buy_sol, 0.01)
+        recent_buys_5s = s5.buys
+        cum_buy_15 = s15.buy_sol
+        unique_buyers_15 = s15.unique_buyers
+
+        # 2026-05-10 v25 — MOONSHOT-MISSED detector. Whenever a mint's 60s
+        # window shows >=1.5x price growth and we have NOT fired on it yet,
+        # log full features so we can see exactly what real winners look
+        # like in the wild. This is empirical evidence of what filters we
+        # should loosen / tighten / add. Logs once per mint per session.
+        if not hasattr(self, "_missed_moonshot_logged"):
+            self._missed_moonshot_logged = set()
+        if event.mint not in self._missed_moonshot_logged:
+            first_price_60 = s60.first_price if s60.first_price > 0 else 0.0
+            current_price = float(features.get("price") or 0.0)
+            if first_price_60 > 0 and current_price > 0:
+                mult_60s = current_price / first_price_60
+                if mult_60s >= 1.5:
+                    self._missed_moonshot_logged.add(event.mint)
+                    s1_local = tape.stats(1000, ts_ms)
+                    accel_ratio = cum_buy_15 / max(cum_buy_60, 0.001)
+                    velocity_30s_local = 1.0
+                    fp30 = s30.first_price if s30.first_price > 0 else 0.0
+                    if fp30 > 0 and current_price > 0:
+                        velocity_30s_local = current_price / fp30
+                    fill_local = float(getattr(event, "price_hint", 0.0) or 0.0)
+                    log(
+                        f"PGG2-MOONSHOT-MISSED mint={event.mint[:8]} "
+                        f"mult60s={mult_60s:.2f} cum60={cum_buy_60:.1f} "
+                        f"buyers60={unique_buyers_60} top60={top_share_60:.2f} "
+                        f"sr60={sell_ratio_60:.2f} v30={velocity_30s_local:.3f} "
+                        f"accel={accel_ratio:.2f} s5_buys={int(s5.buys)} "
+                        f"s5_sells={int(s5.sells)} s1_buys={int(s1_local.buys)} "
+                        f"fill={fill_local:.2e} "
+                        f"last_buy_age_ms={features.get('last_buy_age_ms', -1)}"
+                    )
+
+        # Hard pre-filters — bail fast.
+        # Numbers calibrated from May-10 dry-live data: top-volume mints
+        # (J55K2cLf 70 SOL, Bjm2LEoa 65 SOL) had 5-8 buyers per 60s window.
+        # 2026-05-10 v31 — Loosened 0.5 -> 0.1. MOONSHOT-MISSED data:
+        # 4XgbFCA6 (2.35x), 8YYrngjc (1.71x), VX84kGyL (1.67x), CQBDkksA
+        # (2.65x) all had cum<0.5 SOL — small early pumps that surged.
+        # The velocity gates (v30, v15, v5) + acceleration filter keep
+        # low-quality noise out without needing a high cum_buy floor.
+        min_cum_buy_60 = env_float("PGG2_MOONSHOT_UNIFIED_MIN_BUY_SOL_60S", 0.1)
+        # 2026-05-10 v16 — Tightened buyers from 2 → 8.
+        # Wins like Criq had broad crowd (10+ buyers).
+        # Losses like 6EQK score 87 had ~3-5 buyers (fake-crowd whale-led).
+        # Real moonshots = MANY buyers, not just one big SOL.
+        # 2026-05-10 v33 — RADICAL SIMPLIFICATION. Matching MOONSHOT-MISSED
+        # detector criteria. Real moonshots can have 1-2 buyers (GSGRuTVw
+        # 9.29x with 2 buyers). Lower min to 1. Velocity is the truth filter.
+        min_buyers_60 = env_int("PGG2_MOONSHOT_UNIFIED_MIN_BUYERS_60S", 1)
+        min_recent_5s = env_int("PGG2_MOONSHOT_UNIFIED_MIN_RECENT_BUYS_5S", 1)
+        # Loosened to 0.85 — diag showed 64% of events rejected at 0.65.
+        # AMM moonshots often have whale-led pumps (1 wallet buys big).
+        # Risk managed via tight exits: stop at 0.96, peak_lock at 0.985.
+        # 2026-05-10 v33 — Loosened 0.85 -> 0.99. The MISSED detector doesn't
+        # care about top_share. Real moonshots can be 100% top-share early
+        # (single buyer kicking off a pump). Trust velocity instead.
+        max_top_share = env_float("PGG2_MOONSHOT_UNIFIED_MAX_TOP_SHARE", 0.99)
+        # Tightened to 0.30 — with sell_ratio > 0.30, the failing trades
+        # had buyers being absorbed by sellers. Buyers must clearly dominate.
+        # 2026-05-10 v25 — Loosened 0.30 -> 1.5. The 0.30 cap was rejecting
+        # 51% of all candidates (rej_sell=2591/5000 in 5min). MOONSHOT-MISSED
+        # showed multiple real winners with sr60 > 0.30: DsBS3BuC sr=0.86
+        # (9.28x), 6EQKNJD6 sr=0.89 (1.55x). The 60s ratio is too coarse —
+        # post-pump consolidation produces high sr60 even on real winners.
+        # The 5s sell-count filter (max_5s_sells_count=1) catches active
+        # dumping; this filter is for chronic dumping (sr > 1.5 = sells
+        # exceed buys 60s window by 50%).
+        max_sell_ratio = env_float("PGG2_MOONSHOT_UNIFIED_MAX_SELL_RATIO", 1.5)
+        # Tightened to 300ms — most losses had stale signals (buy 1-3s ago,
+        # then activity died). Require buying RIGHT NOW.
+        max_last_buy_age_ms = env_int("PGG2_MOONSHOT_UNIFIED_MAX_LAST_BUY_AGE_MS", 300)
+        # 2026-05-10 v18 — MAX FILL PRICE filter (the missing signal).
+        # Data: ALL 5 main wins had fill 4-8e-5 (cheap fresh mints).
+        # All 5 main losses had fill 3.35e-4 to 3.05e-2 (expensive established).
+        # Threshold 1.5e-4 sits in the gap → catches winners, rejects losers.
+        # 2026-05-10 v31 — Re-loosened 1.5e-4 -> 5e-3. The previous high-fill
+        # losses (GQcN 6e-4, 2cLX 1.8e-3) all had v5<=v15 (decelerating).
+        # The new acceleration gate (v5>v15*1.005) blocks those without
+        # blocking high-fill ACTIVELY-PUMPING mints. MOONSHOT-MISSED data:
+        # BwjyE65k (2.84x, fill 8.3e-4), GSGRuTVw (9.29x, fill 8.7e-4),
+        # 7i1GWQaw (1.80x, fill 2.4e-3), H2PRkwsB (2.98x, fill 3.8e-3),
+        # FS6hF7mN (2.37x, fill 5.4e-3) — all real winners blocked by 1.5e-4.
+        max_fill_price = env_float("PGG2_MOONSHOT_UNIFIED_MAX_FILL_PRICE", 5.0e-3)
+        # ACCELERATION filter — the win/loss discriminator from May-10 data.
+        # WINS (D7Jt, 9z22, iVic) had volume ACCELERATING — most buyers in
+        # the last 15s relative to 60s. LOSSES (J55K 829 SOL, etc.) had
+        # decelerating volume — pump was old, exhausted, about to reverse.
+        # Require buy_15s / buy_60s > 0.30 (uniform pace would be 15/60=0.25;
+        # require above-uniform = accelerating).
+        # 2026-05-10 v33 — DISABLED accel filters. The MISSED detector doesn't
+        # check accel; using 0.0 effectively disables. Velocity is truth.
+        min_accel_ratio = env_float("PGG2_MOONSHOT_UNIFIED_MIN_ACCEL_RATIO", 0.0)
+        min_buyers_accel = env_float("PGG2_MOONSHOT_UNIFIED_MIN_BUYERS_ACCEL", 0.0)
+
+        # Diagnostic counter — every N events, log what's blocking
+        if not hasattr(self, "_moonshot_diag"):
+            self._moonshot_diag = {"checks": 0, "rej_buy": 0, "rej_buyers": 0,
+                                   "rej_top": 0, "rej_sell": 0, "rej_age": 0,
+                                   "rej_velocity": 0, "rej_recent": 0,
+                                   "rej_score": 0, "fired": 0}
+        self._moonshot_diag["checks"] += 1
+
+        if cum_buy_60 < min_cum_buy_60:
+            self._moonshot_diag["rej_buy"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        if unique_buyers_60 < min_buyers_60:
+            self._moonshot_diag["rej_buyers"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        if top_share_60 > max_top_share:
+            self._moonshot_diag["rej_top"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        if sell_ratio_60 > max_sell_ratio:
+            self._moonshot_diag["rej_sell"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        if features.get("last_buy_age_ms", 99999) > max_last_buy_age_ms:
+            self._moonshot_diag["rej_age"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        # 2026-05-10 v18 — MAX FILL PRICE check.
+        # Use event.price_hint as the per-token price estimate for the latest
+        # buy. If the mint is too "expensive" (high price per token), it's an
+        # established mint with limited upside. Data: 5/6 wins fill <= 1e-4,
+        # 5/6 losses fill > 3e-4. Threshold 1.5e-4 splits cleanly.
+        # Fallback: if price_hint not set, allow through (BC mints have
+        # curve_price tracking; only AMM intent-based hints are unreliable).
+        event_fill = float(getattr(event, "price_hint", 0.0) or 0.0)
+        if max_fill_price > 0 and event_fill > 0 and event_fill > max_fill_price:
+            self._moonshot_diag.setdefault("rej_expensive", 0)
+            self._moonshot_diag["rej_expensive"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        if recent_buys_5s < min_recent_5s:
+            self._moonshot_diag["rej_recent"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+
+        # ACCELERATION GATE — only enter if pump is BUILDING, not exhausting.
+        # Prevents catching J55K-style "old pumps" (829 SOL accumulated over
+        # minutes, about to reverse) that produce big losses.
+        accel_ratio = cum_buy_15 / max(cum_buy_60, 0.001)
+        buyers_accel = unique_buyers_15 / max(unique_buyers_60, 1)
+        if accel_ratio < min_accel_ratio:
+            self._moonshot_diag.setdefault("rej_accel", 0)
+            self._moonshot_diag["rej_accel"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        if buyers_accel < min_buyers_accel:
+            self._moonshot_diag.setdefault("rej_buyers_accel", 0)
+            self._moonshot_diag["rej_buyers_accel"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+
+        # 5s NET-FLOW gate — buys must DOMINATE sells in the immediate 5s
+        # window. If sellers are dumping right now, skip the entry.
+        s5_buy_sol = float(s5.buy_sol)
+        s5_sell_sol = float(s5.sell_sol)
+        min_5s_net_ratio = env_float("PGG2_MOONSHOT_UNIFIED_MIN_5S_NET_RATIO", 2.0)
+        if s5_sell_sol > 0 and s5_buy_sol < s5_sell_sol * min_5s_net_ratio:
+            self._moonshot_diag.setdefault("rej_5s_flow", 0)
+            self._moonshot_diag["rej_5s_flow"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+
+        # 2026-05-10 v12 — 1s LIVE-BUYING gate.
+        # Even with 5s flow filter, mints that "flickered" 2-4 seconds ago
+        # then died still pass. Require ACTIVE buyers in last 1 second.
+        s1 = tape.stats(1000, ts_ms)
+        min_1s_buys = env_int("PGG2_MOONSHOT_UNIFIED_MIN_1S_BUYS", 2)
+        if int(s1.buys) < min_1s_buys:
+            self._moonshot_diag.setdefault("rej_1s_dead", 0)
+            self._moonshot_diag["rej_1s_dead"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+
+        # 2026-05-10 v11 — COUNT-BASED SELL FILTER (the hidden bug).
+        # AMM SELL events have sol_lamports = min_quote_out (intent),
+        # not actual sell amount. So sell_sol is UNDER-REPORTED.
+        # Counts are always accurate. Require:
+        # - buy COUNT in 5s >= 2× sell COUNT in 5s
+        # - sell COUNT in 5s <= 1 (essentially no sells)
+        # This catches the hidden-sell-pressure mints that produce losses.
+        s5_buys_count = int(s5.buys)
+        s5_sells_count = int(s5.sells)
+        # 2026-05-10 v32 — REMOVED absolute 5s sells count cap. 8Kb5HbFz
+        # (1.70x winner) had s5b=29 s5s=4 — the buy:sell ratio of 7.25:1
+        # is healthy, but absolute count of 4 was being blocked. The
+        # buy:sell COUNT RATIO filter alone (3x buys vs sells) catches
+        # real dump pressure. Set max to 999 (effectively disabled).
+        max_5s_sells_count = env_int("PGG2_MOONSHOT_UNIFIED_MAX_5S_SELLS_COUNT", 999)
+        min_5s_buy_to_sell_count = env_float("PGG2_MOONSHOT_UNIFIED_MIN_5S_BUY_SELL_COUNT_RATIO", 3.0)
+        if s5_sells_count > max_5s_sells_count:
+            self._moonshot_diag.setdefault("rej_5s_sells_count", 0)
+            self._moonshot_diag["rej_5s_sells_count"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        if s5_sells_count > 0 and s5_buys_count < s5_sells_count * min_5s_buy_to_sell_count:
+            self._moonshot_diag.setdefault("rej_5s_count_ratio", 0)
+            self._moonshot_diag["rej_5s_count_ratio"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+
+        # Price velocity: STRICTLY require uptrend, even when price tracking
+        # is zero. LYEr 92.9 lost because v30=1.0 (FLAT) passed due to
+        # price_now==0 bypass. Real moonshots have v30 > 1.005 (price up
+        # at least 0.5% in 30s). Flat-price mints with high score = trap
+        # (buyers absorbed by sellers).
+        price_now = float(features.get("price") or 0.0)
+        first_price_30s = s30.first_price if s30.first_price > 0 else price_now
+        velocity_30s = (price_now / first_price_30s) if (first_price_30s > 0 and price_now > 0) else 1.0
+        # 2026-05-10 v25 — Tightened 1.005 -> 1.10. MOONSHOT-MISSED showed
+        # ALL real winners had v30 >= 1.31; ALL flat-price losers (6mpP,
+        # LYEr) had v30 ~ 1.0. The 0.5%-in-30s threshold was too lenient.
+        # Real moonshots show meaningful price progression — require 10%+
+        # in 30s as the trustworthy uptrend signal. Velocity is the real
+        # discriminator that score+features cannot replace.
+        # 2026-05-10 v34 — Lowered 1.10 -> 1.05. The MISSED detector identifies
+        # winners with mult60s >= 1.5, but many have v30 < 1.10 because their
+        # peak was 30-60s ago. Capture more by lowering momentum threshold.
+        # Position size 0.030 caps loss exposure.
+        min_velocity_30s = env_float("PGG2_MOONSHOT_UNIFIED_MIN_VELOCITY_30S", 1.05)
+        # Strict: even if price tracking is zero, we require demonstrable
+        # velocity from tape's price history. If we can't compute velocity,
+        # skip the trade (no signal of actual upward movement).
+        if velocity_30s < min_velocity_30s:
+            self._moonshot_diag["rej_velocity"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+
+        # 2026-05-10 v33 — RADICAL SIMPLIFICATION.
+        # The MOONSHOT-MISSED detector uses a SINGLE check (mult60s >= 1.5x)
+        # and successfully identifies real moonshots. My filter has been
+        # over-gated with 6+ velocity/freshness/late-stage checks, blocking
+        # real winners. Removing all secondary velocity gates — keep only
+        # v30 >= 1.10 as the core momentum filter (which is essentially what
+        # MISSED detector uses). Compute v15/v5 only for logging visibility.
+        first_price_15s = s15.first_price if s15.first_price > 0 else price_now
+        velocity_15s = (price_now / first_price_15s) if (first_price_15s > 0 and price_now > 0) else 1.0
+        first_price_5s = s5.first_price if s5.first_price > 0 else price_now
+        velocity_5s = (price_now / first_price_5s) if (first_price_5s > 0 and price_now > 0) else 1.0
+        # All v15/v5/accel/fresh-mint/late-stage gates DISABLED.
+        # Loss control comes from: small position (0.030 SOL) + tight stops.
+
+        score = 0.0
+        score += min(100.0, cum_buy_60 * 2.5)
+        score += min(50.0, unique_buyers_60 * 2.0)
+        score += min(50.0, max(0.0, velocity_30s - 1.0) * 200.0)
+        score += min(20.0, recent_buys_5s * 2.0)
+        score -= max(0.0, top_share_60 - 0.3) * 100.0
+        score -= sell_ratio_60 * 30.0
+
+        # 2026-05-10 v25 — EMPIRICAL WIN FORMULA (calibrated from MOONSHOT-MISSED
+        # data showing 31 real winners in 5 minutes, score range 120-150).
+        # The previous formula was empirically too strict — the score>=180 +
+        # fill>=7e-5 cutoff blocked nearly every real winner. Real winners:
+        #   AQeSEwpo (1.71x): score~146, fill 1.0e-4, sr60=0.01, buyers=20
+        #   Ej5crhz9 (1.52x): score~122, fill 6.8e-5, sr60=0.09, buyers=18
+        #   DsBS3BuC (9.28x): score high, sr60=0.86  ** sr filter would block **
+        #   6EQKNJD6 (1.55x): score mid, sr60=0.89  ** sr filter would block **
+        # The DISCRIMINATOR vs losers is velocity_30s: all real winners had
+        # v30 >= 1.30; all losers (6mpP/LYEr) had v30 ~= 1.0 (flat).
+        # Score floor 110 catches the 120-150 winner band, blocks 6mpP (94)
+        # and Axbf (81). Min velocity 1.10 (raised from 1.005) blocks
+        # flat-price traps. Score is a scoreable proxy; velocity is the real
+        # truth filter.
+        threshold = env_float("PGG2_MOONSHOT_UNIFIED_SCORE_THRESHOLD", 110.0)
+        if score < threshold:
+            self._moonshot_diag["rej_score"] += 1
+            self._moonshot_diag_maybe_log()
+            return None
+        tier_used = "A"
+        self._moonshot_diag["fired"] += 1
+        self._moonshot_diag_maybe_log()
+
+        scout_sol = env_float("PGG2_MOONSHOT_UNIFIED_SOL", 0.030)
+        target_sol = env_float("PGG2_MOONSHOT_UNIFIED_TARGET_SOL", 0.030)
+        reason = (
+            f"tier={tier_used} cum60={cum_buy_60:.1f} buyers60={unique_buyers_60} "
+            f"v30={velocity_30s:.3f} v15={velocity_15s:.3f} v5={velocity_5s:.3f} "
+            f"top60={top_share_60:.2f} sr60={sell_ratio_60:.2f} "
+            f"accel={(cum_buy_15/max(cum_buy_60,0.001)):.2f} s5b={int(s5.buys)} "
+            f"s5s={int(s5.sells)} score={score:.0f}"
+        )
+        # 2026-05-10 v28 — FIRE-TIME FEATURE TRACE.
+        # Log the FULL feature set at fire so we can post-mortem every fire
+        # (especially losses) without guessing. Stores in tape and visible
+        # in next QUOTE-SHADOW-BUY line via reason field above.
+        log(
+            f"PGG2-MOONSHOT-FIRE-FEATURES mint={event.mint[:8]} "
+            f"cum60={cum_buy_60:.1f} buyers60={unique_buyers_60} "
+            f"top60={top_share_60:.2f} sr60={sell_ratio_60:.2f} "
+            f"v30={velocity_30s:.3f} v15={velocity_15s:.3f} v5={velocity_5s:.3f} "
+            f"accel={(cum_buy_15/max(cum_buy_60,0.001)):.2f} "
+            f"s5b={int(s5.buys)} s5s={int(s5.sells)} "
+            f"s1b={int(tape.stats(1000, ts_ms).buys)} "
+            f"fill={float(getattr(event, 'price_hint', 0.0) or 0.0):.2e} "
+            f"score={score:.1f} tier={tier_used}"
+        )
+        plan_features = dict(features)
+        plan_features.update({
+            "moonshot_cum_buy_15s": cum_buy_15,
+            "moonshot_cum_buy_60s": cum_buy_60,
+            "moonshot_buyers_15s": unique_buyers_15,
+            "moonshot_buyers_60s": unique_buyers_60,
+            "moonshot_top_share_60s": top_share_60,
+            "moonshot_sell_ratio_60s": sell_ratio_60,
+            "moonshot_velocity_30s": velocity_30s,
+            "entry_size_reason": "moonshot_unified",
+            "entry_probe_sol": scout_sol,
+        })
+        return StrikePlan(
+            mint=event.mint,
+            ts_ms=ts_ms,
+            lane="moonshot_unified",
+            reason=reason,
+            score=score,
+            scout_sol=scout_sol,
+            target_sol=target_sol,
+            price=price_now,
+            needs_curve_fill=False,
+            features=plan_features,
+        )
 
     def curve_lag_reveal_ready(self, event: PumpEvent, features: dict[str, Any]) -> Optional[StrikePlan]:
         """PGG2 curve-lag reveal lane.
@@ -3256,6 +3641,86 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             return
         self.maybe_arm_first_burst(event, features)
         features = self.feature_snapshot(event.mint, ts_ms) or features
+
+        # 2026-05-10 — MOONSHOT FAST-PATH (BEFORE LOSS_DNA_BLOCK).
+        # LOSS_DNA_BLOCK was tuned for early-life mint sniping and rejects
+        # real moonshots as "retail_cluster" (avg_buy<1.5) or "chase" (move>1.30).
+        # But J55K-style moonshots — many small buyers piling on a confirmed
+        # pump — have EXACTLY those features. We catch them by running
+        # moonshot_unified BEFORE LOSS_DNA_BLOCK gets a chance to reject.
+        if (env_bool("PGG2_MOONSHOT_UNIFIED_ENABLED", True)
+                and env_bool("PGG2_MOONSHOT_FAST_PATH", True)
+                and event.is_buy
+                and event.mint not in self.moonshot_unified_seen):
+            try:
+                ms_plan = self.moonshot_unified_ready(event, features)
+            except Exception as exc:
+                ms_plan = None
+                log(f"PGG2-LANE-ERROR moonshot_fast_path {type(exc).__name__}: {exc}")
+            # 2026-05-10 v13 — RE-APPLY LOSS_DNA_BLOCK to moonshot signals.
+            # Score >= 80 is necessary but not sufficient. Battle-tested
+            # filters (top1500 <= 0.50, no chase, whale-led, no retail cluster)
+            # catch the pump-and-dump pattern that high-score mints can hide.
+            # 2026-05-10 v14 — moonshot variant: SKIP stale_mint (established
+            # AMM moonshots like FjhCSNzZ pump for minutes, age > 10s is OK
+            # for confirmed moonshots).
+            if ms_plan and env_bool("PGG2_MOONSHOT_APPLY_LOSS_DNA", True):
+                lossdna_block = self._loss_dna_block_reason(features)
+                # 2026-05-10 v20 — moonshot variant of LOSS_DNA_BLOCK:
+                # SKIP stale_mint — established AMM pumps are valid.
+                # SKIP retail_cluster — moonshots ARE retail clusters!
+                #   Many small buyers FOMO into a mint = avg_buy_per_buyer LOW.
+                #   This is the SIGNATURE of crowd-driven moonshots, not a loss
+                #   pattern. Wins like G1cs (+25%), Criq (+72%), 7D7s (+160%)
+                #   all had broad retail-style participation.
+                # 2026-05-10 v26 — SKIP chase_move700.
+                #   FLAVeXmr (1.69x missed winner) had chase_move700=1.74.
+                #   4m39GNCq (1.11x prior winner) had chase_move700=1.34.
+                #   Real moonshots have fast 700ms moves at the inflection
+                #   point — that's the entry signal, not a chase signal.
+                #   The post-entry exits (TP/peak_lock/no_pump) handle risk
+                #   if the move actually was the top.
+                # KEEP: top_share (whale dominance) — that's a clean rug filter.
+                # 2026-05-10 v33 — DISABLED ALL LOSS_DNA blocks for moonshot.
+                # The MISSED detector ignores LOSS_DNA criteria and finds
+                # real moonshots. Trust velocity + position sizing for risk.
+                lossdna_block = None
+                if lossdna_block:
+                    log(f"PGG2-MOONSHOT-LOSS-DNA-BLOCK mint={event.mint[:8]} {lossdna_block}")
+                    self.moonshot_unified_seen.add(event.mint)
+                    return
+            if ms_plan:
+                ok, reason = self.broker.can_strike(event.mint, ts_ms)
+                if not ok:
+                    self.logger.decision(
+                        "strike_skipped",
+                        event.mint,
+                        {"reason": reason, "lane": ms_plan.lane, "features": self.slim_features(features)},
+                    )
+                    return
+                self.logger.decision(
+                    "strike_plan",
+                    event.mint,
+                    {
+                        "lane": ms_plan.lane,
+                        "reason": ms_plan.reason,
+                        "score": ms_plan.score,
+                        "scout_sol": ms_plan.scout_sol,
+                        "target_sol": ms_plan.target_sol,
+                        "needs_curve_fill": ms_plan.needs_curve_fill,
+                        "features": ms_plan.features,
+                    },
+                )
+                pos = self.broker.queue_or_fill(ms_plan, float(features.get("price") or 0.0))
+                self.moonshot_unified_seen.add(event.mint)
+                if pos:
+                    self.init_position_follow(pos, trusted=True, entry_features=features)
+                    self.logger.decision(
+                        "open", event.mint,
+                        {"lane": ms_plan.lane, "features": self.slim_features(features)},
+                    )
+                return
+
         # Phase 22 2026-05-08: universal entry blocker derived from Phase 21
         # loss dissection. These features were 100% absent in winners and
         # present in 8+ losses each. Block before any lane probes.
@@ -3264,6 +3729,93 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             if block_reason:
                 if env_bool("PGG2_LOSS_DNA_BLOCK_LOG", False):
                     log(f"PGG2-LOSS-DNA-BLOCK mint={event.mint[:8]} {block_reason}")
+                return
+        # 2026-05-10 — ALL-LANES SCORE-BASED SELECTION.
+        # Every enabled lane runs in parallel. The plan with the highest
+        # score wins (immediate-fill preferred on ties). This eliminates
+        # priority bias — lanes compete on merit, not on position in a list.
+        # CPU cost: 15 lane checks per event × ~80 events/sec = ~1200 checks/sec.
+        # Each check is microseconds. Negligible vs network round-trip latency.
+        # Disable via PGG2_ALL_LANES_SCORE_BASED_ENABLED=0 to revert to the
+        # original priority-order fall-through below.
+        if env_bool("PGG2_ALL_LANES_SCORE_BASED_ENABLED", True):
+            lane_specs = (
+                # NEW 2026-05-10: moonshot_unified — confirms real pumps via
+                # cumulative volume + breadth + momentum. Gets first shot but
+                # competes with others on score.
+                ("moonshot_unified", self.moonshot_unified_ready, self.moonshot_unified_seen, None),
+                ("spark3_arm", self.spark3_arm_ready, self.spark3_arm_seen, None),
+                ("stealth_arm", self.stealth_arm_ready, self.stealth_arm_seen, None),
+                ("spark3_breakout", self.spark3_breakout_ready, self.spark3_breakout_seen, None),
+                ("preprice_reveal", self.preprice_reveal_ready, self.preprice_reveal_seen, None),
+                ("bounce_buy", self.bounce_buy_ready, self.bounce_buy_seen, None),
+                ("engagement_driven", self.engagement_driven_ready, self.engagement_driven_seen, None),
+                ("priced_snap", self.priced_snap_ready, self.priced_snap_seen, None),
+                ("priced_breakout", self.priced_breakout_ready, self.priced_breakout_seen, None),
+                ("late_swarm", self.late_swarm_ready, self.late_swarm_seen, None),
+                ("birth_fanout", self.birth_fanout_ready, self.birth_fanout_seen, None),
+                ("curve_lag_reveal", self.curve_lag_reveal_ready, self.curve_lag_reveal_seen, None),
+                ("curve_arm_scout", self.curve_arm_scout_ready, self.curve_arm_scout_seen, None),
+                ("whale_spark", self.whale_spark_ready, self.whale_spark_seen, None),
+                ("raw_momentum", self.raw_momentum_ready, self.raw_momentum_seen, "raw_momentum_arms"),
+                ("early_ignition", self.early_ignition_ready, None, None),
+            )
+            candidates = []
+            for lane_name, ready_fn, seen_set, post_attr in lane_specs:
+                try:
+                    plan = ready_fn(event, features)
+                    if plan:
+                        candidates.append((plan, seen_set, post_attr))
+                except Exception as exc:
+                    log(f"PGG2-LANE-ERROR {lane_name} {type(exc).__name__}: {exc}")
+            if candidates:
+                # Sort: highest score wins. On ties, immediate-fill plans rank
+                # higher than needs_curve_fill (faster execution).
+                candidates.sort(
+                    key=lambda x: (x[0].score, 0 if x[0].needs_curve_fill else 1),
+                    reverse=True,
+                )
+                best_plan, best_seen, post_attr = candidates[0]
+                if len(candidates) > 1:
+                    losers = ",".join(
+                        f"{c[0].lane}:{c[0].score:.0f}" for c in candidates[1:]
+                    )
+                    log(
+                        f"PGG2-LANE-RACE mint={event.mint[:8]} winner={best_plan.lane}:"
+                        f"{best_plan.score:.0f} losers={losers}"
+                    )
+                ok, reason = self.broker.can_strike(event.mint, ts_ms)
+                if not ok:
+                    self.logger.decision(
+                        "strike_skipped",
+                        event.mint,
+                        {"reason": reason, "lane": best_plan.lane, "features": self.slim_features(features)},
+                    )
+                    return
+                self.logger.decision(
+                    "strike_plan",
+                    event.mint,
+                    {
+                        "lane": best_plan.lane,
+                        "reason": best_plan.reason,
+                        "score": best_plan.score,
+                        "scout_sol": best_plan.scout_sol,
+                        "target_sol": best_plan.target_sol,
+                        "needs_curve_fill": best_plan.needs_curve_fill,
+                        "features": best_plan.features,
+                    },
+                )
+                pos = self.broker.queue_or_fill(best_plan, float(features.get("price") or 0.0))
+                if best_seen is not None:
+                    best_seen.add(event.mint)
+                if post_attr == "raw_momentum_arms":
+                    self.raw_momentum_arms.pop(event.mint, None)
+                if pos:
+                    self.init_position_follow(pos, trusted=True, entry_features=features)
+                    self.logger.decision(
+                        "open", event.mint,
+                        {"lane": best_plan.lane, "features": self.slim_features(features)},
+                    )
                 return
         spark3_plan = self.spark3_arm_ready(event, features)
         if spark3_plan:
@@ -3890,7 +4442,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         # min_hold_panic, etc). Uses ONLY the on-chain real price, not the
         # broker's simulated sell-back quote. Bounded losses, ride real moves.
         if (env_bool("PGG2_PHASE25_UNIVERSAL_EXIT_ENABLED", True)
-                and pos.lane not in {"engagement_driven", "bounce_buy"}):
+                and pos.lane not in {"engagement_driven", "bounce_buy", "moonshot_unified"}):
             stop_mult = env_float("PGG2_PHASE25_STOP_MULT", 0.95)        # -5% real
             cat_mult = env_float("PGG2_PHASE25_CATASTROPHIC_MULT", 0.60)  # -40% rug guard
             trail_arm = env_float("PGG2_PHASE25_TRAIL_ARM_PEAK", 1.08)    # arm trail at +8%
@@ -3944,6 +4496,199 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 return
 
             # Otherwise HOLD — block all other exit logic
+            return
+
+        # 2026-05-10 v3 — moonshot exit using REAL AMM quote, not phantom mult.
+        # mult derived from tape.last_price = AMM args (intent-based) was
+        # producing phantom drops to 0.008 (real -5%) and phantom ups to
+        # 1.48 (real -37%). We periodically fetch the REAL sell quote via
+        # build_swap and use that mult for exit decisions.
+        if pos.lane == "moonshot_unified" and env_bool("PGG2_MOONSHOT_UNIFIED_CUSTOM_EXIT", True):
+            age = pos.age_sec(ts_ms)
+            min_hold = env_float("PGG2_MOONSHOT_UNIFIED_MIN_HOLD_SEC", 2.0)
+            timebox = env_float("PGG2_MOONSHOT_UNIFIED_TIMEBOX_SEC", 30.0)
+            # 2026-05-10 v6 — slippage-aware exits + FAST-FAIL on dead signals.
+            # AMM round-trip slippage = ~5% (real_mult starts at 0.95 post-buy).
+            # WIN territory = real_mult > 1.00 (proceeds > cost).
+            # take_profit at 1.03 = +2% net win (worth banking).
+            # peak_lock at 1.01 = break-even held; any retreat → bank.
+            # stop at 0.88 = real -12% drop (well below normal slippage).
+            # FAST-FAIL: if at 5s real_mult < 0.96, signal is dead → exit fast
+            # (limits loss to ~7% net instead of waiting for -12% stop).
+            take_profit = env_float("PGG2_MOONSHOT_UNIFIED_TAKE_PROFIT_REAL_MULT", 1.03)
+            peak_lock_min = env_float("PGG2_MOONSHOT_UNIFIED_PEAK_LOCK_MIN_REAL", 1.01)
+            peak_lock_drop = env_float("PGG2_MOONSHOT_UNIFIED_PEAK_LOCK_DROP", 0.99)
+            trail_arm = env_float("PGG2_MOONSHOT_UNIFIED_TRAIL_ARM_REAL_MULT", 1.02)
+            trail_drop = env_float("PGG2_MOONSHOT_UNIFIED_TRAIL_DROP", 0.97)
+            stop_real_mult = env_float("PGG2_MOONSHOT_UNIFIED_STOP_REAL_MULT", 0.88)
+            quote_interval_ms = env_int("PGG2_MOONSHOT_UNIFIED_QUOTE_INTERVAL_MS", 800)
+            # FAST-FAIL params
+            fast_fail_age = env_float("PGG2_MOONSHOT_UNIFIED_FAST_FAIL_AGE_SEC", 5.0)
+            fast_fail_min_mult = env_float("PGG2_MOONSHOT_UNIFIED_FAST_FAIL_MIN_MULT", 0.97)
+
+            # IMMEDIATE-DROP fast-fail (runs BEFORE min_hold gate):
+            # Get the very first real_mult reading right after buy. If at 2-4s
+            # the real_mult has dropped 1%+ below initial, the mint isn't
+            # pumping. Exit IMMEDIATELY — no point holding for the full timebox.
+            initial_real = getattr(pos, "_ms_initial_real_mult", 0.0)
+            current_real = getattr(pos, "_ms_real_mult", 1.0)
+            current_peak = getattr(pos, "_ms_real_peak", 1.0)
+
+            # On first opportunity, capture initial_real_mult
+            if initial_real == 0.0 and age >= 0.5:
+                last_check_init = getattr(pos, "_ms_last_check_ms", 0)
+                if (ts_ms - last_check_init) >= 200:
+                    try:
+                        quote_tokens = self.broker.quote_shadow_tokens.get(mint, pos.remaining_tokens)
+                        quote = self.broker.build_swap(mint, SOL_MINT, round(quote_tokens, 9), self.broker.sell_slippage)
+                        expected_out = self.broker.rate_amount_out(quote)
+                        if expected_out > 0 and pos.cost_sol > 0:
+                            overhead = self.broker.quote_roundtrip_overhead_sol if self.broker.quote_shadow_positions else 0.0
+                            net_proceeds = max(0.0, expected_out - overhead)
+                            initial_real = net_proceeds / pos.cost_sol
+                            pos._ms_initial_real_mult = initial_real
+                            pos._ms_real_mult = initial_real
+                            pos._ms_real_peak = initial_real
+                            current_real = initial_real
+                            current_peak = initial_real
+                            pos._ms_last_check_ms = ts_ms
+                            if pos.avg_price > 0:
+                                pos.last_price = pos.avg_price * initial_real
+                                pos.peak_price = max(pos.peak_price, pos.last_price)
+                    except Exception:
+                        pass
+
+            # IMMEDIATE-DROP: at 2-4s, ANY drop from initial → bail.
+            # Pure-win mode: require real_mult to be >= initial. Losses
+            # from drift are eliminated.
+            if (initial_real > 0
+                    and age >= 2.0 and age < 4.0
+                    and current_real > 0
+                    and current_real < initial_real):
+                self.close_position(
+                    mint, ts_ms, price,
+                    f"moonshot_no_pump initial={initial_real:.3f} now={current_real:.3f}",
+                    features, killed=True,
+                )
+                return
+
+            if age < min_hold:
+                return
+
+            # 2026-05-10 v10 — REMOVED tiered fast_fail (5s/10s/15s).
+            # Real data: G1cs at score 96 was about to fast_fail_15s with
+            # peak=0.959 → would exit as loss. But the deferred close
+            # 2.5s later got actual proceeds = 1.255x (+27% real WIN).
+            # The fast_fail was killing late-pumping winners.
+            # Now: rely only on take_profit, peak_lock, real_stop, timebox.
+
+            # SELL-PRESSURE FAST EXIT — if sellers dominate post-entry, BAIL.
+            # Winners have continued buyer momentum. Losers have sells flooding
+            # in. Catch reversals within seconds, not at -8% stop.
+            tape = self.tapes.get(mint)
+            if tape is not None:
+                s5 = tape.stats(5000, ts_ms)
+                s10 = tape.stats(10000, ts_ms)
+                # Exit if sells > buys in last 5s (acute reversal)
+                if s5.sell_sol > s5.buy_sol * 1.5 and s5.sells >= 3:
+                    self.close_position(
+                        mint, ts_ms, price,
+                        f"moonshot_sell_pressure s5_sells={s5.sells} s5_sell_sol={s5.sell_sol:.2f} buy={s5.buy_sol:.2f}",
+                        features, killed=True,
+                    )
+                    return
+                # Exit if 10s window shows clear bear flow
+                if age > 5.0 and s10.sell_sol > s10.buy_sol * 1.2 and s10.sells >= 5:
+                    self.close_position(
+                        mint, ts_ms, price,
+                        f"moonshot_bear_flow s10_sells={s10.sells} sell_sol={s10.sell_sol:.2f} buy={s10.buy_sol:.2f}",
+                        features, killed=True,
+                    )
+                    return
+
+            # Throttled real-quote check + UPDATE pos.last_price so display
+            # reflects honest mult (not phantom price_hint mult).
+            last_check = getattr(pos, "_ms_last_check_ms", 0)
+            real_mult = getattr(pos, "_ms_real_mult", 1.0)
+            real_peak = getattr(pos, "_ms_real_peak", 1.0)
+            if (ts_ms - last_check) >= quote_interval_ms:
+                try:
+                    quote_tokens = self.broker.quote_shadow_tokens.get(mint, pos.remaining_tokens)
+                    quote = self.broker.build_swap(mint, SOL_MINT, round(quote_tokens, 9), self.broker.sell_slippage)
+                    expected_out = self.broker.rate_amount_out(quote)
+                    if expected_out > 0 and pos.cost_sol > 0:
+                        overhead = self.broker.quote_roundtrip_overhead_sol if self.broker.quote_shadow_positions else 0.0
+                        net_proceeds = max(0.0, expected_out - overhead)
+                        real_mult = net_proceeds / pos.cost_sol
+                        pos._ms_last_check_ms = ts_ms
+                        pos._ms_real_mult = real_mult
+                        if real_mult > real_peak:
+                            real_peak = real_mult
+                            pos._ms_real_peak = real_peak
+                        # CRITICAL: update pos.last_price + peak_mult so the
+                        # UI/PIGGY-STATUS displays the HONEST real-quote mult
+                        # instead of the phantom price_hint based mult.
+                        if pos.avg_price > 0:
+                            real_price = pos.avg_price * real_mult
+                            pos.last_price = real_price
+                            real_peak_price = pos.avg_price * real_peak
+                            if real_peak_price > pos.peak_price:
+                                pos.peak_price = real_peak_price
+                                pos.peak_mult = real_peak
+                except Exception:
+                    pass
+
+            # Take profit on REAL mult
+            if real_mult >= take_profit:
+                self.close_position(
+                    mint, ts_ms, price,
+                    f"moonshot_real_tp real_mult={real_mult:.3f}",
+                    features, killed=False,
+                )
+                return
+
+            # PEAK-LOCK: if we've been positive at any point (peak >= 1.02 real)
+            # and now retreating by 1.5% from peak, BANK whatever we have.
+            # Catches the "pump touched +3%, reversed to -5%" pattern that was
+            # producing most losses.
+            if real_peak >= peak_lock_min:
+                peak_floor = real_peak * peak_lock_drop
+                if real_mult <= peak_floor:
+                    self.close_position(
+                        mint, ts_ms, price,
+                        f"moonshot_peak_lock peak={real_peak:.3f} mult={real_mult:.3f}",
+                        features, killed=False,
+                    )
+                    return
+
+            # Trail on REAL peak (longer-term)
+            if real_peak >= trail_arm:
+                trail_floor = real_peak * trail_drop
+                if real_mult <= trail_floor:
+                    self.close_position(
+                        mint, ts_ms, price,
+                        f"moonshot_real_trail peak={real_peak:.3f} mult={real_mult:.3f}",
+                        features, killed=False,
+                    )
+                    return
+
+            # Stop on REAL mult
+            if real_mult > 0 and real_mult <= stop_real_mult:
+                self.close_position(
+                    mint, ts_ms, price,
+                    f"moonshot_real_stop real_mult={real_mult:.3f}",
+                    features, killed=True,
+                )
+                return
+
+            if age >= timebox:
+                self.close_position(
+                    mint, ts_ms, price,
+                    f"moonshot_timebox age={age:.0f}s real_mult={real_mult:.3f}",
+                    features, killed=(real_mult < 1.0),
+                )
+                return
+
             return
         # ════════════════════════════════════════════════════════════════════
 

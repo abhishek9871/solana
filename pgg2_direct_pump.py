@@ -707,7 +707,14 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
 
     def build_buy(self, mint_str: str, amount_sol: float, slippage: float) -> dict[str, Any]:
         mint = as_pubkey(mint_str)
-        curve = self.bonding_curve(mint)
+        # 2026-05-10 — pure AMM mints (post-migration only seen via PumpSwap)
+        # have NO BC PDA. Catch the missing-BC error and route to AMM.
+        try:
+            curve = self.bonding_curve(mint)
+        except RuntimeError as exc:
+            if "bonding curve missing" in str(exc) or "bonding curve data too short" in str(exc):
+                return self.build_pumpswap_buy(mint, amount_sol, slippage)
+            raise
         if curve.complete:
             return self.build_pumpswap_buy(mint, amount_sol, slippage)
         global_cfg = self.pump_global()
@@ -808,7 +815,13 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
 
     def build_sell(self, mint_str: str, amount: Any, slippage: float) -> dict[str, Any]:
         mint = as_pubkey(mint_str)
-        curve = self.bonding_curve(mint)
+        # 2026-05-10 — pure AMM mints have no BC PDA; route to PumpSwap.
+        try:
+            curve = self.bonding_curve(mint)
+        except RuntimeError as exc:
+            if "bonding curve missing" in str(exc) or "bonding curve data too short" in str(exc):
+                return self.build_pumpswap_sell(mint, amount, slippage)
+            raise
         if curve.complete:
             return self.build_pumpswap_sell(mint, amount, slippage)
         global_cfg = self.pump_global()

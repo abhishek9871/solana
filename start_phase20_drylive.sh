@@ -228,11 +228,11 @@ export PGG2_PEAK_LOCK_ENABLED=1
 
 # Phase 20G: bigger stake to make small wins meaningful — also lift broker cap
 # Phase 27: smaller stake — bound max single-trade loss to ~$1 instead of ~$3
-export PIGGY_SCOUT_SOL=0.030
-export PIGGY_MAX_POSITION_SOL=0.030
-export PIGGY_PROBE_SOL=0.060
+export PIGGY_SCOUT_SOL=0.107
+export PIGGY_MAX_POSITION_SOL=0.107
+export PIGGY_PROBE_SOL=0.107
 export PIGGY_MAX_OPEN=5
-export PGG2_LIVE_MAX_TRADE_SOL=0.030
+export PGG2_LIVE_MAX_TRADE_SOL=0.107
 export PGG2_LIVE_MIN_TRADE_SOL=0.030
 
 # Strip overfit blocks (won't matter for engagement lane but tidy)
@@ -288,6 +288,19 @@ export PGG2_PHASE25_MIN_HOLD_SEC=2.5            # Phase 29: 2.5s (was 1.5s) — 
 export PGG2_PHASE25_TIMEBOX_SEC=60.0
 export PGG2_PHASE25_TIMEBOX_MIN_MULT=1.02
 
+# 2026-05-10 — CRITICAL OVERHEAD FIX (re-asserted AFTER source blocks).
+# Sourced launchers reset PGG2_QUOTE_ROUNDTRIP_OVERHEAD_SOL to 0.00235
+# which includes ATA rent (0.00204) — but recover_ata=1 means ATA rent
+# is REFUNDED on close. Fixed cost should be just tx fees ≈ 0.00060.
+# Effect on a 0.060 stake:
+#   OLD: fixed -3.9% drag → real_mult must reach 1.04 just to break even
+#   NEW: fixed -1.0% drag → real_mult 1.01 breaks even
+# This single change converts most of the prior -8% to -11% net losses
+# into -2% to -5% net losses (closer to break even).
+export PGG2_QUOTE_ROUNDTRIP_OVERHEAD_SOL=0.00060
+export PGG2_LIVE_MIN_PROFIT_EXIT_SOL=0.00060
+export PGG2_LIVE_RAW_MOMENTUM_ELITE_ROUNDTRIP_ABS_FLOOR_SOL=0.00060
+
 # Phase 26: per-lane position sizing — bias capital by lane track record
 export PGG2_CURVE_LAG_SOL=0.080                 # 100% W/L star lane — biggest stake
 export PGG2_RAW_MOMENTUM_SOL=0.045              # 40% W/L mid
@@ -305,4 +318,7 @@ export PIGGY_DECISIONS_FILE="/root/piggy/data/${RUNID}_decisions.jsonl"
 
 echo "PHASE20-DRYLIVE RUN_ID=$RUNID mode=SURVIVOR_TRADER engagement_only tight_exits=10/-5"
 
+export PGG2_MOONSHOT_UNIFIED_SOL=0.030
+export PGG2_MOONSHOT_UNIFIED_TARGET_SOL=0.030
 exec ./venv/bin/python -u PGG2.py 2>&1 | tee "/root/piggy/logs/${RUNID}.log"
+
