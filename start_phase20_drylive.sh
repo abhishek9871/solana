@@ -231,9 +231,9 @@ export PGG2_PEAK_LOCK_ENABLED=1
 export PIGGY_SCOUT_SOL=0.107
 export PIGGY_MAX_POSITION_SOL=0.107
 export PIGGY_PROBE_SOL=0.107
-export PIGGY_MAX_OPEN=5
+export PIGGY_MAX_OPEN=50
 export PGG2_LIVE_MAX_TRADE_SOL=0.107
-export PGG2_LIVE_MIN_TRADE_SOL=0.030
+export PGG2_LIVE_MIN_TRADE_SOL=0.020
 
 # Strip overfit blocks (won't matter for engagement lane but tidy)
 export PGG2_PRICED_SNAP_BLOCK_TOP700=1.01
@@ -318,7 +318,7 @@ export PIGGY_DECISIONS_FILE="/root/piggy/data/${RUNID}_decisions.jsonl"
 
 echo "PHASE20-DRYLIVE RUN_ID=$RUNID mode=SURVIVOR_TRADER engagement_only tight_exits=10/-5"
 
-export PGG2_MOONSHOT_UNIFIED_SOL=0.030
-export PGG2_MOONSHOT_UNIFIED_TARGET_SOL=0.030
+export PGG2_MOONSHOT_UNIFIED_SOL=0.020
+export PGG2_MOONSHOT_UNIFIED_TARGET_SOL=0.107
 exec ./venv/bin/python -u PGG2.py 2>&1 | tee "/root/piggy/logs/${RUNID}.log"
 

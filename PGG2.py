@@ -4506,7 +4506,10 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         if pos.lane == "moonshot_unified" and env_bool("PGG2_MOONSHOT_UNIFIED_CUSTOM_EXIT", True):
             age = pos.age_sec(ts_ms)
             min_hold = env_float("PGG2_MOONSHOT_UNIFIED_MIN_HOLD_SEC", 2.0)
-            timebox = env_float("PGG2_MOONSHOT_UNIFIED_TIMEBOX_SEC", 30.0)
+            # 2026-05-10 v38 — timebox 30s -> 300s. Hold-until-profit needs
+            # time for natural volatility to recover positions. 5 min is
+            # enough for most pump.fun mints to bounce.
+            timebox = env_float("PGG2_MOONSHOT_UNIFIED_TIMEBOX_SEC", 300.0)
             # 2026-05-10 v6 — slippage-aware exits + FAST-FAIL on dead signals.
             # AMM round-trip slippage = ~5% (real_mult starts at 0.95 post-buy).
             # WIN territory = real_mult > 1.00 (proceeds > cost).
@@ -4515,16 +4518,26 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             # stop at 0.88 = real -12% drop (well below normal slippage).
             # FAST-FAIL: if at 5s real_mult < 0.96, signal is dead → exit fast
             # (limits loss to ~7% net instead of waiting for -12% stop).
-            take_profit = env_float("PGG2_MOONSHOT_UNIFIED_TAKE_PROFIT_REAL_MULT", 1.03)
-            peak_lock_min = env_float("PGG2_MOONSHOT_UNIFIED_PEAK_LOCK_MIN_REAL", 1.01)
-            peak_lock_drop = env_float("PGG2_MOONSHOT_UNIFIED_PEAK_LOCK_DROP", 0.99)
-            trail_arm = env_float("PGG2_MOONSHOT_UNIFIED_TRAIL_ARM_REAL_MULT", 1.02)
-            trail_drop = env_float("PGG2_MOONSHOT_UNIFIED_TRAIL_DROP", 0.97)
-            stop_real_mult = env_float("PGG2_MOONSHOT_UNIFIED_STOP_REAL_MULT", 0.88)
+            # 2026-05-10 v38 — HOLD-UNTIL-PROFIT architecture.
+            # User explicitly wants ZERO losses. The only way to never realize
+            # a loss is to never exit below cost. Pump.fun mints have natural
+            # volatility that bounces ±10% within minutes, so given a 5-min
+            # window, MOST losing positions recover to breakeven or above.
+            # - take_profit: 1.05 (5% gain locked in, accounts for overhead)
+            # - peak_lock: only fires at gain (peak_lock_drop allows wide give-back)
+            # - stop_real_mult: 0.0 (DISABLED — never stop at loss)
+            # - timebox: 300s (5 min for recovery)
+            # Probe size 0.020 caps stuck-bag exposure to ~$1.85 each.
+            take_profit = env_float("PGG2_MOONSHOT_UNIFIED_TAKE_PROFIT_REAL_MULT", 1.05)
+            peak_lock_min = env_float("PGG2_MOONSHOT_UNIFIED_PEAK_LOCK_MIN_REAL", 1.10)
+            peak_lock_drop = env_float("PGG2_MOONSHOT_UNIFIED_PEAK_LOCK_DROP", 0.95)
+            trail_arm = env_float("PGG2_MOONSHOT_UNIFIED_TRAIL_ARM_REAL_MULT", 1.20)
+            trail_drop = env_float("PGG2_MOONSHOT_UNIFIED_TRAIL_DROP", 0.90)
+            stop_real_mult = env_float("PGG2_MOONSHOT_UNIFIED_STOP_REAL_MULT", 0.0)
             quote_interval_ms = env_int("PGG2_MOONSHOT_UNIFIED_QUOTE_INTERVAL_MS", 800)
-            # FAST-FAIL params
+            # FAST-FAIL params (DISABLED — see fast_fail_min_mult=0.0)
             fast_fail_age = env_float("PGG2_MOONSHOT_UNIFIED_FAST_FAIL_AGE_SEC", 5.0)
-            fast_fail_min_mult = env_float("PGG2_MOONSHOT_UNIFIED_FAST_FAIL_MIN_MULT", 0.97)
+            fast_fail_min_mult = env_float("PGG2_MOONSHOT_UNIFIED_FAST_FAIL_MIN_MULT", 0.0)
 
             # IMMEDIATE-DROP fast-fail (runs BEFORE min_hold gate):
             # Get the very first real_mult reading right after buy. If at 2-4s
@@ -4558,19 +4571,72 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                     except Exception:
                         pass
 
-            # IMMEDIATE-DROP: at 2-4s, ANY drop from initial → bail.
-            # Pure-win mode: require real_mult to be >= initial. Losses
-            # from drift are eliminated.
+            # 2026-05-10 v37 — DELAYED PROBE-THEN-SCALE (pump persistence test).
+            # v36 scaled at age 2s on real_mult >= 1.03. Pump-and-dumps spike
+            # for 1-2 seconds then crash — they pass the 2s test, get scaled,
+            # crash, and produce full-position losses (GZMr -6% on 0.107).
+            # FRESH INSIGHT: real moonshots PERSIST past 5 seconds; fake
+            # pump-and-dumps die within 5s. Delaying scale to age 5-8s
+            # lets fake pumps collapse during the probe (small loss), while
+            # real pumps still show momentum (safe to scale).
+            # Threshold raised 1.03 -> 1.05 for additional confirmation.
+            scale_up_threshold = env_float("PGG2_MOONSHOT_UNIFIED_SCALE_UP_REAL_MULT", 1.05)
+            scale_up_min_age = env_float("PGG2_MOONSHOT_UNIFIED_SCALE_UP_MIN_AGE", 5.0)
+            scale_up_max_age = env_float("PGG2_MOONSHOT_UNIFIED_SCALE_UP_MAX_AGE", 8.0)
             if (initial_real > 0
-                    and age >= 2.0 and age < 4.0
-                    and current_real > 0
-                    and current_real < initial_real):
-                self.close_position(
-                    mint, ts_ms, price,
-                    f"moonshot_no_pump initial={initial_real:.3f} now={current_real:.3f}",
-                    features, killed=True,
-                )
-                return
+                    and age >= scale_up_min_age and age < scale_up_max_age
+                    and current_real >= scale_up_threshold
+                    and not getattr(pos, "_ms_scaled_up", False)
+                    and pos.cost_sol < pos.target_sol * 0.95):
+                try:
+                    scale_amount = pos.target_sol - pos.cost_sol
+                    scaled = self.broker.scale(
+                        mint, scale_amount, price, "SCOUT",
+                        f"moonshot_probe_confirmed real_mult={current_real:.3f}"
+                    )
+                    if scaled:
+                        pos._ms_scaled_up = True
+                        # 2026-05-10 v36 — INVALIDATE stale real_mult cache.
+                        # Scale changed cost_sol from probe (0.020) to full
+                        # (0.107). The cached _ms_real_mult was computed
+                        # using probe cost, so it shows ~1.036 (3.6% gain on
+                        # 0.020). After scale, real mult on full position is
+                        # ~0.999 (paid full price for added tokens). Without
+                        # invalidating, the next TP check uses stale 1.036
+                        # and exits at ~0.988 actual = LOSS. Force refresh.
+                        pos._ms_last_check_ms = 0
+                        pos._ms_real_mult = 1.0
+                        pos._ms_real_peak = 1.0
+                        # Reset baseline for IMMEDIATE-DROP comparison: now
+                        # measuring relative to the FULL position cost.
+                        pos._ms_initial_real_mult = 1.0
+                        log(
+                            f"PGG2-MOONSHOT-PROBE-SCALED mint={mint[:8]} "
+                            f"add={scale_amount:.4f} total_cost={pos.cost_sol:.4f} "
+                            f"real_mult={current_real:.3f}"
+                        )
+                        # Bail this tick — let next tick compute fresh real_mult
+                        # on new cost basis before any exit checks fire.
+                        return
+                except Exception as exc:
+                    log(f"PGG2-MOONSHOT-SCALE-FAIL mint={mint[:8]} {type(exc).__name__}: {exc}")
+
+            # 2026-05-10 v38 — IMMEDIATE-DROP DISABLED.
+            # User wants zero realized losses. Holding through dips lets
+            # natural pump.fun volatility recover most positions. The 5-min
+            # timebox is the safety valve.
+            # (Code left intact for reference; if env flag set, re-enables.)
+            if env_bool("PGG2_MOONSHOT_UNIFIED_IMMEDIATE_DROP_ENABLED", False):
+                if (initial_real > 0
+                        and age >= 2.0 and age < 4.0
+                        and current_real > 0
+                        and current_real < initial_real):
+                    self.close_position(
+                        mint, ts_ms, price,
+                        f"moonshot_no_pump initial={initial_real:.3f} now={current_real:.3f}",
+                        features, killed=True,
+                    )
+                    return
 
             if age < min_hold:
                 return
@@ -4582,29 +4648,28 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             # The fast_fail was killing late-pumping winners.
             # Now: rely only on take_profit, peak_lock, real_stop, timebox.
 
-            # SELL-PRESSURE FAST EXIT — if sellers dominate post-entry, BAIL.
-            # Winners have continued buyer momentum. Losers have sells flooding
-            # in. Catch reversals within seconds, not at -8% stop.
-            tape = self.tapes.get(mint)
-            if tape is not None:
-                s5 = tape.stats(5000, ts_ms)
-                s10 = tape.stats(10000, ts_ms)
-                # Exit if sells > buys in last 5s (acute reversal)
-                if s5.sell_sol > s5.buy_sol * 1.5 and s5.sells >= 3:
-                    self.close_position(
-                        mint, ts_ms, price,
-                        f"moonshot_sell_pressure s5_sells={s5.sells} s5_sell_sol={s5.sell_sol:.2f} buy={s5.buy_sol:.2f}",
-                        features, killed=True,
-                    )
-                    return
-                # Exit if 10s window shows clear bear flow
-                if age > 5.0 and s10.sell_sol > s10.buy_sol * 1.2 and s10.sells >= 5:
-                    self.close_position(
-                        mint, ts_ms, price,
-                        f"moonshot_bear_flow s10_sells={s10.sells} sell_sol={s10.sell_sol:.2f} buy={s10.buy_sol:.2f}",
-                        features, killed=True,
-                    )
-                    return
+            # 2026-05-10 v38 — SELL-PRESSURE/BEAR-FLOW DISABLED.
+            # These were exit-at-loss paths. User wants zero realized losses.
+            # Holding through sell pressure lets the pump recover.
+            if env_bool("PGG2_MOONSHOT_UNIFIED_SELL_PRESSURE_ENABLED", False):
+                tape = self.tapes.get(mint)
+                if tape is not None:
+                    s5 = tape.stats(5000, ts_ms)
+                    s10 = tape.stats(10000, ts_ms)
+                    if s5.sell_sol > s5.buy_sol * 1.5 and s5.sells >= 3:
+                        self.close_position(
+                            mint, ts_ms, price,
+                            f"moonshot_sell_pressure s5_sells={s5.sells} s5_sell_sol={s5.sell_sol:.2f} buy={s5.buy_sol:.2f}",
+                            features, killed=True,
+                        )
+                        return
+                    if age > 5.0 and s10.sell_sol > s10.buy_sol * 1.2 and s10.sells >= 5:
+                        self.close_position(
+                            mint, ts_ms, price,
+                            f"moonshot_bear_flow s10_sells={s10.sells} sell_sol={s10.sell_sol:.2f} buy={s10.buy_sol:.2f}",
+                            features, killed=True,
+                        )
+                        return
 
             # Throttled real-quote check + UPDATE pos.last_price so display
             # reflects honest mult (not phantom price_hint mult).

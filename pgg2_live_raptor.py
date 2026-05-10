@@ -1578,8 +1578,56 @@ class RaptorLiveBroker(PaperBroker):
             return None
 
     def scale(self, mint: str, add_sol: float, price: float, state: str, reason: str) -> Optional[Position]:
-        log(f"PGG2-LIVE-SCALE-BLOCKED {short_addr(mint)} requested={add_sol:.6f} reason={reason}")
-        return None
+        """2026-05-10 v35 — Real scale-up implementation for quote-shadow mode.
+        Used by moonshot probe-then-scale architecture: small initial probe
+        at 0.020 SOL, scaled to full target on 2s confirmation. This caps
+        bad-entry losses to probe size (~$0.50) while capturing full upside
+        on confirmed winners.
+        """
+        pos = self.positions.get(mint)
+        if not pos or add_sol <= 0 or price <= 0:
+            return None
+        # Cap at target_sol - cost_sol (don't exceed planned target)
+        add_sol = min(add_sol, max(0.0, pos.target_sol - pos.cost_sol))
+        # Cap at max_trade_sol - cost_sol (broker limit)
+        add_sol = min(add_sol, max(0.0, self.max_trade_sol - pos.cost_sol))
+        if add_sol <= 0.0005:
+            return None
+        try:
+            if self.quote_only and self.quote_shadow_positions:
+                # Build buy quote for the scale amount
+                quote = self.build_swap(SOL_MINT, mint, add_sol, self.buy_slippage)
+                quote_tokens = self.rate_amount_out(quote)
+                if quote_tokens <= 0:
+                    log(f"PGG2-LIVE-SCALE-FAIL {short_addr(mint)} no quote tokens")
+                    return None
+                fill_price = price * (1.0 + self.drag)
+                add_paper_tokens = add_sol / max(fill_price, 1e-18)
+                # Update position
+                pos.cost_sol += add_sol
+                pos.tokens_bought += add_paper_tokens
+                pos.remaining_tokens += add_paper_tokens
+                pos.avg_price = pos.cost_sol / max(pos.tokens_bought, 1e-18)
+                # Update quote shadow tokens (more tokens to sell on exit)
+                if mint in self.quote_shadow_tokens:
+                    self.quote_shadow_tokens[mint] += quote_tokens
+                else:
+                    self.quote_shadow_tokens[mint] = quote_tokens
+                pos.state = state
+                pos.update(price)
+                log(
+                    f"PGG2-QUOTE-SHADOW-SCALE {short_addr(mint)} state={state} "
+                    f"add={add_sol:.6f} cost={pos.cost_sol:.6f} "
+                    f"avg_price={pos.avg_price:.9e} mult={pos.last_mult:.3f} reason={reason}"
+                )
+                self.save_state()
+                return pos
+            # Live mode: not implemented (would need a second buy tx)
+            log(f"PGG2-LIVE-SCALE-LIVE-NOT-IMPLEMENTED {short_addr(mint)} reason={reason}")
+            return None
+        except Exception as exc:
+            log(f"PGG2-LIVE-SCALE-FAIL {short_addr(mint)} {type(exc).__name__}: {exc}")
+            return None
 
     def partial(self, mint: str, fraction: float, price: float, reason: str) -> Optional[Position]:
         """Phase 18 2026-05-08: REAL partial sell. Was blocked, breaking scale-out
