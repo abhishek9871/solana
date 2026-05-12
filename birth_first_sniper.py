@@ -36,11 +36,6 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-# 2026-05-10 — PumpSwap AMM program. Subscribed alongside PUMP_PROGRAM so the
-# bot can SEE post-migration AMM trades and score them via moonshot_unified.
-# Without this subscription the bot is blind to ~70% of real volume (large
-# pumps continue as AMM after BC graduation; this catches them too).
-PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
 BC_DISC = bytes([23, 183, 248, 55, 96, 216, 172, 96])
@@ -52,11 +47,6 @@ DISC_BUY = bytes([102, 6, 61, 18, 1, 218, 235, 234])
 DISC_BUY_EXACT_SOL_IN = bytes([56, 252, 116, 8, 158, 223, 205, 95])
 DISC_SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])
 DISC_MIGRATE = bytes([155, 234, 231, 146, 236, 158, 162, 30])
-# PumpSwap AMM (post-migration). Same regular-buy disc as BC; AMM also has
-# a buy_exact_quote_in variant. Sell shares the same disc as BC sell.
-DISC_AMM_BUY = bytes([102, 6, 61, 18, 1, 218, 235, 234])
-DISC_AMM_BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])
-DISC_AMM_SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])
 
 
 def load_dotenv() -> None:
@@ -587,11 +577,6 @@ class Position:
     derisk_done: bool = False
     dry_live_cost_sol: float = 0.0
     dry_live_locked_rent_sol: float = 0.0
-    moonshot_mode: bool = False
-    moonshot_arm_ts: int = 0
-    moonshot_arm_peak: float = 0.0
-    scale_out_step: int = 0
-    peak_advance_ts: int = 0
 
     def age_sec(self, ts_ms: int) -> float:
         return max(0.0, (ts_ms - self.opened_ts_ms) / 1000.0)
@@ -1035,82 +1020,13 @@ def parse_base64_shred_for_pump_events(shred_result: dict[str, Any], tracked_wal
         recv_ns = now_ns()
         for ix in vt.message.instructions:
             program = get_key(keys, int(ix.program_id_index))
-            if program not in (PUMP_PROGRAM, PUMP_AMM_PROGRAM):
+            if program != PUMP_PROGRAM:
                 continue
             data = bytes(ix.data)
             if len(data) < 8:
                 continue
             disc = data[:8]
             accounts = list(ix.accounts)
-            # 2026-05-10 — AMM trade parsing for moonshot detection.
-            # PumpSwap (post-migration) trades flow through PUMP_AMM_PROGRAM.
-            # Account layout (both buy and sell, first 5 are stable):
-            #   0=pool, 1=user, 2=global_config, 3=base_mint, 4=quote_mint
-            # Data layout per disc:
-            #   AMM regular buy:  u64(base_amount_out) + u64(max_quote_amount_in)
-            #   buy_exact_quote_in: u64(spend_lamports) + u64(min_base_out) + 1B
-            #   AMM sell:         u64(base_amount) + u64(min_quote_out)
-            # We use the args (intent) as approximate sol/token amounts —
-            # good enough for moonshot accumulation detection.
-            if program == PUMP_AMM_PROGRAM:
-                if len(data) < 24:
-                    continue
-                if disc not in (DISC_AMM_BUY, DISC_AMM_BUY_EXACT_QUOTE_IN, DISC_AMM_SELL):
-                    continue
-                mint = get_account_key(keys, accounts, 3)
-                # If account[3] is WSOL, the layout differs (some sell variants
-                # have base_mint at index 4). Try [4] in that case. If still
-                # WSOL or empty, skip.
-                if mint == "So11111111111111111111111111111111111111112" or not mint:
-                    mint = get_account_key(keys, accounts, 4)
-                if not mint or mint == "So11111111111111111111111111111111111111112":
-                    continue
-                user = get_account_key(keys, accounts, 1) or signer
-                arg_a = int.from_bytes(data[8:16], "little")
-                arg_b = int.from_bytes(data[16:24], "little")
-                is_buy = disc in (DISC_AMM_BUY, DISC_AMM_BUY_EXACT_QUOTE_IN)
-                if disc == DISC_AMM_BUY_EXACT_QUOTE_IN:
-                    sol_lamports = arg_a
-                    token_amount = arg_b
-                    instruction_kind = "amm_buy_exact_quote_in"
-                elif disc == DISC_AMM_BUY:
-                    token_amount = arg_a
-                    sol_lamports = arg_b
-                    instruction_kind = "amm_buy"
-                else:
-                    token_amount = arg_a
-                    # AMM SELL: arg_b is min_quote_out (slippage floor), so
-                    # actual SOL received is typically 1.5-2× higher.
-                    # Scale up to better estimate REAL sell pressure for
-                    # downstream filters (sell_ratio, etc).
-                    amm_sell_scale = env_float("BIRTH_AMM_SELL_SOL_SCALE", 1.7)
-                    sol_lamports = int(arg_b * amm_sell_scale)
-                    instruction_kind = "amm_sell"
-                max_trade_lamports = int(env_float("BIRTH_MAX_DECODED_TRADE_SOL", 250.0) * 1_000_000_000)
-                if sol_lamports > max_trade_lamports:
-                    continue
-                # Set price_hint from sol/token args (intent-based but
-                # gives queue_or_fill a non-zero price to fill immediately
-                # instead of expiring with no_curve_price).
-                price_hint = (sol_lamports / max(token_amount, 1)) if token_amount > 0 else 0.0
-                events.append(PumpEvent(
-                    ts_ms=ts_ms,
-                    recv_ns=recv_ns,
-                    sig=sig,
-                    slot=slot,
-                    signer=signer,
-                    kind="trade",
-                    mint=mint,
-                    bonding_curve="",
-                    user=user,
-                    is_buy=is_buy,
-                    sol_lamports=sol_lamports,
-                    token_amount=token_amount,
-                    tracked=(signer in tracked_wallets) or (user in tracked_wallets),
-                    instruction_kind=instruction_kind,
-                    price_hint=price_hint,
-                ))
-                continue
             if disc in {DISC_CREATE, DISC_CREATE_V2}:
                 is_v2 = disc == DISC_CREATE_V2
                 mint = get_account_key(keys, accounts, 0)
@@ -1238,53 +1154,6 @@ class BirthFirstSniper:
         ts = now_ms()
         self.last_shred_msg_ms = ts
         self.last_curve_msg_ms = ts
-        # Phase 11 2026-05-08: smart-wallet WS tracker. Subscribes to PumpPortal
-        # subscribeAccountTrade for known alpha wallets. Provides the missing
-        # coordinated-buy signal — when 1+ smart wallet buys a mint we're
-        # evaluating, that's a strong moonshot pre-confirmation per Marino paper.
-        self.smart_wallet_tracker = None
-        if env_bool("SMART_WALLET_WS_ENABLED", True):
-            try:
-                from pumpportal_smart_wallet import SmartWalletTracker
-                self.smart_wallet_tracker = SmartWalletTracker(
-                    log_fn=log,
-                    window_sec=env_float("SMART_WALLET_WINDOW_SEC", 30.0),
-                )
-                log(f"PHASE11: SmartWalletTracker initialized with {len(self.smart_wallet_tracker.wallets)} wallets")
-            except Exception as exc:
-                log(f"PHASE11: smart-wallet tracker init failed {type(exc).__name__}: {exc}")
-                self.smart_wallet_tracker = None
-        # Phase 15 2026-05-08: signal-scraping layer.
-        # (A) RugCheck pre-buy gate: rejects rug-pattern tokens before strike.
-        # (B) Pump.fun engagement poller: livestream viewers + reply count
-        #     signals retail bots can't compute from raw on-chain data.
-        self.rugcheck_client = None
-        if env_bool("RUGCHECK_ENABLED", True):
-            try:
-                from rugcheck_client import RugCheckClient
-                self.rugcheck_client = RugCheckClient(
-                    log_fn=log,
-                    reject_score=env_int("RUGCHECK_REJECT_SCORE", 4),
-                    timeout_sec=env_float("RUGCHECK_TIMEOUT_SEC", 0.45),
-                    cache_ttl_sec=env_float("RUGCHECK_CACHE_TTL_SEC", 300.0),
-                )
-                log(f"PHASE15A: RugCheckClient initialized reject_score={self.rugcheck_client.reject_score}")
-            except Exception as exc:
-                log(f"PHASE15A: RugCheck init failed {type(exc).__name__}: {exc}")
-                self.rugcheck_client = None
-        self.engagement_poller = None
-        if env_bool("ENGAGEMENT_POLL_ENABLED", True):
-            try:
-                from pumpfun_engagement import PumpfunEngagementPoller
-                self.engagement_poller = PumpfunEngagementPoller(
-                    log_fn=log,
-                    poll_sec=env_float("ENGAGEMENT_POLL_SEC", 4.0),
-                    limit=env_int("ENGAGEMENT_POLL_LIMIT", 50),
-                )
-                log(f"PHASE15B: EngagementPoller initialized poll={self.engagement_poller.poll_sec}s")
-            except Exception as exc:
-                log(f"PHASE15B: engagement poller init failed {type(exc).__name__}: {exc}")
-                self.engagement_poller = None
 
     @staticmethod
     def load_tracked(path: Path) -> set[str]:
@@ -1787,28 +1656,39 @@ class BirthFirstSniper:
 
     @staticmethod
     def slim_features(features: dict[str, Any]) -> dict[str, Any]:
+        # v33 — risk-worker close paths may pass a minimal feature dict (no
+        # bonding-curve snapshot). Use `.get` with safe defaults so the close
+        # decision log never raises KeyError. Mirror the same defaults used
+        # by the bonding-curve poll snapshot.
+        s700 = features.get("s700") or {}
+        s1500 = features.get("s1500") or {}
         return {
-            "price": features["price"],
-            "has_curve": features["has_curve"],
-            "complete": features["complete"],
-            "vsol_sol": features["vsol_sol"],
-            "age_ms": features["age_ms"],
-            "buy_age_ms": features["buy_age_ms"],
-            "first_buy_sol": features["first_buy_sol"],
-            "create_version": features["create_version"],
-            "is_mayhem": features["is_mayhem"],
-            "move250": features["move250"],
-            "move700": features["move700"],
-            "move1500": features["move1500"],
-            "score": features["score"],
-            "buy700": features["s700"]["buy_sol"],
-            "sell700": features["s700"]["sell_sol"],
-            "uniq700": features["s700"]["unique_buyers"],
-            "buy1500": features["s1500"]["buy_sol"],
-            "sell1500": features["s1500"]["sell_sol"],
-            "uniq1500": features["s1500"]["unique_buyers"],
-            "top_share1500": features["s1500"]["top_buy_share"],
-            "top_flip1500": features["s1500"]["top_buyer_flip"],
+            "price": features.get("price", 0.0),
+            "has_curve": features.get("has_curve", False),
+            "complete": features.get("complete", False),
+            "vsol_sol": features.get("vsol_sol", 0.0),
+            "age_ms": features.get("age_ms", 0),
+            "buy_age_ms": features.get("buy_age_ms", 0),
+            "first_buy_sol": features.get("first_buy_sol", 0.0),
+            "create_version": features.get("create_version", ""),
+            "is_mayhem": features.get("is_mayhem", False),
+            "move250": features.get("move250", 1.0),
+            "move700": features.get("move700", 1.0),
+            "move1500": features.get("move1500", 1.0),
+            "score": features.get("score", 0.0),
+            "buy700": s700.get("buy_sol", 0.0),
+            "sell700": s700.get("sell_sol", 0.0),
+            "uniq700": s700.get("unique_buyers", 0),
+            "buy1500": s1500.get("buy_sol", 0.0),
+            "sell1500": s1500.get("sell_sol", 0.0),
+            "uniq1500": s1500.get("unique_buyers", 0),
+            "top_share1500": s1500.get("top_buy_share", 0.0),
+            "top_flip1500": s1500.get("top_buyer_flip", 0.0),
+            # v33 — pass-through fields the risk worker enriches the dict with.
+            "cost_model_route": features.get("cost_model_route", ""),
+            "cost_model_confidence": features.get("cost_model_confidence", ""),
+            "pnl_model_version": features.get("pnl_model_version", ""),
+            "rule_id": features.get("rule_id", ""),
         }
 
     async def heartbeat_loop(self) -> None:
@@ -1894,7 +1774,7 @@ class BirthFirstSniper:
                         "id": 61001,
                         "method": "shredSubscribe",
                         "params": [
-                            {"accountInclude": [PUMP_PROGRAM, PUMP_AMM_PROGRAM], "accountRequired": [], "vote": False},
+                            {"accountInclude": [PUMP_PROGRAM], "accountRequired": [PUMP_PROGRAM], "vote": False},
                             {
                                 "encoding": "base64",
                                 "transactionDetails": "full",
@@ -1994,19 +1874,6 @@ class BirthFirstSniper:
             asyncio.create_task(self.heartbeat_loop()),
             asyncio.create_task(self.combined_stream_loop()),
         ]
-        if self.smart_wallet_tracker is not None:
-            tasks.append(asyncio.create_task(self.smart_wallet_tracker.run()))
-            tasks.append(asyncio.create_task(self.smart_wallet_tracker.prune()))
-        if self.engagement_poller is not None:
-            tasks.append(asyncio.create_task(self.engagement_poller.run()))
-        # Phase 20C 2026-05-08: register optional subclass loops by name probe.
-        # Lets PGG2.py add poll-driven strike + management loops without
-        # needing to override run() (which would duplicate this whole block).
-        for fn_name in ("engagement_poll_strike_loop", "engagement_manage_loop"):
-            fn = getattr(self, fn_name, None)
-            if fn is not None and asyncio.iscoroutinefunction(fn):
-                tasks.append(asyncio.create_task(fn()))
-                log(f"PHASE20C: registered subclass loop {fn_name}")
         deadline = time.time() + self.config.run_seconds if self.config.run_seconds > 0 else None
         try:
             while not self.stop_event.is_set():

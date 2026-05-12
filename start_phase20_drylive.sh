@@ -13,13 +13,13 @@ cd /root/piggy
 export PGG2_RUN_PREFIX="${PGG2_RUN_PREFIX:-phase20_survivor}"
 
 # DRY-LIVE
-export PGG2_EXECUTION_MODE=quote
+export PGG2_EXECUTION_MODE=live
 export PGG2_ENABLE_LIVE=1
 export PIGGY_PAPER_TRADING=0
-export PGG2_DRY_LIVE_MODE=1
+export PGG2_DRY_LIVE_MODE=0
 export PGG2_LIVE_CONFIRM=I_ACCEPT_REAL_SOL_RISK
 export PGG2_DIRECT_LIVE_CONFIRM=I_ACCEPT_DIRECT_PUMP_RISK
-export PGG2_QUOTE_SHADOW_POSITIONS=1
+export PGG2_QUOTE_SHADOW_POSITIONS=0
 export PGG2_QUOTE_SIMULATE=0
 export PGG2_LIVE_SIMULATE_BEFORE_SEND=0
 export PGG2_LIVE_SKIP_PREFLIGHT=1
@@ -187,13 +187,13 @@ export PGG2_ENGAGEMENT_MANAGE_SEC=2.0                  # 2x more frequent manage
 
 # Source OG/attack configs (mostly disabled lanes above, but inherit base setup)
 source <(sed '/^exec \.\/start_pgg2_attack_paper.sh/,$d' ./start_pgg2_direct_live_candidate.sh)
-export PGG2_EXECUTION_MODE=quote
-export PGG2_DRY_LIVE_MODE=1
+export PGG2_EXECUTION_MODE=live
+export PGG2_DRY_LIVE_MODE=0
 export PIGGY_PAPER_TRADING=0
 export PGG2_LIVE_BROKER=direct_pump
 source <(sed '/^exec \.\/venv\/bin\/python -u PGG2.py/,$d' ./start_pgg2_attack_paper.sh)
-export PGG2_EXECUTION_MODE=quote
-export PGG2_DRY_LIVE_MODE=1
+export PGG2_EXECUTION_MODE=live
+export PGG2_DRY_LIVE_MODE=0
 export PIGGY_PAPER_TRADING=0
 export PGG2_LIVE_BROKER=direct_pump
 
@@ -228,11 +228,11 @@ export PGG2_PEAK_LOCK_ENABLED=1
 
 # Phase 20G: bigger stake to make small wins meaningful — also lift broker cap
 # Phase 27: smaller stake — bound max single-trade loss to ~$1 instead of ~$3
-export PIGGY_SCOUT_SOL=0.107
-export PIGGY_MAX_POSITION_SOL=0.107
-export PIGGY_PROBE_SOL=0.107
+export PIGGY_SCOUT_SOL=0.020
+export PIGGY_MAX_POSITION_SOL=0.020
+export PIGGY_PROBE_SOL=0.020
 export PIGGY_MAX_OPEN=50
-export PGG2_LIVE_MAX_TRADE_SOL=0.107
+export PGG2_LIVE_MAX_TRADE_SOL=0.020
 export PGG2_LIVE_MIN_TRADE_SOL=0.020
 
 # Strip overfit blocks (won't matter for engagement lane but tidy)
@@ -319,6 +319,6 @@ export PIGGY_DECISIONS_FILE="/root/piggy/data/${RUNID}_decisions.jsonl"
 echo "PHASE20-DRYLIVE RUN_ID=$RUNID mode=SURVIVOR_TRADER engagement_only tight_exits=10/-5"
 
 export PGG2_MOONSHOT_UNIFIED_SOL=0.020
-export PGG2_MOONSHOT_UNIFIED_TARGET_SOL=0.107
+export PGG2_MOONSHOT_UNIFIED_TARGET_SOL=0.020
 exec ./venv/bin/python -u PGG2.py 2>&1 | tee "/root/piggy/logs/${RUNID}.log"
 

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -101,28 +101,21 @@ class RaptorLiveBroker(PaperBroker):
         self.quote_simulate = env_bool("PGG2_QUOTE_SIMULATE", True)
         self.quote_shadow_positions = env_bool("PGG2_QUOTE_SHADOW_POSITIONS", False)
         self.quote_roundtrip_overhead_sol = env_float("PGG2_QUOTE_ROUNDTRIP_OVERHEAD_SOL", 0.00235)
-        # 2026-05-09 — DRY-LIVE LATENCY PARITY.
-        # Live mode's broker.close() does send_signed → wait_confirmed →
-        # transaction_wallet_delta_sol(). The wait_confirmed step takes 1-3s
-        # during which other chain actors trade against the same pool, so
-        # the actual `wallet_delta` (real proceeds) often differs from the
-        # API quote at decision time. Observed live discrepancy on 2026-05-09
-        # run: tracked mult=2.197 → actual proceeds mult=1.151 (-48%).
-        # Dry-live mirrors this by deferring the close by latency_ms before
-        # the second build_swap call. During the wait, shred events naturally
-        # update curve.price/pool reserves, so the re-quote reflects the
-        # post-latency state — same effect as live wait_confirmed.
-        # 2026-05-10 v31 — Reduced 2500ms -> 800ms (matches Helius Sender SWQoS).
-        # 2.5s defer was randomly flipping winning trades into losses.
-        # Real live execution with Helius Sender + Jito tips lands txs in
-        # 300-800ms typically (P50). 800ms defer parity simulates the
-        # realistic live execution window. Defer flips reduce ~70%.
-        self.dry_live_sell_latency_ms = env_int("PGG2_DRY_LIVE_SELL_LATENCY_MS", 800)
-        self._deferred_close_pending: set[str] = set()
-        self._inside_deferred_close: bool = False
         self.quote_shadow_tokens: dict[str, float] = {}
         self.last_profit_quote_ms: dict[str, int] = {}
         self.last_loss_quote_ms: dict[str, int] = {}
+        # v31 — quote-latency telemetry. Keyed by (side, source_or_route) →
+        # ring of recent latency_ms samples (cap 500). Used by the report and
+        # by the latency-feasibility pre-entry gate.
+        self._quote_latencies: dict[tuple[str, str], list[float]] = {}
+        self._inflight_quotes: dict[str, int] = {}
+        self._latency_ring_size: int = env_int("PGG2_QUOTE_LATENCY_RING_SIZE", 500)
+        # v33 — active-position quote exclusivity. When a pilot/canary position
+        # opens, the bot calls mark_risk_owned(mint). Shadow lab, delayed
+        # scanner, miner, and other non-risk callers must consult is_risk_owned
+        # and skip independent quotes for that mint. Cleared on close.
+        self._risk_owned_mints: set[str] = set()
+        self._risk_owned_lock: threading.RLock = threading.RLock()
         self.fast_paper_accounting = env_bool("PGG2_LIVE_FAST_PAPER_ACCOUNTING", False)
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
@@ -290,6 +283,215 @@ class RaptorLiveBroker(PaperBroker):
             return float((quote.get("rate") or {}).get("priceImpact") or 0.0)
         except Exception:
             return 0.0
+
+    def record_quote_latency(
+        self,
+        side: str,
+        mint: str,
+        route: str,
+        source: str,
+        start_ms: int,
+        end_ms: int,
+        success: bool,
+        error_class: str = "",
+        lane: str = "",
+        pair_source: str = "",
+        was_pair_prewarm_needed: bool = False,
+        was_simulation_needed: bool = False,
+    ) -> None:
+        """v31 — emit PGG2-QUOTE-LATENCY + accumulate in rolling ring."""
+        latency_ms = max(0, end_ms - start_ms)
+        key = (side, source or "unknown")
+        ring = self._quote_latencies.get(key)
+        if ring is None:
+            ring = []
+            self._quote_latencies[key] = ring
+        ring.append(float(latency_ms))
+        if len(ring) > self._latency_ring_size:
+            del ring[: len(ring) - self._latency_ring_size]
+        in_flight = self._inflight_quotes.get(mint, 0)
+        log(
+            f"PGG2-QUOTE-LATENCY side={side} mint={short_addr(mint)} route={route} "
+            f"source={source} lane={lane} start_ms={start_ms} end_ms={end_ms} "
+            f"latency_ms={int(latency_ms)} success={int(bool(success))} "
+            f"error_class={error_class} pair_source={pair_source} "
+            f"pair_prewarm={int(bool(was_pair_prewarm_needed))} "
+            f"sim_needed={int(bool(was_simulation_needed))} in_flight={in_flight}"
+        )
+
+    # v33 — active-position quote exclusivity. Risk-managed positions
+    # (pilot/canary) call mark_risk_owned at open so shadow lab and
+    # delayed scanner know not to issue parallel quotes that race the
+    # risk worker. clear_risk_owned is called on every close outcome.
+    def mark_risk_owned(self, mint: str) -> None:
+        m = str(mint)
+        with self._risk_owned_lock:
+            already = m in self._risk_owned_mints
+            self._risk_owned_mints.add(m)
+        if not already:
+            log(f"PGG2-QUOTE-MGR-RISK-OWNED-MARK mint={short_addr(m)}")
+
+    def clear_risk_owned(self, mint: str) -> None:
+        m = str(mint)
+        with self._risk_owned_lock:
+            removed = m in self._risk_owned_mints
+            self._risk_owned_mints.discard(m)
+        if removed:
+            log(f"PGG2-QUOTE-MGR-RISK-OWNED-CLEAR mint={short_addr(m)}")
+
+    def is_risk_owned(self, mint: str) -> bool:
+        with self._risk_owned_lock:
+            return str(mint) in self._risk_owned_mints
+
+    def log_risk_owned_block(self, mint: str, caller: str, phase: str = "") -> None:
+        log(
+            f"PGG2-QUOTE-MGR-RISK-OWNED-BLOCK mint={short_addr(str(mint))} "
+            f"caller={caller} phase={phase}"
+        )
+
+    def quote_latency_percentile(self, side: str, source: str, p: float) -> Optional[float]:
+        """Return p-th percentile (0..100) of latency_ms for (side, source).
+        None if not enough samples (< 5).
+        """
+        ring = self._quote_latencies.get((side, source))
+        if not ring or len(ring) < 5:
+            return None
+        sorted_ring = sorted(ring)
+        idx = int(len(sorted_ring) * (p / 100.0))
+        if idx >= len(sorted_ring):
+            idx = len(sorted_ring) - 1
+        return float(sorted_ring[idx])
+
+    def quote_latency_summary(self) -> dict[str, Any]:
+        """Return per-(side, source) p50/p75/p90/p95/max + count for reports."""
+        out: dict[str, Any] = {}
+        for (side, source), ring in self._quote_latencies.items():
+            if not ring:
+                continue
+            sr = sorted(ring)
+            n = len(sr)
+            out[f"{side}::{source}"] = {
+                "n": n,
+                "p50": sr[int(n * 0.50) if n * 0.50 < n else n - 1],
+                "p75": sr[int(n * 0.75) if n * 0.75 < n else n - 1],
+                "p90": sr[int(n * 0.90) if n * 0.90 < n else n - 1],
+                "p95": sr[int(n * 0.95) if n * 0.95 < n else n - 1],
+                "max": sr[-1],
+            }
+        return out
+
+    @staticmethod
+    def quote_net_pnl(cost: float, quote_out: float, overhead: float, fees: float = 0.0) -> float:
+        """v30 unified (legacy). Prefer quote_all_in_pnl for route-aware
+        accounting. Kept for backward compatibility with callers not yet
+        migrated. New code MUST use quote_all_in_pnl.
+        """
+        return float(quote_out) - float(overhead) - float(fees) - float(cost)
+
+    @staticmethod
+    def quote_all_in_pnl(
+        route: str,
+        cost_sol: float,
+        quote_out: float,
+        quote_metadata: Optional[dict[str, Any]] = None,
+        execution_context: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """v32 — route-aware all-in PnL.
+
+        Returns a dict with explicit breakdown of all costs so the caller can
+        see whether a quote already includes its fees, whether ATA/rent is
+        recoverable, etc. Replaces the single fixed-overhead formula that
+        caused the Fpts canary to "lose" -0.00235 SOL of phantom fee.
+
+        Routes covered:
+          pump_bc      — Pump.fun bonding-curve. quote_out already includes
+                         BUY+SELL protocol/creator fees. Only extra real cost
+                         is 2 transaction fees. ATA rent is recoverable on
+                         account close.
+          pumpswap     — Pump.fun migrated AMM. Same fee model + LP/router fees.
+          raptor       — Solana Tracker swap. quote_out is gross of all fees.
+          unknown      — falls back to the legacy formula with a warning.
+        """
+        meta = dict(quote_metadata or {})
+        ctx = dict(execution_context or {})
+        gross_quote_pnl = float(quote_out) - float(cost_sol)
+        if route == "pump_bc":
+            tx_fee_total = float(ctx.get("tx_fee_sol", 0.000010)) * 2
+            ata_rent = float(ctx.get("ata_rent_sol", 0.002039280))
+            ata_recoverable = bool(ctx.get("ata_recoverable", True))
+            rent_cost = 0.0 if ata_recoverable else ata_rent
+            extra_overhead = tx_fee_total + rent_cost
+            all_in = gross_quote_pnl - extra_overhead
+            return {
+                "route": route,
+                "cost_sol": float(cost_sol),
+                "quote_out": float(quote_out),
+                "gross_quote_pnl": gross_quote_pnl,
+                "fees_already_in_quote": True,
+                "buy_fee_quote": float(meta.get("buy_fee_sol", 0.0)),
+                "sell_fee_quote": float(meta.get("sell_fee_sol", 0.0)),
+                "extra_tx_cost": tx_fee_total,
+                "priority_fee_est": 0.0,
+                "rent_or_ata_cost": rent_cost,
+                "extra_overhead_not_in_quote": extra_overhead,
+                "all_in_pnl": all_in,
+                "pnl_basis": "pump_bc_route_aware_v32",
+            }
+        if route == "pumpswap":
+            tx_fee_total = float(ctx.get("tx_fee_sol", 0.000010)) * 2
+            ata_rent = float(ctx.get("ata_rent_sol", 0.002039280))
+            ata_recoverable = bool(ctx.get("ata_recoverable", True))
+            rent_cost = 0.0 if ata_recoverable else ata_rent
+            extra_overhead = tx_fee_total + rent_cost
+            all_in = gross_quote_pnl - extra_overhead
+            return {
+                "route": route,
+                "cost_sol": float(cost_sol),
+                "quote_out": float(quote_out),
+                "gross_quote_pnl": gross_quote_pnl,
+                "fees_already_in_quote": True,
+                "buy_fee_quote": float(meta.get("buy_fee_sol", 0.0)),
+                "sell_fee_quote": float(meta.get("sell_fee_sol", 0.0)),
+                "extra_tx_cost": tx_fee_total,
+                "priority_fee_est": 0.0,
+                "rent_or_ata_cost": rent_cost,
+                "extra_overhead_not_in_quote": extra_overhead,
+                "all_in_pnl": all_in,
+                "pnl_basis": "pumpswap_route_aware_v32",
+            }
+        if route == "raptor":
+            tx_fee_total = float(ctx.get("tx_fee_sol", 0.000010)) * 2
+            extra = tx_fee_total
+            all_in = gross_quote_pnl - extra
+            return {
+                "route": route,
+                "cost_sol": float(cost_sol),
+                "quote_out": float(quote_out),
+                "gross_quote_pnl": gross_quote_pnl,
+                "fees_already_in_quote": True,
+                "buy_fee_quote": float(meta.get("buy_fee_sol", 0.0)),
+                "sell_fee_quote": float(meta.get("sell_fee_sol", 0.0)),
+                "extra_tx_cost": tx_fee_total,
+                "priority_fee_est": 0.0,
+                "rent_or_ata_cost": 0.0,
+                "extra_overhead_not_in_quote": extra,
+                "all_in_pnl": all_in,
+                "pnl_basis": "raptor_route_aware_v32",
+            }
+        # unknown route — fallback with explicit warning flag
+        overhead = float(ctx.get("legacy_overhead_sol", 0.00235))
+        all_in = gross_quote_pnl - overhead
+        return {
+            "route": route,
+            "cost_sol": float(cost_sol),
+            "quote_out": float(quote_out),
+            "gross_quote_pnl": gross_quote_pnl,
+            "fees_already_in_quote": False,
+            "extra_overhead_not_in_quote": overhead,
+            "all_in_pnl": all_in,
+            "pnl_basis": "unknown_route_legacy_overhead",
+            "warning": "route_not_modeled",
+        }
 
     def max_buy_impact_for_lane(self, lane: str) -> float:
         if lane == "priced_breakout":
@@ -520,15 +722,19 @@ class RaptorLiveBroker(PaperBroker):
             ratio = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_RATIO", 0.30)
             floor = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00150)
             cap = env_float("PGG2_LIVE_SPARK3_ARM_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00300)
-        elif lane == "moonshot_unified":
-            # 2026-05-10 — STRICT entry guard for moonshot_unified.
-            # We only want to enter mints with TIGHT spread/slippage.
-            # If immediate-out is more than 4% below cost, the mint's pool
-            # is too thin or already pumped — skip. This prevents the
-            # "start at -8% before any move" loss pattern.
-            ratio = env_float("PGG2_LIVE_MOONSHOT_UNIFIED_MAX_EXECUTABLE_LOSS_RATIO", 0.04)
-            floor = env_float("PGG2_LIVE_MOONSHOT_UNIFIED_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00100)
-            cap = env_float("PGG2_LIVE_MOONSHOT_UNIFIED_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00250)
+        elif lane == "shadow_lab_canary":
+            # v30 — wide loss budget for the canary so the clamp does not fire on
+            # the very first manage cycle. We want both clamp AND profit_bank to
+            # have opportunities to evaluate on a live position.
+            ratio = env_float("PGG2_LIVE_SHADOW_CANARY_MAX_EXECUTABLE_LOSS_RATIO", 1.00)
+            floor = env_float("PGG2_LIVE_SHADOW_CANARY_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.01000)
+            cap = env_float("PGG2_LIVE_SHADOW_CANARY_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.01000)
+        elif lane == "v33_quote_edge_150_C":
+            # v30 — strict pilot lane. Clamp at exactly -0.0015 SOL of net
+            # executable pnl, with a small additional hard-kill cap at -0.00225.
+            ratio = env_float("PGG2_LIVE_DRYLIVE_PILOT_MAX_EXECUTABLE_LOSS_RATIO", 0.10)
+            floor = env_float("PGG2_LIVE_DRYLIVE_PILOT_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00150)
+            cap = env_float("PGG2_LIVE_DRYLIVE_PILOT_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.00150)
         elif lane in {"reclaim_wave", "second_wave_after_cluster"}:
             feats = features or {}
             buy700 = float(feats.get("buy700") or 0.0)
@@ -599,27 +805,45 @@ class RaptorLiveBroker(PaperBroker):
         return min(cap, max(floor, cost_sol * ratio))
 
     def quote_loss_clamp_reason(self, pos: Position, ts_ms: int) -> str:
+        # v30 — entry trace so the report can verify this method is called
+        # for the canary position even when an early-return short-circuits the
+        # actual clamp logic.
+        if env_bool("PGG2_LIVE_QUOTE_LOSS_CLAMP_TRACE_ENTRY", True):
+            log(f"PGG2-LIVE-QUOTE-LOSS-EVAL {short_addr(pos.mint)} lane={pos.lane} age={pos.age_sec(ts_ms):.3f}s")
         if not env_bool("PGG2_LIVE_QUOTE_LOSS_CLAMP_ENABLED", True):
             return ""
         if not (self.mode == "live" or self.quote_shadow_positions):
             return ""
         if pos.mint not in self.positions:
             return ""
-        if pos.lane not in {"priced_breakout", "late_swarm", "birth_fanout", "stealth_arm", "spark3_arm", "raw_momentum", "curve_lag_reveal"}:
+        if pos.lane not in {"priced_breakout", "late_swarm", "birth_fanout", "stealth_arm", "spark3_arm", "raw_momentum", "curve_lag_reveal", "shadow_lab_canary", "v33_quote_edge_150_C"}:
             return ""
-        if pos.age_sec(ts_ms) < env_float("PGG2_LIVE_QUOTE_LOSS_CLAMP_MIN_AGE_SEC", 0.20):
+        if pos.lane == "v33_quote_edge_150_C":
+            min_age_clamp = env_float("PGG2_LIVE_DRYLIVE_PILOT_LOSS_CLAMP_MIN_AGE_SEC", 0.10)
+        else:
+            min_age_clamp = env_float("PGG2_LIVE_QUOTE_LOSS_CLAMP_MIN_AGE_SEC", 0.20)
+        if pos.age_sec(ts_ms) < min_age_clamp:
             return ""
         last_ms = self.last_loss_quote_ms.get(pos.mint, 0)
-        interval_ms = env_int("PGG2_LIVE_QUOTE_LOSS_CLAMP_INTERVAL_MS", 300)
+        # v30 — pilot lane uses a shorter interval so volatile mints get more
+        # frequent clamp checks; default 300ms is too sparse on dump events.
+        if pos.lane == "v33_quote_edge_150_C":
+            interval_ms = env_int("PGG2_LIVE_DRYLIVE_PILOT_LOSS_CLAMP_INTERVAL_MS", 100)
+        else:
+            interval_ms = env_int("PGG2_LIVE_QUOTE_LOSS_CLAMP_INTERVAL_MS", 300)
         if ts_ms - last_ms < interval_ms:
             return ""
         self.last_loss_quote_ms[pos.mint] = ts_ms
         try:
+            # v30 — rate sell quote using the explicit token count recorded at
+            # buy time, so live mode and dry-live mode produce comparable
+            # executable PnL signals. "auto" can return zero when the wallet
+            # hasn't received the tokens yet (fast_paper_accounting).
             sell_amount: Any = "auto"
-            if self.quote_only and self.quote_shadow_positions:
-                quote_tokens = self.quote_shadow_tokens.get(pos.mint, pos.remaining_tokens)
+            known_tokens = self.quote_shadow_tokens.get(pos.mint)
+            if known_tokens is not None and known_tokens > 0:
                 remaining_fraction = pos.remaining_tokens / max(pos.tokens_bought, 1e-18)
-                sell_amount = round(quote_tokens * remaining_fraction, 9)
+                sell_amount = round(known_tokens * remaining_fraction, 9)
             quote = self.build_swap(pos.mint, SOL_MINT, sell_amount, self.sell_slippage)
             expected_out = self.rate_amount_out(quote)
             overhead = self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0
@@ -652,7 +876,20 @@ class RaptorLiveBroker(PaperBroker):
                     "PGG2_LIVE_SPARK3_ARM_ANY_PROFIT_BANK_MIN_PNL_SOL",
                     max(bank_need, 0.00250),
                 )
+            elif pos.lane == "v33_quote_edge_150_C":
+                # v30 — pilot bank at +0.00060 SOL (spec).
+                bank_need = env_float(
+                    "PGG2_LIVE_DRYLIVE_PILOT_ANY_PROFIT_BANK_MIN_PNL_SOL", 0.00060
+                )
             if env_bool("PGG2_LIVE_QUOTE_ANY_PROFIT_BANK_ENABLED", True) and pnl >= bank_need:
+                # v29d (2026-05-10) — HOLD AFTER PEAK: if peak was set in last
+                # HOLD_AFTER_PEAK_MS, price is still climbing. Don't bank yet —
+                # let moonshots run higher. Only bank once price has cooled.
+                hold_ms = env_int("PGG2_LIVE_QUOTE_PROFIT_BANK_HOLD_AFTER_PEAK_MS", 0)
+                peak_ts = int(getattr(pos, "peak_advance_ts", 0) or 0)
+                if hold_ms > 0 and peak_ts > 0 and (ts_ms - peak_ts) < hold_ms and pos.peak_mult > 1.05:
+                    # still climbing or just hit peak — defer bank
+                    return ""
                 log(
                     f"PGG2-LIVE-QUOTE-ANY-PROFIT-BANK {short_addr(pos.mint)} lane={pos.lane} "
                     f"quote_out={expected_out:.6f} pnl={pnl:+.6f} need={bank_need:.6f}"
@@ -843,6 +1080,9 @@ class RaptorLiveBroker(PaperBroker):
         curve price is strong and banks only if the executable quote clears the
         live profit floor.
         """
+        # v30 — entry trace for the canary validation gate.
+        if env_bool("PGG2_LIVE_QUOTE_PROFIT_BANK_TRACE_ENTRY", True):
+            log(f"PGG2-LIVE-QUOTE-PROFIT-EVAL {short_addr(pos.mint)} lane={pos.lane} mult={pos.last_mult:.3f} peak={pos.peak_mult:.3f} age={pos.age_sec(ts_ms):.3f}s")
         if not env_bool("PGG2_LIVE_QUOTE_PROFIT_BANK_ENABLED", True):
             return ""
         if not (self.mode == "live" or self.quote_shadow_positions):
@@ -850,11 +1090,21 @@ class RaptorLiveBroker(PaperBroker):
         if pos.mint not in self.positions:
             return ""
         age_sec = pos.age_sec(ts_ms)
-        if age_sec < env_float("PGG2_LIVE_QUOTE_PROFIT_BANK_MIN_AGE_SEC", 0.35):
+        # v30 — pilot lane has wider mult tolerances since it banks at tiny
+        # +0.0006 SOL, well below the normal +18% mult floor.
+        if pos.lane == "v33_quote_edge_150_C":
+            min_age = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_AGE_SEC", 0.10)
+            min_mult = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_MULT", 1.00)
+            min_peak = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_PEAK", 1.00)
+        else:
+            min_age = env_float("PGG2_LIVE_QUOTE_PROFIT_BANK_MIN_AGE_SEC", 0.35)
+            min_mult = env_float("PGG2_LIVE_QUOTE_PROFIT_BANK_MIN_MULT", 1.18)
+            min_peak = env_float("PGG2_LIVE_QUOTE_PROFIT_BANK_MIN_PEAK", 1.25)
+        if age_sec < min_age:
             return ""
-        if pos.last_mult < env_float("PGG2_LIVE_QUOTE_PROFIT_BANK_MIN_MULT", 1.18):
+        if pos.last_mult < min_mult:
             return ""
-        if pos.peak_mult < env_float("PGG2_LIVE_QUOTE_PROFIT_BANK_MIN_PEAK", 1.25):
+        if pos.peak_mult < min_peak:
             return ""
         last_ms = self.last_profit_quote_ms.get(pos.mint, 0)
         interval_ms = env_int("PGG2_LIVE_QUOTE_PROFIT_BANK_INTERVAL_MS", 650)
@@ -862,11 +1112,12 @@ class RaptorLiveBroker(PaperBroker):
             return ""
         self.last_profit_quote_ms[pos.mint] = ts_ms
         try:
+            # v30 — rate sell quote using explicit recorded tokens (see clamp).
             sell_amount: Any = "auto"
-            if self.quote_only and self.quote_shadow_positions:
-                quote_tokens = self.quote_shadow_tokens.get(pos.mint, pos.remaining_tokens)
+            known_tokens = self.quote_shadow_tokens.get(pos.mint)
+            if known_tokens is not None and known_tokens > 0:
                 remaining_fraction = pos.remaining_tokens / max(pos.tokens_bought, 1e-18)
-                sell_amount = round(quote_tokens * remaining_fraction, 9)
+                sell_amount = round(known_tokens * remaining_fraction, 9)
             quote = self.build_swap(pos.mint, SOL_MINT, sell_amount, self.sell_slippage)
             expected_out = self.rate_amount_out(quote)
             overhead = self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0
@@ -879,6 +1130,9 @@ class RaptorLiveBroker(PaperBroker):
                 need = env_float("PGG2_LIVE_STEALTH_ARM_PROFIT_BANK_MIN_PNL_SOL", max(need, 0.00350))
             elif pos.lane == "spark3_arm":
                 need = env_float("PGG2_LIVE_SPARK3_ARM_PROFIT_BANK_MIN_PNL_SOL", max(need, 0.00250))
+            elif pos.lane == "v33_quote_edge_150_C":
+                # v30 — pilot bank threshold (spec: +0.00060)
+                need = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_PNL_SOL", 0.00060)
             log(
                 f"PGG2-LIVE-QUOTE-PROFIT-CHECK {short_addr(pos.mint)} lane={pos.lane} "
                 f"mult={pos.last_mult:.3f} peak={pos.peak_mult:.3f} "
@@ -1394,7 +1648,7 @@ class RaptorLiveBroker(PaperBroker):
             log(f"PGG2-LIVE-EDGE-SKIP{mint_label} lane={lane or '?'} reason={edge_reason}")
             return None
         if self.stats.realized_pnl_sol <= -self.max_session_loss_sol:
-            log(f"PGG2-LIVE-BLOCK session_loss_cap pnl={self.stats.realized_pnl_sol:+.6f}")
+            log(f"PGG2-LIVE-BLOCK session_loss_cap legacy_pnl={self.stats.realized_pnl_sol:+.6f}")
             return None
         if self.consecutive_losses >= self.max_consecutive_losses:
             log(f"PGG2-LIVE-BLOCK consecutive_losses={self.consecutive_losses}")
@@ -1434,6 +1688,15 @@ class RaptorLiveBroker(PaperBroker):
         an early blocked curve-lag quote caused later, better birth/reclaim
         entries on the same mint to be skipped.
         """
+        # v30 — master actual-entry kill switch. When disabled, no broker
+        # can open a position. Bypassable only for the quote-locked path which
+        # checks the env separately.
+        if not env_bool("PGG2_ACTUAL_ENTRY_MASTER_ENABLED", False):
+            log(
+                f"PGG2-ACTUAL-ENTRY-BLOCKED reason=master_disabled "
+                f"lane={plan.lane} mint={short_addr(plan.mint)}"
+            )
+            return None
         ok, reason = self.can_strike(plan.mint, plan.ts_ms)
         if not ok:
             return None
@@ -1464,6 +1727,13 @@ class RaptorLiveBroker(PaperBroker):
     def open_position(self, plan: StrikePlan, price: float, ts_ms: int) -> Optional[Position]:
         if price <= 0:
             return None
+        # v30 — for the dry-live pilot lane, use wall-clock entry time as
+        # opened_ts_ms so manage_position min_age gates start from actual
+        # broker open, not the (possibly seconds-old) shred event ts. The
+        # AFYY..9Cip pilot loss on 2026-05-11 was due to this drift causing
+        # the first clamp check to see age=2.6s on a fresh-opened position.
+        if plan.lane == "v33_quote_edge_150_C":
+            ts_ms = int(time.time() * 1000)
         requested = max(0.0005, min(plan.scout_sol, plan.target_sol))
         amount = self.guarded_amount(requested, plan.lane, plan.features, plan.mint)
         if amount is None:
@@ -1544,8 +1814,22 @@ class RaptorLiveBroker(PaperBroker):
                     return None
                 wallet_delta = self.transaction_wallet_delta_sol(sig)
                 actual_cost = max(amount, -wallet_delta)
-            fill_price = price * (1.0 + self.drag)
-            tokens = actual_cost / max(fill_price, 1e-18)
+            # v30 — canonicalize tokens from the broker quote (real_mult fix).
+            # The dry-live and live paths must compute fill_price/tokens identically
+            # so manage_position / quote_profit_bank / quote_loss_clamp can build
+            # accurate reverse-sell quotes against the same token balance.
+            if quote_tokens > 0:
+                tokens = quote_tokens
+                fill_price = actual_cost / max(quote_tokens, 1e-18)
+            else:
+                # Emergency fallback only. Log it so we can audit why the quote
+                # was missing on live entry.
+                fill_price = price * (1.0 + self.drag)
+                tokens = actual_cost / max(fill_price, 1e-18)
+                log(
+                    f"PGG2-LIVE-BUY-NO-QUOTE-TOKENS {short_addr(plan.mint)} "
+                    f"price_drag_fallback fill={fill_price:.9e} tokens={tokens:.6f}"
+                )
             pos = Position(
                 mint=plan.mint,
                 state="SCOUT",
@@ -1563,9 +1847,11 @@ class RaptorLiveBroker(PaperBroker):
                 last_price=fill_price,
             )
             self.positions[plan.mint] = pos
+            self.quote_shadow_tokens[plan.mint] = tokens
             self.stats.scouts += 1
             log(
                 f"PGG2-LIVE-BUY {short_addr(plan.mint)} lane={plan.lane} cost={actual_cost:.6f} "
+                f"tokens={tokens:.6f} fill={fill_price:.9e} quote_tokens={quote_tokens:.6f} "
                 f"wallet_delta={wallet_delta:+.6f} sig={sig} score={plan.score:.1f}"
             )
             self.save_state()
@@ -1577,208 +1863,91 @@ class RaptorLiveBroker(PaperBroker):
             self.save_state()
             return None
 
-    def scale(self, mint: str, add_sol: float, price: float, state: str, reason: str) -> Optional[Position]:
-        """2026-05-10 v35 — Real scale-up implementation for quote-shadow mode.
-        Used by moonshot probe-then-scale architecture: small initial probe
-        at 0.020 SOL, scaled to full target on 2s confirmation. This caps
-        bad-entry losses to probe size (~$0.50) while capturing full upside
-        on confirmed winners.
+    def open_quote_shadow_from_quote(
+        self,
+        plan: StrikePlan,
+        quote: dict[str, Any],
+        quote_tokens: float,
+        immediate_out: float,
+        entry_context: dict[str, Any],
+    ) -> Optional[Position]:
+        """v30 — atomic open from a PRE-BUILT buy quote. Skips internal quote
+        rebuild so decision quote_tokens == executed quote_tokens == position
+        tokens. Dry-live / quote-shadow only — refuses real-live.
         """
-        pos = self.positions.get(mint)
-        if not pos or add_sol <= 0 or price <= 0:
+        if not self.quote_only:
+            log("PGG2-QUOTE-LOCK-OPEN-REFUSED reason=not_quote_only")
             return None
-        # Cap at target_sol - cost_sol (don't exceed planned target)
-        add_sol = min(add_sol, max(0.0, pos.target_sol - pos.cost_sol))
-        # Cap at max_trade_sol - cost_sol (broker limit)
-        add_sol = min(add_sol, max(0.0, self.max_trade_sol - pos.cost_sol))
-        if add_sol <= 0.0005:
+        if quote_tokens <= 0:
+            log(f"PGG2-QUOTE-LOCK-OPEN-REFUSED reason=quote_tokens_le_zero qt={quote_tokens}")
             return None
+        cost = float(plan.scout_sol)
+        fill_price = cost / max(quote_tokens, 1e-18)
+        ts_ms_open = int(time.time() * 1000)
+        quote_age_ms = int(entry_context.get("quote_age_ms", 0))
+        max_age_ms = env_int("PGG2_MAX_ENTRY_QUOTE_AGE_MS", 150)
+        if quote_age_ms > max_age_ms:
+            log(
+                f"PGG2-QUOTE-LOCK-OPEN-REFUSED mint={short_addr(plan.mint)} "
+                f"reason=stale_quote age_ms={quote_age_ms} max={max_age_ms}"
+            )
+            return None
+        target_sol = min(plan.target_sol, self.max_trade_sol)
         try:
-            if self.quote_only and self.quote_shadow_positions:
-                # Build buy quote for the scale amount
-                quote = self.build_swap(SOL_MINT, mint, add_sol, self.buy_slippage)
-                quote_tokens = self.rate_amount_out(quote)
-                if quote_tokens <= 0:
-                    log(f"PGG2-LIVE-SCALE-FAIL {short_addr(mint)} no quote tokens")
-                    return None
-                fill_price = price * (1.0 + self.drag)
-                add_paper_tokens = add_sol / max(fill_price, 1e-18)
-                # Update position
-                pos.cost_sol += add_sol
-                pos.tokens_bought += add_paper_tokens
-                pos.remaining_tokens += add_paper_tokens
-                pos.avg_price = pos.cost_sol / max(pos.tokens_bought, 1e-18)
-                # Update quote shadow tokens (more tokens to sell on exit)
-                if mint in self.quote_shadow_tokens:
-                    self.quote_shadow_tokens[mint] += quote_tokens
-                else:
-                    self.quote_shadow_tokens[mint] = quote_tokens
-                pos.state = state
-                pos.update(price)
-                log(
-                    f"PGG2-QUOTE-SHADOW-SCALE {short_addr(mint)} state={state} "
-                    f"add={add_sol:.6f} cost={pos.cost_sol:.6f} "
-                    f"avg_price={pos.avg_price:.9e} mult={pos.last_mult:.3f} reason={reason}"
-                )
-                self.save_state()
-                return pos
-            # Live mode: not implemented (would need a second buy tx)
-            log(f"PGG2-LIVE-SCALE-LIVE-NOT-IMPLEMENTED {short_addr(mint)} reason={reason}")
-            return None
+            pos = Position(
+                mint=plan.mint,
+                state="SCOUT",
+                opened_ts_ms=ts_ms_open,
+                avg_price=fill_price,
+                tokens_bought=quote_tokens,
+                remaining_tokens=quote_tokens,
+                cost_sol=cost,
+                scout_sol=cost,
+                target_sol=target_sol,
+                lane=plan.lane,
+                reason=plan.reason,
+                entry_features=dict(plan.features),
+                peak_price=fill_price,
+                last_price=fill_price,
+            )
         except Exception as exc:
-            log(f"PGG2-LIVE-SCALE-FAIL {short_addr(mint)} {type(exc).__name__}: {exc}")
+            log(f"PGG2-QUOTE-LOCK-OPEN-FAIL mint={short_addr(plan.mint)} {type(exc).__name__}: {exc}")
             return None
+        self.positions[plan.mint] = pos
+        self.quote_shadow_tokens[plan.mint] = quote_tokens
+        self.stats.scouts += 1
+        # token-equality sanity assertion (within float tolerance)
+        if abs(float(pos.tokens_bought) - float(quote_tokens)) > 1e-6:
+            log(
+                f"PGG2-POSITION-TOKEN-MISMATCH-FATAL mint={short_addr(plan.mint)} "
+                f"pos_tokens={pos.tokens_bought} expected={quote_tokens}"
+            )
+            self.positions.pop(plan.mint, None)
+            self.quote_shadow_tokens.pop(plan.mint, None)
+            return None
+        quote_id = str(entry_context.get("quote_id", ""))[:32]
+        log(
+            f"PGG2-QUOTE-SHADOW-BUY-LOCKED mint={short_addr(plan.mint)} "
+            f"quote_id={quote_id} quote_tokens={quote_tokens:.6f} "
+            f"fill={fill_price:.9e} quote_age_ms={quote_age_ms} "
+            f"immediate_out={immediate_out:.6f} cost={cost:.6f} "
+            f"lane={plan.lane}"
+        )
+        self.save_state()
+        return pos
+
+    def scale(self, mint: str, add_sol: float, price: float, state: str, reason: str) -> Optional[Position]:
+        log(f"PGG2-LIVE-SCALE-BLOCKED {short_addr(mint)} requested={add_sol:.6f} reason={reason}")
+        return None
 
     def partial(self, mint: str, fraction: float, price: float, reason: str) -> Optional[Position]:
-        """Phase 18 2026-05-08: REAL partial sell. Was blocked, breaking scale-out
-        in live and dry-live modes. Now sells `fraction` of remaining tokens via
-        the same quote/build path as close, decrements remaining_tokens, banks
-        proceeds. Position stays open with smaller stake."""
-        pos = self.positions.get(mint)
-        if not pos:
-            return None
-        if price > 0:
-            pos.update(price)
-        # Clamp fraction to (0, 0.99) — full liquidation should use close()
-        fraction = max(0.0, min(0.99, fraction))
-        if fraction <= 0:
-            return None
-        if pos.remaining_tokens <= 0:
-            return None
-        try:
-            if self.quote_only and self.quote_shadow_positions:
-                quote_tokens = self.quote_shadow_tokens.get(mint, pos.remaining_tokens)
-                remaining_fraction = pos.remaining_tokens / max(pos.tokens_bought, 1e-18)
-                full_sell_tokens = quote_tokens * remaining_fraction
-                sell_amount: Any = round(full_sell_tokens * fraction, 9)
-                if isinstance(sell_amount, (int, float)) and sell_amount <= 0:
-                    return None
-            else:
-                # Live mode: pass UI amount as fraction-of-tokens; broker computes
-                sell_amount = round(pos.remaining_tokens * fraction, 9)
-                if sell_amount <= 0:
-                    return None
-            quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
-            expected_out = self.rate_amount_out(quote)
-            # Partial keeps the ATA open — half the round-trip overhead applies
-            overhead = (self.quote_roundtrip_overhead_sol or 0.0) * 0.5 if self.quote_shadow_positions else 0.0
-            proceeds = max(0.0, expected_out - overhead)
-
-            if self.quote_only:
-                if self.quote_simulate and self.keypair:
-                    signed_b64, _ = self.sign_transaction(str(quote["txn"]))
-                    self.simulate_signed(signed_b64)
-                if self.quote_shadow_positions:
-                    tokens_sold = pos.remaining_tokens * fraction
-                    pos.remaining_tokens -= tokens_sold
-                    pos.realized_sol += proceeds
-                    if mint in self.quote_shadow_tokens:
-                        self.quote_shadow_tokens[mint] = max(
-                            0.0, self.quote_shadow_tokens[mint] - sell_amount
-                        )
-                    pos.derisk_done = True
-                    if pos.state == "SCOUT":
-                        pos.state = "RUNNER"
-                    self.stats.partials += 1
-                    pos.update(price)
-                    log(
-                        f"PGG2-LIVE-PARTIAL-SHADOW {short_addr(mint)} reason={reason} "
-                        f"fraction={fraction:.2f} sold_tokens={tokens_sold:.0f} "
-                        f"proceeds={proceeds:.6f} realized={pos.realized_sol:.6f} "
-                        f"remaining_tokens={pos.remaining_tokens:.0f}"
-                    )
-                    self.save_state()
-                    return pos
-                log(f"PGG2-LIVE-QUOTE-ONLY-PARTIAL {short_addr(mint)} reason={reason}")
-                return None
-
-            # Real live mode (mode == "live", not quote_only)
-            signed_b64, _ = self.sign_transaction(str(quote["txn"]))
-            if not self.simulate_signed(signed_b64):
-                log(f"PGG2-LIVE-PARTIAL-SIM-FAIL {short_addr(mint)} reason={reason}")
-                return None
-            sig = self.send_signed(signed_b64)
-            if not self.wait_confirmed(sig):
-                log(f"PGG2-LIVE-PARTIAL-CONFIRM-FAIL {short_addr(mint)} reason={reason}")
-                return None
-            # Update position state on successful sell
-            tokens_sold = pos.remaining_tokens * fraction
-            pos.remaining_tokens -= tokens_sold
-            pos.realized_sol += proceeds
-            pos.derisk_done = True
-            if pos.state == "SCOUT":
-                pos.state = "RUNNER"
-            self.stats.partials += 1
-            pos.update(price)
-            log(
-                f"PGG2-LIVE-PARTIAL {short_addr(mint)} reason={reason} "
-                f"fraction={fraction:.2f} sig={sig} proceeds={proceeds:.6f}"
-            )
-            self.save_state()
-            return pos
-        except Exception as exc:
-            log(
-                f"PGG2-LIVE-PARTIAL-ERROR {short_addr(mint)} reason={reason} "
-                f"{type(exc).__name__}: {exc}"
-            )
-            return None
-
-    async def _delayed_dry_live_close(
-        self, mint: str, price: float, reason: str, killed: bool, latency_ms: int
-    ) -> None:
-        """Wait the configured latency, then run close() with fresh curve state.
-        Mirrors live's wait_confirmed window so dry-live captures the same
-        latency-induced slippage."""
-        try:
-            await asyncio.sleep(latency_ms / 1000.0)
-        except asyncio.CancelledError:
-            self._deferred_close_pending.discard(mint)
-            return
-        self._deferred_close_pending.discard(mint)
-        if mint not in self.positions:
-            return
-        self._inside_deferred_close = True
-        try:
-            ts_ms_now = int(time.time() * 1000)
-            self.close(mint, ts_ms_now, price, reason, killed)
-        finally:
-            self._inside_deferred_close = False
+        log(f"PGG2-LIVE-PARTIAL-BLOCKED {short_addr(mint)} fraction={fraction:.2f} reason={reason}")
+        return None
 
     def close(self, mint: str, ts_ms: int, price: float, reason: str, killed: bool) -> Optional[float]:
         pos = self.positions.get(mint)
         if not pos:
             return None
-        # DRY-LIVE LATENCY PARITY: defer the actual quote+close so curve.price
-        # has time to drift from real shred events, mirroring live's wait_confirmed.
-        if (
-            self.quote_only
-            and self.quote_shadow_positions
-            and self.dry_live_sell_latency_ms > 0
-            and not self._inside_deferred_close
-        ):
-            if mint in self._deferred_close_pending:
-                return None
-            self._deferred_close_pending.add(mint)
-            log(
-                f"PGG2-QUOTE-SHADOW-CLOSE-DEFER {short_addr(mint)} reason={reason} "
-                f"latency_ms={self.dry_live_sell_latency_ms}"
-            )
-            try:
-                asyncio.get_running_loop().create_task(
-                    self._delayed_dry_live_close(mint, price, reason, killed, self.dry_live_sell_latency_ms)
-                )
-            except RuntimeError:
-                # No running loop — fall through to immediate close
-                self._deferred_close_pending.discard(mint)
-                self._inside_deferred_close = True
-                try:
-                    return self._do_close_now(mint, ts_ms, price, reason, killed, pos)
-                finally:
-                    self._inside_deferred_close = False
-            return None
-        return self._do_close_now(mint, ts_ms, price, reason, killed, pos)
-
-    def _do_close_now(self, mint: str, ts_ms: int, price: float, reason: str, killed: bool, pos: Any) -> Optional[float]:
         if price > 0:
             pos.update(price)
         try:
@@ -1829,13 +1998,38 @@ class RaptorLiveBroker(PaperBroker):
                 if self.quote_shadow_positions:
                     self.positions.pop(mint, None)
                     self.quote_shadow_tokens.pop(mint, None)
+                    # v33 — route-aware close accounting. Legacy formula
+                    # (overhead=0.00235) double-counted recoverable ATA rent
+                    # so we mirror both in the ledger for the transition.
                     proceeds = max(0.0, expected_out - overhead)
-                    pnl = pos.realized_sol + proceeds - pos.cost_sol
-                    self.stats.realized_pnl_sol += pnl
+                    legacy_pnl = pos.realized_sol + proceeds - pos.cost_sol
+                    quote_route = "pump_bc"
+                    try:
+                        quote_route = str(quote.get("route") or "pump_bc")
+                    except Exception:
+                        pass
+                    econ = self.quote_all_in_pnl(
+                        route=quote_route,
+                        cost_sol=float(pos.cost_sol),
+                        quote_out=float(expected_out),
+                        execution_context={"ata_recoverable": True},
+                    )
+                    all_in_pnl = float(pos.realized_sol) + float(econ["all_in_pnl"])
+                    gross_quote_pnl = float(econ["gross_quote_pnl"])
+                    extra_tx_cost = float(econ["extra_overhead_not_in_quote"])
+                    # ledger updates: track both fields
+                    self.stats.realized_pnl_sol += legacy_pnl
+                    if not hasattr(self.stats, "realized_all_in_pnl_sol"):
+                        self.stats.realized_all_in_pnl_sol = 0.0
+                    if not hasattr(self.stats, "legacy_realized_pnl_sol"):
+                        self.stats.legacy_realized_pnl_sol = 0.0
+                    self.stats.realized_all_in_pnl_sol += all_in_pnl
+                    self.stats.legacy_realized_pnl_sol += legacy_pnl
                     self.stats.closes += 1
                     if killed:
                         self.stats.kills += 1
-                    if pnl >= 0:
+                    # v33 — W/L now uses all_in_pnl, not legacy.
+                    if all_in_pnl >= 0:
                         self.stats.wins += 1
                         self.consecutive_losses = 0
                     else:
@@ -1843,21 +2037,24 @@ class RaptorLiveBroker(PaperBroker):
                         self.consecutive_losses += 1
                     exec_mult = proceeds / max(pos.cost_sol, 1e-18)
                     self.stats.best_mult = max(self.stats.best_mult, pos.peak_mult, exec_mult)
-                    if self.allow_fast_reentry_after_close(pos, reason, pnl):
+                    if self.allow_fast_reentry_after_close(pos, reason, all_in_pnl):
                         log(
                             f"PGG2-LIVE-FAST-REENTRY-UNLOCK {short_addr(mint)} "
-                            f"lane={pos.lane} reason={reason} pnl={pnl:+.6f}"
+                            f"lane={pos.lane} reason={reason} all_in_pnl={all_in_pnl:+.6f}"
                         )
                     else:
                         self.closed_recent[mint] = ts_ms
                     log(
                         f"PGG2-QUOTE-SHADOW-SELL {short_addr(mint)} reason={reason} "
-                        f"quote_out={expected_out:.6f} overhead={overhead:.6f} "
-                        f"proceeds={proceeds:.6f} mult={exec_mult:.3f} pnl={pnl:+.6f} "
-                        f"session={self.stats.realized_pnl_sol:+.6f}"
+                        f"quote_out={expected_out:.6f} gross_quote_pnl={gross_quote_pnl:+.6f} "
+                        f"extra_tx_cost={extra_tx_cost:.6f} all_in_pnl={all_in_pnl:+.6f} "
+                        f"legacy_pnl={legacy_pnl:+.6f} pnl_model_version=v33_route_aware "
+                        f"cost_model_route={quote_route} cost_model_confidence=proven "
+                        f"session_all_in={self.stats.realized_all_in_pnl_sol:+.6f} "
+                        f"session_legacy={self.stats.legacy_realized_pnl_sol:+.6f}"
                     )
                     self.save_state()
-                    return pnl
+                    return all_in_pnl
                 log(f"PGG2-LIVE-QUOTE-ONLY-SELL {short_addr(mint)} reason={reason}")
                 return None
             signed_b64, _signed_b58 = self.sign_transaction(str(quote["txn"]))
@@ -1869,12 +2066,22 @@ class RaptorLiveBroker(PaperBroker):
             wallet_delta = self.transaction_wallet_delta_sol(sig)
             proceeds = max(0.0, wallet_delta)
             self.positions.pop(mint, None)
-            pnl = pos.realized_sol + proceeds - pos.cost_sol
-            self.stats.realized_pnl_sol += pnl
+            legacy_pnl = pos.realized_sol + proceeds - pos.cost_sol
+            # v33 — in real-live mode wallet_delta IS the executable all-in
+            # (it reflects actual SOL change after fees + ATA close rent
+            # return). Mirror legacy + all-in for ledger consistency.
+            all_in_pnl = legacy_pnl  # wallet_delta is already net of all on-chain costs
+            self.stats.realized_pnl_sol += legacy_pnl
+            if not hasattr(self.stats, "realized_all_in_pnl_sol"):
+                self.stats.realized_all_in_pnl_sol = 0.0
+            if not hasattr(self.stats, "legacy_realized_pnl_sol"):
+                self.stats.legacy_realized_pnl_sol = 0.0
+            self.stats.realized_all_in_pnl_sol += all_in_pnl
+            self.stats.legacy_realized_pnl_sol += legacy_pnl
             self.stats.closes += 1
             if killed:
                 self.stats.kills += 1
-            if pnl >= 0:
+            if all_in_pnl >= 0:
                 self.stats.wins += 1
                 self.consecutive_losses = 0
             else:
@@ -1882,20 +2089,22 @@ class RaptorLiveBroker(PaperBroker):
                 self.consecutive_losses += 1
             exec_mult = proceeds / max(pos.cost_sol, 1e-18)
             self.stats.best_mult = max(self.stats.best_mult, pos.peak_mult, exec_mult)
-            if self.allow_fast_reentry_after_close(pos, reason, pnl):
+            if self.allow_fast_reentry_after_close(pos, reason, all_in_pnl):
                 log(
                     f"PGG2-LIVE-FAST-REENTRY-UNLOCK {short_addr(mint)} "
-                    f"lane={pos.lane} reason={reason} pnl={pnl:+.6f}"
+                    f"lane={pos.lane} reason={reason} all_in_pnl={all_in_pnl:+.6f}"
                 )
             else:
                 self.closed_recent[mint] = ts_ms
             log(
                 f"PGG2-LIVE-SELL {short_addr(mint)} reason={reason} sig={sig} "
                 f"proceeds={proceeds:.6f} wallet_delta={wallet_delta:+.6f} "
-                f"mult={exec_mult:.3f} pnl={pnl:+.6f} session={self.stats.realized_pnl_sol:+.6f}"
+                f"mult={exec_mult:.3f} all_in_pnl={all_in_pnl:+.6f} "
+                f"legacy_pnl={legacy_pnl:+.6f} pnl_model_version=v33_route_aware "
+                f"session_all_in={self.stats.realized_all_in_pnl_sol:+.6f}"
             )
             self.save_state()
-            return pnl
+            return all_in_pnl
         except Exception as exc:
             log(f"PGG2-LIVE-SELL-FAIL {short_addr(mint)} {type(exc).__name__}: {exc}")
             self.save_state()

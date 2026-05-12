@@ -232,6 +232,10 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         self._pump_buyback_cache: tuple[float, dict[str, Any]] = (0.0, {})
         self._pump_buyback_selected: dict[str, PumpBuybackPair] = {}
         self._pump_buyback_observed_miss: dict[str, float] = {}
+        # v30 — pair source tracking for the executable shadow lab.
+        self._last_pair_source: dict[str, str] = {}
+        self._last_pair_recipient: dict[str, str] = {}
+        self._last_pair_social: dict[str, str] = {}
         self._mint_decimals: dict[str, int] = {}
         log(
             f"PGG2-DIRECT: mode={self.mode.upper()} "
@@ -531,6 +535,82 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         self._pump_buyback_observed_miss[key] = time.time()
         return None
 
+    def probe_pump_v2_buy(self, mint: Any, amount_sol: float) -> dict[str, Any]:
+        """v30 — Pump v2 instruction probe.
+
+        Pump's public docs announce three new bonding-curve instructions:
+            buy_v2, sell_v2, buy_exact_quote_in_v2
+        which are documented to use mandatory accounts in the same order for
+        all coins (no optional remaining accounts).
+
+        This probe is intentionally a SAFE STUB. We do not have an
+        authoritative IDL or canonical discriminator + account list for the v2
+        instructions in this repository. Guessing the layout would risk
+        corrupting live transactions, so we refuse to construct a v2 tx and
+        record exactly what is missing.
+
+        To enable a real build we need, from the official Pump source:
+          1. Instruction discriminator bytes for buy_v2 / sell_v2 /
+             buy_exact_quote_in_v2 (8-byte Anchor discriminators)
+          2. Exact account list and order for each instruction
+          3. Data layout (lamports / token amounts encoding)
+          4. Whether the fee_config PDA + buyback recipient / social fee PDA
+             accounts move into the mandatory list or are dropped
+        """
+        if not env_bool("PGG2_DIRECT_PUMP_V2_PROBE", False):
+            return {"v2_probe_attempted": False}
+        # mandatory hard-gate: never attempt v2 in real live mode
+        if self.mode == "live":
+            return {
+                "v2_probe_attempted": True,
+                "v2_probe_build_ok": False,
+                "v2_probe_sim_ok": False,
+                "v2_probe_error": "v2_probe_refused_live_mode",
+            }
+        missing_idl = (
+            "v2_idl_unavailable: need authoritative discriminator + account list for "
+            "buy_v2 / sell_v2 / buy_exact_quote_in_v2 before construction is safe"
+        )
+        log(
+            f"PGG2-DIRECT-V2-PROBE blocked mint={short_addr(str(mint))} reason=v2_idl_unavailable"
+        )
+        return {
+            "v2_probe_attempted": True,
+            "v2_probe_build_ok": False,
+            "v2_probe_sim_ok": False,
+            "v2_probe_error": missing_idl,
+        }
+
+    def prewarm_pump_buyback_pair_from_sig(self, mint: Any, sig: str) -> bool:
+        """v30 — discover and persist the Pump buyback/social pair from a
+        candidate event signature. Lets the shadow lab and live broker quote
+        fresh mints whose pair is not yet in the raw-event tape.
+
+        Returns True if a pair was discovered (newly or already cached).
+        Safe in any mode: only does a read-only RPC and updates cache; does
+        not change strict-required behavior at build time.
+        """
+        if not sig:
+            return False
+        try:
+            mint_pk = as_pubkey(str(mint))
+        except Exception:
+            return False
+        # already cached or in-memory? skip the RPC
+        if self.cached_pump_buyback_pair(mint_pk):
+            return True
+        pair = self.pump_buyback_pair_from_signature(sig)
+        if not pair:
+            return False
+        observed = PumpBuybackPair(pair[0], pair[1], "current_sig")
+        self.remember_pump_buyback_pair(mint_pk, observed)
+        log(
+            f"PGG2-DIRECT-PAIR-PREWARM mint={short_addr(str(mint))} sig={short_addr(sig)} "
+            f"source=current_sig recipient={short_addr(str(observed.recipient))} "
+            f"social={short_addr(str(observed.social_fee_pda))}"
+        )
+        return True
+
     def pump_buyback_pair_from_signature(self, sig: str) -> Optional[tuple[Pubkey, Pubkey]]:
         try:
             tx = self.rpc(
@@ -630,18 +710,54 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         ]
 
     def pump_buy_remaining_metas(self, mint: Pubkey) -> list[AccountMeta]:
-        pair = self.forced_pump_buyback_pair() or self.cached_pump_buyback_pair(mint) or self.observed_pump_buyback_pair(mint)
+        # v30 — record which source we end up using, for the shadow lab.
+        mint_key = str(mint)
+        forced = self.forced_pump_buyback_pair()
+        cached = self.cached_pump_buyback_pair(mint) if not forced else None
+        observed = self.observed_pump_buyback_pair(mint) if not (forced or cached) else None
+        pair = forced or cached or observed
         if not pair and env_bool("PGG2_DIRECT_REQUIRE_OBSERVED_BUYBACK_PAIR", self.mode == "live"):
+            self._last_pair_source[mint_key] = "none"
             raise RuntimeError(f"no confirmed pump buyback/social pair observed: {short_addr(str(mint))}")
         if pair:
+            if forced:
+                source = "forced"
+            elif cached:
+                # cache stores source ("current_sig", "sim_selected", "observed_raw_rpc", "env")
+                source = cached.source or "cache"
+            else:
+                source = observed.source or "observed_raw"
+            self._last_pair_source[mint_key] = source
+            self._last_pair_recipient[mint_key] = str(pair.recipient)
+            self._last_pair_social[mint_key] = str(pair.social_fee_pda)
             social_fee_pda = AccountMeta(pair.social_fee_pda, False, True)
         else:
             buyback = self.pump_buyback_remaining_metas(mint)
             social_fee_pda = buyback[-1] if buyback else None
+            self._last_pair_source[mint_key] = "default"
+            if social_fee_pda:
+                self._last_pair_social[mint_key] = str(social_fee_pda.pubkey)
         metas = [AccountMeta(self.pump_bonding_curve_v2(mint), False, False)]
         if social_fee_pda:
             metas.append(social_fee_pda)
         return metas
+
+    def last_pair_info(self, mint: Any) -> dict[str, str]:
+        """Return the most recent pair source/recipient/social PDA used for
+        this mint by the buy builder. Empty dict if not seen.
+        """
+        key = str(mint)
+        out: dict[str, str] = {}
+        src = self._last_pair_source.get(key)
+        if src is not None:
+            out["pair_source"] = src
+        rec = self._last_pair_recipient.get(key)
+        if rec:
+            out["pair_recipient"] = rec
+        soc = self._last_pair_social.get(key)
+        if soc:
+            out["pair_social_fee_pda"] = soc
+        return out
 
     def pump_sell_remaining_metas(self, mint: Pubkey, curve: PumpBondingCurve, user: Pubkey) -> list[AccountMeta]:
         buyback = self.pump_buyback_remaining_metas(mint)
@@ -686,6 +802,12 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             for social in socials:
                 if not any(pair.recipient == recipient and pair.social_fee_pda == social for pair in pairs):
                     pairs.append(PumpBuybackPair(recipient, social, "grid"))
+        # v30 — cap the sim-select candidate list so shadow-lab quote latency
+        # stays manageable. Cache hit / prewarm / observed pairs are kept at
+        # the head, so the cap rarely affects accuracy.
+        cap = env_int("PGG2_DIRECT_SIM_SELECT_MAX_CANDIDATES", 0)
+        if cap > 0:
+            return pairs[:cap]
         return pairs
 
     def quote_pump_buy_tokens(self, spend_lamports: int, curve: PumpBondingCurve, global_cfg: PumpGlobal) -> tuple[int, int]:
@@ -706,15 +828,35 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         return max(0, gross_sol - fees), max(0, fees)
 
     def build_buy(self, mint_str: str, amount_sol: float, slippage: float) -> dict[str, Any]:
-        mint = as_pubkey(mint_str)
-        # 2026-05-10 — pure AMM mints (post-migration only seen via PumpSwap)
-        # have NO BC PDA. Catch the missing-BC error and route to AMM.
+        # v31 — quote latency telemetry. Increment in-flight + capture start.
+        self._inflight_quotes[mint_str] = self._inflight_quotes.get(mint_str, 0) + 1
+        _qstart_ms = int(time.time() * 1000)
+        _qsim_needed = bool(env_bool("PGG2_DIRECT_SELECT_BUYBACK_BY_SIM", False) and self.quote_simulate)
         try:
-            curve = self.bonding_curve(mint)
-        except RuntimeError as exc:
-            if "bonding curve missing" in str(exc) or "bonding curve data too short" in str(exc):
-                return self.build_pumpswap_buy(mint, amount_sol, slippage)
+            return self._build_buy_impl(mint_str, amount_sol, slippage, _qstart_ms, _qsim_needed)
+        except Exception as exc:
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="buy",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="error",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=False,
+                    error_class=type(exc).__name__,
+                    was_simulation_needed=_qsim_needed,
+                )
+            except Exception:
+                pass
             raise
+        finally:
+            self._inflight_quotes[mint_str] = max(0, self._inflight_quotes.get(mint_str, 1) - 1)
+
+    def _build_buy_impl(self, mint_str: str, amount_sol: float, slippage: float, _qstart_ms: int, _qsim_needed: bool) -> dict[str, Any]:
+        mint = as_pubkey(mint_str)
+        curve = self.bonding_curve(mint)
         if curve.complete:
             return self.build_pumpswap_buy(mint, amount_sol, slippage)
         global_cfg = self.pump_global()
@@ -761,7 +903,22 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
 
         selected_pair = ""
         txn = make_tx(self.pump_buy_remaining_metas(mint))
-        if env_bool("PGG2_DIRECT_SELECT_BUYBACK_BY_SIM", False) and self.quote_simulate:
+        # v32 — fast path: if pair was already discovered (forced/cache/observed
+        # /current_sig), skip the sim-select grid search. Sim-select costs
+        # 600-1700ms per pair candidate which makes actual-entry impossible to
+        # risk-manage. Default ON; can be disabled if a deeper sim sweep is
+        # explicitly needed for research.
+        _existing_pair_src = self._last_pair_source.get(str(mint), "none")
+        _skip_sim_if_cached = env_bool("PGG2_DIRECT_SKIP_SIM_IF_CACHED", True)
+        _has_fast_pair = _existing_pair_src in {
+            "forced",
+            "cache",
+            "current_sig",
+            "observed_raw_rpc",
+        }
+        if _skip_sim_if_cached and _has_fast_pair:
+            _qsim_needed = False  # we are NOT going to sim-select
+        if env_bool("PGG2_DIRECT_SELECT_BUYBACK_BY_SIM", False) and self.quote_simulate and not (_skip_sim_if_cached and _has_fast_pair):
             selected = False
             for pair in self.pump_buyback_candidate_pairs(mint):
                 candidate_txn = make_tx(
@@ -779,6 +936,15 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
                             f"{short_addr(str(pair.social_fee_pda))} source={pair.source}"
                         )
                         self.remember_pump_buyback_pair(mint, pair)
+                        # v30 — overwrite last-pair tracking with the sim-selected pair
+                        self._last_pair_source[str(mint)] = f"sim_selected:{pair.source}"
+                        self._last_pair_recipient[str(mint)] = str(pair.recipient)
+                        self._last_pair_social[str(mint)] = str(pair.social_fee_pda)
+                        log(
+                            f"PGG2-DIRECT-PAIR-SIM-SELECTED mint={short_addr(str(mint))} "
+                            f"source={pair.source} recipient={short_addr(str(pair.recipient))} "
+                            f"social={short_addr(str(pair.social_fee_pda))}"
+                        )
                         selected = True
                         break
                 except Exception as exc:
@@ -801,6 +967,23 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             f"in={amount_sol:.6f} out={out_ui:.6f} min={min_ui:.6f} "
             f"fee_bps={global_cfg.fee_bps + global_cfg.creator_fee_bps} fee={fee_sol:.6f}{selected_pair}"
         )
+        # v31 — record latency telemetry for the successful buy quote
+        _qend_ms = int(time.time() * 1000)
+        _pair_source = self._last_pair_source.get(str(mint), "unknown")
+        try:
+            self.record_quote_latency(
+                side="buy",
+                mint=mint_str,
+                route="pump_bc",
+                source=_pair_source,
+                start_ms=_qstart_ms,
+                end_ms=_qend_ms,
+                success=True,
+                pair_source=_pair_source,
+                was_simulation_needed=_qsim_needed,
+            )
+        except Exception:
+            pass
         return {
             "txn": txn,
             "route": "pump_bc",
@@ -814,14 +997,33 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         }
 
     def build_sell(self, mint_str: str, amount: Any, slippage: float) -> dict[str, Any]:
-        mint = as_pubkey(mint_str)
-        # 2026-05-10 — pure AMM mints have no BC PDA; route to PumpSwap.
+        # v31 — quote latency telemetry for sell.
+        self._inflight_quotes[mint_str] = self._inflight_quotes.get(mint_str, 0) + 1
+        _qstart_ms = int(time.time() * 1000)
         try:
-            curve = self.bonding_curve(mint)
-        except RuntimeError as exc:
-            if "bonding curve missing" in str(exc) or "bonding curve data too short" in str(exc):
-                return self.build_pumpswap_sell(mint, amount, slippage)
+            return self._build_sell_impl(mint_str, amount, slippage, _qstart_ms)
+        except Exception as exc:
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="sell",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="error",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=False,
+                    error_class=type(exc).__name__,
+                )
+            except Exception:
+                pass
             raise
+        finally:
+            self._inflight_quotes[mint_str] = max(0, self._inflight_quotes.get(mint_str, 1) - 1)
+
+    def _build_sell_impl(self, mint_str: str, amount: Any, slippage: float, _qstart_ms: int) -> dict[str, Any]:
+        mint = as_pubkey(mint_str)
+        curve = self.bonding_curve(mint)
         if curve.complete:
             return self.build_pumpswap_sell(mint, amount, slippage)
         global_cfg = self.pump_global()
@@ -866,6 +1068,22 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             f"in_tokens={self.raw_to_ui(mint, token_amount):.6f} out={out_sol:.6f} "
             f"min={min_sol:.6f} fee_bps={global_cfg.fee_bps + global_cfg.creator_fee_bps} fee={fee_sol:.6f}"
         )
+        # v31 — record sell quote latency
+        _qend_ms = int(time.time() * 1000)
+        _pair_source = self._last_pair_source.get(str(mint), "unknown")
+        try:
+            self.record_quote_latency(
+                side="sell",
+                mint=mint_str,
+                route="pump_bc",
+                source=_pair_source,
+                start_ms=_qstart_ms,
+                end_ms=_qend_ms,
+                success=True,
+                pair_source=_pair_source,
+            )
+        except Exception:
+            pass
         return {
             "txn": txn,
             "route": "pump_bc",

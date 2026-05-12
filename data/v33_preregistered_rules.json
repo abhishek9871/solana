@@ -1,0 +1,72 @@
+{
+  "pnl_model_version": "v33_route_aware",
+  "cost_model_confidence": "proven",
+  "registered_at_utc": "2026-05-11T13:00:00Z",
+  "registered_after_run": "pgg2_v33_shadow_20260511_122401.log",
+  "do_not_modify_during_holdout": true,
+  "primary": {
+    "rule_id": "v33_quote_edge_150_C",
+    "description": "Direct fast-quote candidate with all_in_immediate_pnl >= +0.00150 SOL, evaluated under the moonshot-protected-clamp policy. Promotable only on independent fresh-holdout n>=10.",
+    "source_families": ["quote_edge_small_loss", "quote_edge_near_flat", "priced_snap_like", "curve_lag_reveal_shadow", "recovered_quote"],
+    "blacklisted_families": ["raw_momentum_shadow", "raw_momentum_current", "generic_observation"],
+    "entry": {
+      "route": "pump_bc",
+      "direct_route_only": true,
+      "cost_model_confidence_required": "proven",
+      "pair_source_required": ["current_sig", "cache", "observed_raw_rpc"],
+      "sim_needed": 0,
+      "all_in_immediate_pnl_min_sol": 0.00150,
+      "all_in_immediate_pnl_min_floor_target_buffer_sol": 0.00020,
+      "all_in_immediate_pnl_uses": ["t=0", "delayed_500ms", "delayed_1000ms", "delayed_2000ms"],
+      "no_fallback_only_quote": true,
+      "quote_locked_open": true,
+      "risk_worker_owns_exit": true,
+      "max_buy_p90_latency_ms": 750,
+      "max_sell_p90_latency_ms": 750
+    },
+    "policy_id": "C_moonshot_hold_protected_clamp_v33",
+    "exit": {
+      "bank_all_in_pnl_min_sol": 0.00060,
+      "scratch_exit_min_all_in_pnl_sol": 0.00010,
+      "scratch_exit_on_deterioration": true,
+      "clamp_all_in_pnl_max_sol": -0.00075,
+      "timebox_ms": 5000,
+      "timebox_skip_if_positive_and_improving": true,
+      "absolute_max_hold_ms": 10000
+    }
+  },
+  "secondary_monitoring_only": [
+    {
+      "rule_id": "v33_quote_edge_120_C",
+      "entry_all_in_pnl_min_sol": 0.00120,
+      "policy_id": "C_moonshot_hold_protected_clamp_v33",
+      "promotable": false
+    },
+    {
+      "rule_id": "v33_quote_edge_150_A_fast_bank",
+      "entry_all_in_pnl_min_sol": 0.00150,
+      "policy_id": "A_fast_bank_tight_clamp",
+      "promotable": false
+    },
+    {
+      "rule_id": "v33_delayed_allin_green_confirmed",
+      "definition": "two consecutive delayed snapshots with all_in_immediate_pnl_at_delay >= +0.00020 AND second snapshot not worse than first by more than 0.00010",
+      "promotable": false
+    }
+  ],
+  "qualification_gates_for_one_entry_pilot": {
+    "prior_total_n_at_registration": 28,
+    "fresh_holdout_qualifying_n_min": 10,
+    "combined_total_n_min": 38,
+    "fresh_holdout_net_all_in_pnl_min_sol": 0.0,
+    "fresh_holdout_hit_rate_min_pct": 70.0,
+    "fresh_holdout_profit_factor_min": 2.0,
+    "fresh_holdout_max_single_all_in_loss_max_sol": -0.00075,
+    "fresh_holdout_top_winner_concentration_max": 0.70,
+    "fresh_holdout_max_losers": 1,
+    "no_latency_realistic_reversal": true,
+    "buy_p90_latency_max_ms": 750,
+    "sell_p90_latency_max_ms": 750,
+    "quote_manager_no_stale_decision": true
+  }
+}
