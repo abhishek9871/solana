@@ -1,0 +1,231 @@
+{
+  "version": "v35_highfreq_2026-05-12T05:00:00Z",
+  "pnl_model_version": "v33_route_aware",
+  "cost_model_confidence": "proven",
+  "do_not_modify_during_run": true,
+  "frozen_at_utc": "2026-05-12T05:00:00Z",
+  "description": "High-frequency portfolio for the 20-min SLA pilot (10 winners in 20 minutes, zero negative all-in closes, real-live OFF). Built to expand frequency via SAFETY-GUARDED siblings, never by lowering the proven rule.",
+  "sla_target": {
+    "target_entries": 10,
+    "target_window_minutes": 20,
+    "zero_loss_required": true,
+    "real_live_disabled": true
+  },
+  "global_constraints": {
+    "real_live_disabled": true,
+    "execution_mode_required": "quote",
+    "route_required": "pump_bc",
+    "max_open_positions": 3,
+    "one_position_per_mint": true,
+    "session_loss_cap_sol": -0.00150,
+    "max_buy_p90_latency_ms": 900,
+    "max_sell_p90_latency_ms": 750,
+    "max_entry_quote_age_ms": 1500,
+    "pair_source_required_allowed": ["current_sig", "cache", "observed_raw_rpc", "prewarmed"],
+    "blacklisted_lane_candidates": ["raw_momentum_shadow", "raw_momentum_current", "generic_observation"]
+  },
+  "primary": {
+    "rule_id": "v33_quote_edge_150_C",
+    "status": "actual_drylive_allowed",
+    "policy_id": "C_moonshot_hold_protected_clamp_v33",
+    "description": "Proven holdout-validated rule. all_in_immediate_pnl >= +0.00150 at t=0.",
+    "entry": {
+      "route": "pump_bc",
+      "sim_needed": 0,
+      "cost_model_confidence_required": "proven",
+      "pair_source_required": ["current_sig", "cache", "observed_raw_rpc"],
+      "all_in_immediate_pnl_min_sol": 0.00150,
+      "quote_locked_open": true,
+      "no_fallback_only_quote": true,
+      "max_quote_age_ms": 1500
+    },
+    "exit": {
+      "bank_all_in_pnl_min_sol": 0.00060,
+      "scratch_exit_min_all_in_pnl_sol": 0.00010,
+      "scratch_exit_on_deterioration": true,
+      "clamp_all_in_pnl_max_sol": -0.00075,
+      "timebox_ms": 5000,
+      "timebox_skip_if_positive_and_improving": true,
+      "absolute_max_hold_ms": 10000
+    },
+    "per_trade_clamp_sol": -0.00075
+  },
+  "siblings": [
+    {
+      "rule_id": "v33_instant_green_scalp",
+      "status": "shadow_only_pending_replay",
+      "policy_id": "B_fast_scalp",
+      "description": "Tiny-edge scalp with strict timebox. Designed for high frequency on already-green quotes. Hard clamp at -0.00030.",
+      "entry": {
+        "route": "pump_bc",
+        "sim_needed": 0,
+        "cost_model_confidence_required": "proven",
+        "pair_source_required": ["current_sig", "cache", "observed_raw_rpc"],
+        "all_in_immediate_pnl_min_sol": 0.00060,
+        "max_buy_quote_age_ms": 750,
+        "max_sell_quote_age_ms": 750,
+        "quote_locked_open": true,
+        "no_fallback_only_quote": true
+      },
+      "exit": {
+        "bank_all_in_pnl_min_sol": 0.00020,
+        "scratch_exit_min_all_in_pnl_sol": 0.00005,
+        "scratch_exit_on_deterioration": true,
+        "clamp_all_in_pnl_max_sol": -0.00030,
+        "timebox_ms": 3000,
+        "absolute_max_hold_ms": 3000
+      },
+      "per_trade_clamp_sol": -0.00030
+    },
+    {
+      "rule_id": "v33_two_snapshot_green",
+      "status": "shadow_only_pending_replay",
+      "policy_id": "B_fast_scalp",
+      "description": "Two consecutive fresh snapshots within 1000ms confirming green. Higher hit-rate than single snapshot at same edge.",
+      "entry": {
+        "route": "pump_bc",
+        "sim_needed": 0,
+        "cost_model_confidence_required": "proven",
+        "pair_source_required": ["current_sig", "cache", "observed_raw_rpc"],
+        "two_snapshot_required": true,
+        "snapshot_window_ms": 1000,
+        "snapshot1_all_in_pnl_min_sol": 0.00040,
+        "snapshot2_all_in_pnl_min_sol": 0.00040,
+        "snapshot2_min_delta_vs_snapshot1_sol": -0.00010,
+        "quote_locked_open": true,
+        "no_fallback_only_quote": true
+      },
+      "exit": {
+        "bank_all_in_pnl_min_sol": 0.00030,
+        "scratch_exit_min_all_in_pnl_sol": 0.00005,
+        "scratch_exit_on_deterioration": true,
+        "clamp_all_in_pnl_max_sol": -0.00030,
+        "timebox_ms": 3500,
+        "absolute_max_hold_ms": 5000
+      },
+      "per_trade_clamp_sol": -0.00030
+    },
+    {
+      "rule_id": "v33_delayed_green_confirmed",
+      "status": "shadow_only_pending_replay",
+      "policy_id": "C_moonshot_hold_protected_clamp_v33",
+      "description": "Delayed entry only. Two fresh delayed snapshots >=250ms apart both >= +0.00060.",
+      "entry": {
+        "route": "pump_bc",
+        "sim_needed": 0,
+        "cost_model_confidence_required": "proven",
+        "pair_source_required": ["current_sig", "cache", "observed_raw_rpc"],
+        "delayed_only": true,
+        "min_delayed_entries": 2,
+        "min_snapshot_separation_ms": 250,
+        "min_snapshot_all_in_pnl_sol": 0.00060,
+        "sell_p90_latency_max_ms": 750,
+        "quote_locked_open": true,
+        "no_fallback_only_quote": true
+      },
+      "exit": {
+        "bank_all_in_pnl_min_sol": 0.00040,
+        "scratch_exit_min_all_in_pnl_sol": 0.00005,
+        "scratch_exit_on_deterioration": true,
+        "clamp_all_in_pnl_max_sol": -0.00030,
+        "timebox_ms": 5000,
+        "absolute_max_hold_ms": 10000
+      },
+      "per_trade_clamp_sol": -0.00030
+    },
+    {
+      "rule_id": "v33_high_edge_fast_exit",
+      "status": "shadow_only_pending_replay",
+      "policy_id": "A_fast_bank_tight_clamp",
+      "description": "High-edge entries (all_in >= +0.00250) with fast bank.",
+      "entry": {
+        "route": "pump_bc",
+        "sim_needed": 0,
+        "cost_model_confidence_required": "proven",
+        "pair_source_required": ["current_sig", "cache", "observed_raw_rpc"],
+        "all_in_immediate_pnl_min_sol": 0.00250,
+        "quote_locked_open": true,
+        "no_fallback_only_quote": true
+      },
+      "exit": {
+        "bank_all_in_pnl_min_sol": 0.00080,
+        "scratch_exit_min_all_in_pnl_sol": 0.00020,
+        "scratch_exit_on_deterioration": true,
+        "clamp_all_in_pnl_max_sol": -0.00050,
+        "timebox_ms": 3000,
+        "timebox_skip_if_pnl_gt_sol": 0.00100,
+        "absolute_max_hold_ms": 5000
+      },
+      "per_trade_clamp_sol": -0.00050
+    },
+    {
+      "rule_id": "v33_recovered_quote_green",
+      "status": "shadow_only_pending_replay",
+      "policy_id": "C_moonshot_hold_protected_clamp_v33",
+      "description": "Initial quote unavailable (curve_missing), recovered <=1000ms, recovered all_in >= +0.00100.",
+      "entry": {
+        "route": "pump_bc",
+        "sim_needed": 0,
+        "cost_model_confidence_required": "proven",
+        "pair_source_required": ["current_sig", "cache", "observed_raw_rpc"],
+        "quote_recovered_required": true,
+        "max_recovery_ms": 1000,
+        "recovered_all_in_pnl_min_sol": 0.00100,
+        "sell_p90_latency_max_ms": 750,
+        "quote_locked_open": true,
+        "no_fallback_only_quote": true
+      },
+      "exit": {
+        "bank_all_in_pnl_min_sol": 0.00050,
+        "scratch_exit_min_all_in_pnl_sol": 0.00010,
+        "scratch_exit_on_deterioration": true,
+        "clamp_all_in_pnl_max_sol": -0.00030,
+        "timebox_ms": 5000,
+        "absolute_max_hold_ms": 10000
+      },
+      "per_trade_clamp_sol": -0.00030
+    },
+    {
+      "rule_id": "v33_pullback_absorption_green",
+      "status": "shadow_only_pending_replay",
+      "policy_id": "C_moonshot_hold_protected_clamp_v33",
+      "description": "Sell pressure first, quote then recovers, all_in_pnl >= +0.00100.",
+      "entry": {
+        "route": "pump_bc",
+        "sim_needed": 0,
+        "cost_model_confidence_required": "proven",
+        "pair_source_required": ["current_sig", "cache", "observed_raw_rpc"],
+        "prior_sell_pressure_required": true,
+        "min_recovered_all_in_pnl_sol": 0.00100,
+        "max_slot_top_share": 0.50,
+        "min_slot_unique_buyers": 3,
+        "unique_buyers_collapse_block": true,
+        "quote_locked_open": true,
+        "no_fallback_only_quote": true
+      },
+      "exit": {
+        "bank_all_in_pnl_min_sol": 0.00050,
+        "scratch_exit_min_all_in_pnl_sol": 0.00010,
+        "scratch_exit_on_deterioration": true,
+        "clamp_all_in_pnl_max_sol": -0.00030,
+        "timebox_ms": 5000,
+        "absolute_max_hold_ms": 10000
+      },
+      "per_trade_clamp_sol": -0.00030
+    }
+  ],
+  "sla_pilot_qualification": {
+    "min_windows_with_10_or_more_zero_loss_entries": 1,
+    "preferred_windows_with_10_or_more_zero_loss_entries": 2,
+    "rule_inclusion_requires_zero_neg_closes_in_replay": true,
+    "rule_inclusion_requires_max_loss_within_per_trade_clamp": true,
+    "no_duplicate_mint_within_window": true,
+    "no_concurrent_open_position_for_same_mint": true,
+    "max_concurrent_open_positions_in_window": 3
+  },
+  "recommendation_logic": [
+    "If rolling 20-min replay never produces a window with >=10 entries and zero negative closes, do NOT run the SLA pilot. Report market capacity + exact blocker.",
+    "If at least one window qualifies, only include rules whose per-rule replay has zero negative all-in closes. Exclude all others.",
+    "Real-live remains disabled at every stage."
+  ]
+}

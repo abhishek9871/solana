@@ -116,6 +116,13 @@ class RaptorLiveBroker(PaperBroker):
         # and skip independent quotes for that mint. Cleared on close.
         self._risk_owned_mints: set[str] = set()
         self._risk_owned_lock: threading.RLock = threading.RLock()
+        # v34 — recent sell-quote cache per mint. Populated by build_sell on
+        # success. Used by close() to avoid issuing a second network sell
+        # quote when the risk worker just got a fresh one — this is what
+        # prevents broker `_inflight_quotes[mint]` from briefly hitting 2
+        # during the risk_worker_bank → broker.close transition.
+        self._recent_sell_quotes: dict[str, dict[str, Any]] = {}
+        self._recent_sell_quotes_lock: threading.RLock = threading.RLock()
         self.fast_paper_accounting = env_bool("PGG2_LIVE_FAST_PAPER_ACCOUNTING", False)
         self.confirm_timeout_sec = env_float("PGG2_LIVE_CONFIRM_TIMEOUT_SEC", 8.0)
         log(
@@ -336,6 +343,10 @@ class RaptorLiveBroker(PaperBroker):
         with self._risk_owned_lock:
             removed = m in self._risk_owned_mints
             self._risk_owned_mints.discard(m)
+        # v34 — clear the recent-sell-quote cache so a re-entry on the same
+        # mint (rare; pilot blocks duplicates anyway) starts with a fresh
+        # quote.
+        self.clear_recent_sell_quote(m)
         if removed:
             log(f"PGG2-QUOTE-MGR-RISK-OWNED-CLEAR mint={short_addr(m)}")
 
@@ -348,6 +359,42 @@ class RaptorLiveBroker(PaperBroker):
             f"PGG2-QUOTE-MGR-RISK-OWNED-BLOCK mint={short_addr(str(mint))} "
             f"caller={caller} phase={phase}"
         )
+
+    # v34 — recent sell quote cache. build_sell populates this on success;
+    # broker.close() and any other risk-owned sell caller checks here first
+    # to avoid a parallel network call (the in_flight=2 partial in Phase-6
+    # gate #6 was caused by risk_worker + broker.close racing each other on
+    # the SAME sell amount within ~1s).
+    def record_sell_quote(self, mint: str, quote: dict[str, Any], expected_out: float) -> None:
+        try:
+            with self._recent_sell_quotes_lock:
+                self._recent_sell_quotes[str(mint)] = {
+                    "quote": quote,
+                    "expected_out": float(expected_out),
+                    "ts_ms": int(time.time() * 1000),
+                }
+        except Exception:
+            pass
+
+    def get_recent_sell_quote(self, mint: str, max_age_ms: int) -> Optional[dict[str, Any]]:
+        try:
+            with self._recent_sell_quotes_lock:
+                rec = self._recent_sell_quotes.get(str(mint))
+                if rec is None:
+                    return None
+                age = int(time.time() * 1000) - int(rec["ts_ms"])
+                if age > max_age_ms:
+                    return None
+                return {"quote": rec["quote"], "expected_out": rec["expected_out"], "age_ms": age}
+        except Exception:
+            return None
+
+    def clear_recent_sell_quote(self, mint: str) -> None:
+        try:
+            with self._recent_sell_quotes_lock:
+                self._recent_sell_quotes.pop(str(mint), None)
+        except Exception:
+            pass
 
     def quote_latency_percentile(self, side: str, source: str, p: float) -> Optional[float]:
         """Return p-th percentile (0..100) of latency_ms for (side, source).
@@ -729,7 +776,7 @@ class RaptorLiveBroker(PaperBroker):
             ratio = env_float("PGG2_LIVE_SHADOW_CANARY_MAX_EXECUTABLE_LOSS_RATIO", 1.00)
             floor = env_float("PGG2_LIVE_SHADOW_CANARY_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.01000)
             cap = env_float("PGG2_LIVE_SHADOW_CANARY_MAX_EXECUTABLE_LOSS_CAP_SOL", 0.01000)
-        elif lane == "v33_quote_edge_150_C":
+        elif lane in {"v33_quote_edge_150_C", "v33_instant_green_scalp"}:
             # v30 — strict pilot lane. Clamp at exactly -0.0015 SOL of net
             # executable pnl, with a small additional hard-kill cap at -0.00225.
             ratio = env_float("PGG2_LIVE_DRYLIVE_PILOT_MAX_EXECUTABLE_LOSS_RATIO", 0.10)
@@ -816,9 +863,9 @@ class RaptorLiveBroker(PaperBroker):
             return ""
         if pos.mint not in self.positions:
             return ""
-        if pos.lane not in {"priced_breakout", "late_swarm", "birth_fanout", "stealth_arm", "spark3_arm", "raw_momentum", "curve_lag_reveal", "shadow_lab_canary", "v33_quote_edge_150_C"}:
+        if pos.lane not in {"priced_breakout", "late_swarm", "birth_fanout", "stealth_arm", "spark3_arm", "raw_momentum", "curve_lag_reveal", "shadow_lab_canary", "v33_quote_edge_150_C", "v33_instant_green_scalp"}:
             return ""
-        if pos.lane == "v33_quote_edge_150_C":
+        if pos.lane in {"v33_quote_edge_150_C", "v33_instant_green_scalp"}:
             min_age_clamp = env_float("PGG2_LIVE_DRYLIVE_PILOT_LOSS_CLAMP_MIN_AGE_SEC", 0.10)
         else:
             min_age_clamp = env_float("PGG2_LIVE_QUOTE_LOSS_CLAMP_MIN_AGE_SEC", 0.20)
@@ -827,7 +874,7 @@ class RaptorLiveBroker(PaperBroker):
         last_ms = self.last_loss_quote_ms.get(pos.mint, 0)
         # v30 — pilot lane uses a shorter interval so volatile mints get more
         # frequent clamp checks; default 300ms is too sparse on dump events.
-        if pos.lane == "v33_quote_edge_150_C":
+        if pos.lane in {"v33_quote_edge_150_C", "v33_instant_green_scalp"}:
             interval_ms = env_int("PGG2_LIVE_DRYLIVE_PILOT_LOSS_CLAMP_INTERVAL_MS", 100)
         else:
             interval_ms = env_int("PGG2_LIVE_QUOTE_LOSS_CLAMP_INTERVAL_MS", 300)
@@ -876,7 +923,7 @@ class RaptorLiveBroker(PaperBroker):
                     "PGG2_LIVE_SPARK3_ARM_ANY_PROFIT_BANK_MIN_PNL_SOL",
                     max(bank_need, 0.00250),
                 )
-            elif pos.lane == "v33_quote_edge_150_C":
+            elif pos.lane in {"v33_quote_edge_150_C", "v33_instant_green_scalp"}:
                 # v30 — pilot bank at +0.00060 SOL (spec).
                 bank_need = env_float(
                     "PGG2_LIVE_DRYLIVE_PILOT_ANY_PROFIT_BANK_MIN_PNL_SOL", 0.00060
@@ -1092,7 +1139,7 @@ class RaptorLiveBroker(PaperBroker):
         age_sec = pos.age_sec(ts_ms)
         # v30 — pilot lane has wider mult tolerances since it banks at tiny
         # +0.0006 SOL, well below the normal +18% mult floor.
-        if pos.lane == "v33_quote_edge_150_C":
+        if pos.lane in {"v33_quote_edge_150_C", "v33_instant_green_scalp"}:
             min_age = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_AGE_SEC", 0.10)
             min_mult = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_MULT", 1.00)
             min_peak = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_PEAK", 1.00)
@@ -1130,7 +1177,7 @@ class RaptorLiveBroker(PaperBroker):
                 need = env_float("PGG2_LIVE_STEALTH_ARM_PROFIT_BANK_MIN_PNL_SOL", max(need, 0.00350))
             elif pos.lane == "spark3_arm":
                 need = env_float("PGG2_LIVE_SPARK3_ARM_PROFIT_BANK_MIN_PNL_SOL", max(need, 0.00250))
-            elif pos.lane == "v33_quote_edge_150_C":
+            elif pos.lane in {"v33_quote_edge_150_C", "v33_instant_green_scalp"}:
                 # v30 — pilot bank threshold (spec: +0.00060)
                 need = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_PNL_SOL", 0.00060)
             log(
@@ -1732,7 +1779,7 @@ class RaptorLiveBroker(PaperBroker):
         # broker open, not the (possibly seconds-old) shred event ts. The
         # AFYY..9Cip pilot loss on 2026-05-11 was due to this drift causing
         # the first clamp check to see age=2.6s on a fresh-opened position.
-        if plan.lane == "v33_quote_edge_150_C":
+        if plan.lane in {"v33_quote_edge_150_C", "v33_instant_green_scalp"}:
             ts_ms = int(time.time() * 1000)
         requested = max(0.0005, min(plan.scout_sol, plan.target_sol))
         amount = self.guarded_amount(requested, plan.lane, plan.features, plan.mint)
@@ -1956,8 +2003,26 @@ class RaptorLiveBroker(PaperBroker):
                 quote_tokens = self.quote_shadow_tokens.get(mint, pos.remaining_tokens)
                 remaining_fraction = pos.remaining_tokens / max(pos.tokens_bought, 1e-18)
                 sell_amount = round(quote_tokens * remaining_fraction, 9)
-            quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
-            expected_out = self.rate_amount_out(quote)
+            # v34 — broker inflight dedup for risk-owned mints. If a recent
+            # sell quote is cached (populated by the risk worker's QuoteManager
+            # call), reuse it instead of issuing a parallel network sell.
+            # This eliminates the in_flight=2 partial in Phase-6 gate #6.
+            quote = None
+            expected_out = 0.0
+            if self.is_risk_owned(mint):
+                max_age_ms = env_int("PGG2_RISK_OWNED_CLOSE_QUOTE_MAX_AGE_MS", 1500)
+                recent = self.get_recent_sell_quote(mint, max_age_ms=max_age_ms)
+                if recent is not None:
+                    quote = recent["quote"]
+                    expected_out = float(recent["expected_out"])
+                    log(
+                        f"PGG2-QUOTE-MGR-INFLIGHT-DEDUP mint={short_addr(mint)} "
+                        f"side=sell source=recent_quote_cache age_ms={recent['age_ms']} "
+                        f"out={expected_out:.6f}"
+                    )
+            if quote is None:
+                quote = self.build_swap(mint, SOL_MINT, sell_amount, self.sell_slippage)
+                expected_out = self.rate_amount_out(quote)
             overhead = self.quote_roundtrip_overhead_sol if self.quote_shadow_positions else 0.0
             min_profit_out = env_float(
                 "PGG2_LIVE_MIN_PROFIT_EXIT_SOL",

@@ -53,6 +53,13 @@ RULE_V33_QUOTE_EDGE_150_C = "v33_quote_edge_150_C"
 POLICY_V33_C_MOONSHOT = "C_moonshot_hold_protected_clamp_v33"
 PNL_MODEL_VERSION_V33 = "v33_route_aware"
 
+# v35 — high-frequency scalp rule. Lower edge (+0.00060), faster gates,
+# tighter clamp (-0.00030), short timebox (3000 ms). Runs in parallel
+# with the primary rule to expand frequency without lowering the proven
+# rule's thresholds.
+RULE_V33_INSTANT_GREEN_SCALP = "v33_instant_green_scalp"
+POLICY_B_FAST_SCALP = "B_fast_scalp"
+
 
 @dataclass
 class WaveArm:
@@ -231,7 +238,13 @@ class RiskWorker:
         )
 
     def add_position(
-        self, mint: str, lane: str, rule_id: str, opened_ts_ms: int, last_price: float
+        self,
+        mint: str,
+        lane: str,
+        rule_id: str,
+        opened_ts_ms: int,
+        last_price: float,
+        policy: Optional[dict[str, Any]] = None,
     ) -> None:
         with self.lock:
             self.tracked[mint] = {
@@ -240,6 +253,11 @@ class RiskWorker:
                 "opened_ts_ms": opened_ts_ms,
                 "last_price": last_price,
                 "in_flight": False,
+                # v35 — per-position policy. The risk worker reads
+                # bank/clamp/timebox from here so each rule (primary,
+                # scalp, etc.) uses its own exit policy without
+                # process-global env vars.
+                "policy": dict(policy or {}),
             }
 
     def remove_position(self, mint: str) -> None:
@@ -339,13 +357,24 @@ class RiskWorker:
         quote_age_ms = int(result.get("age_ms") or 0)
         quote_latency_ms = int(result.get("latency_ms") or 0)
         in_flight_for_key = 1 if status == "fresh_network_quote" else 0
-        # thresholds per lane
-        bank_threshold = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_PNL_SOL", 0.00060)
-        clamp_threshold = -env_float(
-            "PGG2_LIVE_DRYLIVE_PILOT_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00150
+        # v35 — per-position policy override. Fall back to env vars for
+        # backward compat with positions opened before the policy field
+        # was introduced.
+        policy = ctx.get("policy") or {}
+        bank_threshold = float(
+            policy.get(
+                "bank_all_in_pnl_min_sol",
+                env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_PNL_SOL", 0.00060),
+            )
         )
-        timebox_ms = env_int("PGG2_DRYLIVE_PILOT_TIMEBOX_MS", 5000)
-        absolute_ms = env_int("PGG2_DRYLIVE_PILOT_ABSOLUTE_MAX_HOLD_MS", 10000)
+        clamp_threshold = float(
+            policy.get(
+                "clamp_all_in_pnl_max_sol",
+                -env_float("PGG2_LIVE_DRYLIVE_PILOT_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00150),
+            )
+        )
+        timebox_ms = int(policy.get("timebox_ms", env_int("PGG2_DRYLIVE_PILOT_TIMEBOX_MS", 5000)))
+        absolute_ms = int(policy.get("absolute_max_hold_ms", env_int("PGG2_DRYLIVE_PILOT_ABSOLUTE_MAX_HOLD_MS", 10000)))
         trigger = "none"
         close_reason = ""
         if age_ms >= absolute_ms:
@@ -495,6 +524,13 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         # v30 — pilot manage tracking (per-mint last quote pnl + last_mark_ms)
         self._pilot_last_pnl: dict[str, float] = {}
         self._pilot_last_mark_ms: dict[str, int] = {}
+        # v35 — high-frequency scalp tracker. Parallel to pilot tracker,
+        # separate cap, separate session-loss accounting, shared
+        # mints_seen across both rules to prevent duplicate-mint entry.
+        self._scalp_entries: int = 0
+        self._scalp_session_loss_sol: float = 0.0
+        self._scalp_last_pnl: dict[str, float] = {}
+        self._scalp_last_mark_ms: dict[str, int] = {}
         # v32 — centralized QuoteManager for runtime sell-quote sharing.
         self.quote_manager: Optional[QuoteManager] = (
             QuoteManager(self.broker) if hasattr(self, "broker") and self.broker is not None else None
@@ -921,6 +957,24 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                 record["actual_entry_allowed"] = True
                 record["actual_entry_blocker"] = ""
         record["pilot_opened"] = bool(pilot_pos)
+        # v35 — high-frequency scalp entry. Parallel path; only fires when
+        # primary did NOT take the candidate (no double-entry on same mint).
+        scalp_pos = None
+        if (
+            env_bool("PGG2_SCALP_ENABLED", False)
+            and not canary_pos
+            and pilot_pos is None
+        ):
+            scalp_pos = self._try_scalp_entry(
+                event, features, plan, quote_tokens, immediate_pnl, record,
+                entry_quote=entry, immediate_out=immediate_out,
+            )
+            if scalp_pos:
+                record["lane_candidate"] = RULE_V33_INSTANT_GREEN_SCALP
+                record["plan_reason"] = "scalp_entry"
+                record["actual_entry_allowed"] = True
+                record["actual_entry_blocker"] = ""
+        record["scalp_opened"] = bool(scalp_pos)
 
         future: list[dict[str, Any]] = []
         delays_ms = env_str(
@@ -1828,14 +1882,375 @@ class SameBlockPiggybackBot(BirthFirstSniper):
                     RULE_V33_QUOTE_EDGE_150_C,
                     int(getattr(pos, "opened_ts_ms", int(time.time() * 1000))),
                     float(getattr(pos, "last_price", 0.0)),
+                    policy={
+                        "bank_all_in_pnl_min_sol": env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_PNL_SOL", 0.00060),
+                        "clamp_all_in_pnl_max_sol": -env_float("PGG2_LIVE_DRYLIVE_PILOT_MAX_EXECUTABLE_LOSS_FLOOR_SOL", 0.00075),
+                        "timebox_ms": env_int("PGG2_DRYLIVE_PILOT_TIMEBOX_MS", 5000),
+                        "absolute_max_hold_ms": env_int("PGG2_DRYLIVE_PILOT_ABSOLUTE_MAX_HOLD_MS", 10000),
+                        "rule_id": RULE_V33_QUOTE_EDGE_150_C,
+                        "policy_id": POLICY_V33_C_MOONSHOT,
+                    },
                 )
             except Exception as exc:
                 log(f"PGG2-RISK-WORKER-REGISTER-FAIL {type(exc).__name__}: {exc}")
+            # v36c-2 — ENTRY SNAPSHOT BANK for primary too. The v36c-2 5D5f
+            # loss (open +0.002317 → close −0.005442 via risk_worker_clamp)
+            # was the same risk-worker-race bug ESB fixed for scalp: market
+            # crashed during the ~700 ms it took the risk worker to fetch
+            # its next sell quote. Banking the entry snapshot uses the
+            # broker's recent_sell_quote cache (v34-P1) so no fresh network
+            # call is needed and no race window exists.
+            if env_bool("PGG2_ENTRY_SNAPSHOT_BANK_ENABLED", True):
+                primary_bank_threshold = env_float("PGG2_LIVE_DRYLIVE_PILOT_PROFIT_BANK_MIN_PNL_SOL", 0.00060)
+                live_eligible = env_bool("PGG2_ENTRY_SNAPSHOT_BANK_LIVE_ELIGIBLE", False)
+                broker_live = (getattr(self.broker, "mode", "") == "live")
+                if broker_live and not live_eligible:
+                    log(
+                        f"PGG2-LIVE-EQUIVALENCE-BLOCK mint={short_addr(event.mint)} "
+                        f"reason=entry_snapshot_bank_not_live_eligible"
+                    )
+                elif all_in >= primary_bank_threshold:
+                    log(
+                        f"PGG2-ENTRY-SNAPSHOT-BANK mint={short_addr(event.mint)} "
+                        f"rule_id={RULE_V33_QUOTE_EDGE_150_C} "
+                        f"all_in_pnl={all_in:+.6f} "
+                        f"quote_out={immediate_out_for_econ:.6f} "
+                        f"quote_age_ms={quote_age_ms} "
+                        f"tokens={quote_tokens:.6f} "
+                        f"reason=risk_worker_entry_snapshot_bank"
+                    )
+                    try:
+                        self._risk_worker._schedule_close(
+                            event.mint, "risk_worker_entry_snapshot_bank", killed=False
+                        )
+                    except Exception as exc:
+                        log(
+                            f"PGG2-ENTRY-SNAPSHOT-BANK-FAIL mint={short_addr(event.mint)} "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                else:
+                    log(
+                        f"PGG2-ENTRY-SNAPSHOT-BANK-BLOCK mint={short_addr(event.mint)} "
+                        f"rule_id={RULE_V33_QUOTE_EDGE_150_C} "
+                        f"all_in_pnl={all_in:+.6f} reason=below_bank_threshold"
+                    )
         else:
             log(
                 f"PGG2-DRYLIVE-PILOT-OPEN-NULL mint={short_addr(event.mint)} "
                 f"(open_quote_shadow_from_quote returned None)"
             )
+        return pos
+
+    # v35 — high-frequency scalp entry path. Runs in PARALLEL with the
+    # primary pilot path (called after _try_pilot_entry returned None,
+    # i.e. when the candidate didn't qualify for the +0.00150 rule but
+    # may qualify for the +0.00060 scalp rule). Shares mints_seen with
+    # pilot so the same mint never enters under both rules.
+    def _scalp_safe_to_attempt(self) -> bool:
+        if not env_bool("PGG2_SCALP_ENABLED", False):
+            return False
+        broker = getattr(self, "broker", None)
+        if broker is None:
+            return False
+        if getattr(broker, "mode", "") == "live":
+            return False
+        if getattr(broker, "quote_only", False) is not True:
+            return False
+        if self._scalp_entries >= env_int("PGG2_SCALP_MAX_ENTRIES", 10):
+            return False
+        loss_cap = env_float("PGG2_SCALP_SESSION_LOSS_CAP_SOL", 0.0015)
+        if self._scalp_session_loss_sol <= -loss_cap:
+            return False
+        return True
+
+    def _try_scalp_entry(
+        self,
+        event: PumpEvent,
+        features: dict[str, Any],
+        plan: StrikePlan,
+        quote_tokens: float,
+        immediate_pnl: float,
+        record: dict[str, Any],
+        entry_quote: Optional[dict[str, Any]] = None,
+        immediate_out: float = 0.0,
+    ) -> Optional[Any]:
+        """v35 — controlled dry-live scalp entry for rule
+        `v33_instant_green_scalp`. Lower edge (+0.00060), tighter clamp
+        (-0.00030), short timebox (3000 ms). Same safety stack as pilot
+        otherwise. Real-live OFF by construction."""
+        if not env_bool("PGG2_ACTUAL_ENTRY_MASTER_ENABLED", False):
+            return None
+        if not self._scalp_safe_to_attempt():
+            return None
+        # v36c — SCOUT-SIZE INVARIANT. The shadow lab built buy+sell quotes
+        # at `plan.scout_sol`. If that differs from `PGG2_SCALP_SOL`, the
+        # quote_tokens are sized for a DIFFERENT cost basis: opening at
+        # scalp's size produces a phantom position where pos.cost is scalp's
+        # size but tokens are from a different-sized buy. The sell of those
+        # tokens at scalp's cost yields the lab's payoff at lab's cost,
+        # which is a structural loss when lab cost < scalp cost. Caused the
+        # v36c 3UMG -0.004 loss (rug_bounce plan.scout_sol=0.010 vs
+        # scalp_scout=0.015). Hard-block this mismatch.
+        scalp_scout_sol = env_float("PGG2_SCALP_SOL", 0.015)
+        record_scout = float(record.get("scout_sol") or plan.scout_sol or 0.0)
+        if abs(record_scout - scalp_scout_sol) > 1e-9:
+            log(
+                f"PGG2-SCALP-PREENTRY-BLOCK mint={short_addr(event.mint)} "
+                f"blocker=scout_size_mismatch record_scout={record_scout:.6f} "
+                f"scalp_scout={scalp_scout_sol:.6f}"
+            )
+            return None
+        if not record.get("execution_eligible"):
+            return None
+        if not record.get("direct_quote_success") or not record.get("direct_sell_quote_success"):
+            return None
+        if entry_quote is None:
+            return None
+        # quote age (scalp uses tighter window than pilot)
+        quote_built_ts_ms = int(record.get("quote_built_ts_ms") or 0)
+        now_ms_local = int(time.time() * 1000)
+        quote_age_ms = now_ms_local - quote_built_ts_ms if quote_built_ts_ms else 99999
+        max_age = env_int("PGG2_SCALP_MAX_QUOTE_AGE_MS", 750)
+        if quote_age_ms > max_age:
+            log(
+                f"PGG2-SCALP-PREENTRY-BLOCK mint={short_addr(event.mint)} "
+                f"blocker=stale_quote age_ms={quote_age_ms} max={max_age}"
+            )
+            return None
+        # fast-quote: refuse sim-needed
+        pair_source_str = str(record.get("pair_source", "unknown"))
+        if pair_source_str.startswith("sim_selected:"):
+            return None
+        # route-aware econ block: +0.00060 instead of pilot's +0.00150
+        scalp_min_all_in = env_float("PGG2_SCALP_MIN_ALL_IN_PNL_SOL", 0.00060)
+        immediate_out_for_econ = float(record.get("immediate_reverse_out") or immediate_out)
+        if hasattr(self.broker, "quote_all_in_pnl"):
+            econ = self.broker.quote_all_in_pnl(
+                route="pump_bc",
+                cost_sol=float(plan.scout_sol),
+                quote_out=immediate_out_for_econ,
+                execution_context={"ata_recoverable": True},
+            )
+            all_in = float(econ["all_in_pnl"])
+            if all_in < scalp_min_all_in:
+                log(
+                    f"PGG2-SCALP-ECON-BLOCK mint={short_addr(event.mint)} "
+                    f"reason=below_scalp_threshold all_in={all_in:+.6f} min={scalp_min_all_in:+.6f}"
+                )
+                return None
+        else:
+            return None
+        # latency feasibility (same as pilot)
+        if env_bool("PGG2_LATENCY_FEASIBILITY_ENABLED", True):
+            pair_source = str(record.get("pair_source", "unknown"))
+            broker = self.broker
+            if hasattr(broker, "quote_latency_percentile"):
+                buy_p95 = broker.quote_latency_percentile("buy", pair_source, 95)
+                sell_p95 = broker.quote_latency_percentile("sell", pair_source, 95)
+                max_p95 = env_float("PGG2_LATENCY_MAX_P95_MS", 1100.0)
+                if (buy_p95 is not None and buy_p95 > max_p95) or (sell_p95 is not None and sell_p95 > max_p95):
+                    return None
+        # v36 — lane label is a RISK FEATURE, not a hard veto, for scalp.
+        # Market Capacity Oracle showed 107/187 windows hit >=10 zero-neg
+        # entries when raw_momentum_shadow records were admitted under the
+        # scalp rule's INDEPENDENT gates (sim_needed=0, pair_source allowlist,
+        # slot guards, all_in>=+0.00060, fast quote ages). The Oracle proves
+        # this combination is causally safe.
+        lane_candidate = record.get("lane_candidate", "")
+        if lane_candidate == "generic_observation":
+            return None
+        if lane_candidate == "raw_momentum_shadow":
+            log(
+                f"PGG2-LANE-BLACKLIST-BYPASS mint={short_addr(event.mint)} "
+                f"old_lane={lane_candidate} independent_rule={RULE_V33_INSTANT_GREEN_SCALP} "
+                f"reason=independent_high_edge_rule"
+            )
+        # slot safety + impact (same as pilot)
+        buy_impact = float(record.get("entry_quote_impact") or 0.0)
+        if buy_impact > env_float("PGG2_DRYLIVE_PILOT_MAX_BUY_IMPACT", 0.005):
+            log(
+                f"PGG2-SCALP-SKIP {short_addr(event.mint)} reason=buy_impact_high "
+                f"impact={buy_impact:.6f}"
+            )
+            return None
+        # v36 — slot top_share and slot_buyers are RISK FEATURES (logged, not
+        # hard-vetoed) for the scalp rule. Market Capacity Oracle proves that
+        # candidates with high slot_top or low buyer counts can still close
+        # safely under the scalp exit policy (bank +0.00020, clamp -0.00030,
+        # timebox 3000ms). Replay tier 1: no slot guard, edge-confirmed by
+        # all_in>=+0.00060 and tight quote-age + tight exit.
+        slot_top_share = float(record.get("slot_top_share") or 0.0)
+        slot_buyers = int(record.get("slot_buyers") or 0)
+        # Optional hard veto only if explicitly enabled (default OFF for v36
+        # SLA pilot per Phase 4 Tier 1).
+        if env_bool("PGG2_SCALP_ENFORCE_SLOT_GUARDS", False):
+            if slot_top_share > env_float("PGG2_SCALP_MAX_SLOT_TOP_SHARE", 0.65):
+                log(
+                    f"PGG2-SCALP-SKIP {short_addr(event.mint)} reason=slot_top_high "
+                    f"slot_top={slot_top_share:.3f}"
+                )
+                return None
+            if slot_buyers < env_int("PGG2_SCALP_MIN_SLOT_BUYERS", 2):
+                log(
+                    f"PGG2-SCALP-SKIP {short_addr(event.mint)} reason=slot_buyers_low "
+                    f"slot_buyers={slot_buyers}"
+                )
+                return None
+        # pair source allow-list
+        if pair_source_str not in {"current_sig", "cache", "observed_raw_rpc", "prewarmed"}:
+            return None
+        # cooldown: share mints_seen with pilot (no dup mint across rules)
+        if event.mint in self._pilot_mints_seen:
+            return None
+        # economic_quote_source must not be fallback-only
+        if record.get("economic_quote_source") not in (None, "none", "direct"):
+            return None
+        # Build scalp plan
+        scalp_scout = env_float("PGG2_SCALP_SOL", 0.015)
+        ts_ms = int(event.ts_ms or now_ms())
+        scalp_plan = StrikePlan(
+            mint=event.mint,
+            ts_ms=ts_ms,
+            lane=RULE_V33_INSTANT_GREEN_SCALP,
+            reason="scalp_entry",
+            score=0.0,
+            scout_sol=scalp_scout,
+            target_sol=scalp_scout,
+            price=scalp_scout / max(quote_tokens, 1e-18),
+            needs_curve_fill=False,
+            features=dict(features),
+        )
+        first_q_ms = int(record.get("first_quoteable_ms") or -1)
+        log(
+            f"PGG2-SCALP-BUY rule_id={RULE_V33_INSTANT_GREEN_SCALP} "
+            f"policy_id={POLICY_B_FAST_SCALP} "
+            f"pnl_model_version={PNL_MODEL_VERSION_V33} "
+            f"mint={short_addr(event.mint)} amount={scalp_scout:.6f} "
+            f"quote_tokens={quote_tokens:.6f} immediate_out={record.get('immediate_reverse_out', 0.0):.6f} "
+            f"immediate_pnl={immediate_pnl:+.6f} buy_impact={buy_impact:.6f} "
+            f"pair_source={pair_source_str} first_quoteable_ms={first_q_ms} "
+            f"entry_features={{age_ms:{record.get('age_ms')},slot_buyers:{slot_buyers},slot_top:{slot_top_share}}}"
+        )
+        try:
+            ok, _r = self.broker.can_strike(event.mint, ts_ms)
+        except Exception as exc:
+            log(f"PGG2-SCALP-CAN-STRIKE-FAIL {type(exc).__name__}: {exc}")
+            return None
+        if not ok:
+            return None
+        entry_context = {
+            "quote_id": f"scalp:{event.mint[:8]}:{quote_built_ts_ms}",
+            "quote_age_ms": quote_age_ms,
+            "immediate_pnl_at_decision": immediate_pnl,
+            "buy_impact": buy_impact,
+        }
+        try:
+            pos = self.broker.open_quote_shadow_from_quote(
+                scalp_plan, entry_quote, quote_tokens, immediate_out, entry_context
+            )
+        except Exception as exc:
+            log(f"PGG2-SCALP-OPEN-FAIL {type(exc).__name__}: {exc}")
+            return None
+        if pos:
+            if abs(float(pos.tokens_bought) - float(quote_tokens)) > 1e-6:
+                log(
+                    f"PGG2-POSITION-TOKEN-MISMATCH-FATAL scalp mint={short_addr(event.mint)} "
+                    f"pos_tokens={pos.tokens_bought} expected={quote_tokens}"
+                )
+                try:
+                    self.broker.positions.pop(event.mint, None)
+                except Exception:
+                    pass
+                return None
+            self._scalp_entries += 1
+            self._pilot_mints_seen.add(event.mint)
+            try:
+                self.init_position_follow(pos, trusted=True, entry_features=features)
+            except Exception as exc:
+                log(f"PGG2-SCALP-FOLLOW-INIT-FAIL {type(exc).__name__}: {exc}")
+            log(
+                f"PGG2-SCALP-OPEN mint={short_addr(event.mint)} "
+                f"cost={getattr(pos, 'cost_sol', 0.0):.6f} "
+                f"tokens={getattr(pos, 'tokens_bought', 0.0):.6f} "
+                f"entries_used={self._scalp_entries} session_loss={self._scalp_session_loss_sol:+.6f} "
+                f"rule_id={RULE_V33_INSTANT_GREEN_SCALP} policy_id={POLICY_B_FAST_SCALP} "
+                f"pnl_model_version={PNL_MODEL_VERSION_V33}"
+            )
+            try:
+                self.broker.mark_risk_owned(event.mint)
+            except Exception as exc:
+                log(f"PGG2-RISK-OWNED-MARK-FAIL {type(exc).__name__}: {exc}")
+            try:
+                self._risk_worker.add_position(
+                    event.mint,
+                    RULE_V33_INSTANT_GREEN_SCALP,
+                    RULE_V33_INSTANT_GREEN_SCALP,
+                    int(getattr(pos, "opened_ts_ms", int(time.time() * 1000))),
+                    float(getattr(pos, "last_price", 0.0)),
+                    policy={
+                        "bank_all_in_pnl_min_sol": env_float("PGG2_SCALP_BANK_MIN_PNL_SOL", 0.00020),
+                        "clamp_all_in_pnl_max_sol": -env_float("PGG2_SCALP_CLAMP_MAX_LOSS_SOL", 0.00030),
+                        "timebox_ms": env_int("PGG2_SCALP_TIMEBOX_MS", 3000),
+                        "absolute_max_hold_ms": env_int("PGG2_SCALP_ABS_MAX_HOLD_MS", 3000),
+                        "rule_id": RULE_V33_INSTANT_GREEN_SCALP,
+                        "policy_id": POLICY_B_FAST_SCALP,
+                    },
+                )
+            except Exception as exc:
+                log(f"PGG2-RISK-WORKER-REGISTER-FAIL {type(exc).__name__}: {exc}")
+            # v36c — ENTRY SNAPSHOT BANK. The entry's all_in (computed above
+            # from the SAME locked-quote pair that opened the position) is
+            # already bankable when it exceeds the scalp bank threshold.
+            # The v36b 2xty loss was caused by waiting for the next risk-
+            # worker quote fetch (~700-900ms later) during which the price
+            # crashed from +0.002 to -0.002. Banking the entry snapshot
+            # immediately uses the broker's recent_sell_quote cache (v34-P1
+            # fix) so no new network call is issued and no race window
+            # exists between open and bank.
+            if env_bool("PGG2_ENTRY_SNAPSHOT_BANK_ENABLED", True):
+                scalp_bank_threshold = env_float("PGG2_SCALP_BANK_MIN_PNL_SOL", 0.00020)
+                # Live-equivalence guard: scalp's entry-snapshot bank uses the
+                # locked quote-shadow sell. In real-live mode we'd need an
+                # atomic buy+sell bundle; until that's proven, this strategy
+                # is dry-live only.
+                live_eligible = env_bool("PGG2_ENTRY_SNAPSHOT_BANK_LIVE_ELIGIBLE", False)
+                broker_live = (getattr(self.broker, "mode", "") == "live")
+                if broker_live and not live_eligible:
+                    log(
+                        f"PGG2-LIVE-EQUIVALENCE-BLOCK mint={short_addr(event.mint)} "
+                        f"reason=entry_snapshot_bank_not_live_eligible"
+                    )
+                elif all_in >= scalp_bank_threshold:
+                    log(
+                        f"PGG2-ENTRY-SNAPSHOT-BANK mint={short_addr(event.mint)} "
+                        f"rule_id={RULE_V33_INSTANT_GREEN_SCALP} "
+                        f"all_in_pnl={all_in:+.6f} "
+                        f"quote_out={immediate_out_for_econ:.6f} "
+                        f"quote_age_ms={quote_age_ms} "
+                        f"tokens={quote_tokens:.6f} "
+                        f"reason=risk_worker_entry_snapshot_bank"
+                    )
+                    # Schedule immediate close on the asyncio loop. The
+                    # risk worker's _schedule_close ensures idempotency,
+                    # uses the broker's recent_sell_quote cache (v34-P1)
+                    # for the actual sell, and goes through the same
+                    # close_position path the v36b SELL events used.
+                    try:
+                        self._risk_worker._schedule_close(
+                            event.mint, "risk_worker_entry_snapshot_bank", killed=False
+                        )
+                    except Exception as exc:
+                        log(
+                            f"PGG2-ENTRY-SNAPSHOT-BANK-FAIL mint={short_addr(event.mint)} "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                else:
+                    log(
+                        f"PGG2-ENTRY-SNAPSHOT-BANK-BLOCK mint={short_addr(event.mint)} "
+                        f"rule_id={RULE_V33_INSTANT_GREEN_SCALP} "
+                        f"all_in_pnl={all_in:+.6f} "
+                        f"reason=below_bank_threshold"
+                    )
         return pos
 
     @staticmethod
@@ -5282,7 +5697,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         before_pnl = self.broker.stats.realized_pnl_sol
         # capture lane + cost before close removes the position
         pre_pos = self.broker.positions.get(mint)
-        pilot_lane = bool(pre_pos and getattr(pre_pos, "lane", "") == RULE_V33_QUOTE_EDGE_150_C)
+        pilot_lane = bool(pre_pos and getattr(pre_pos, "lane", "") in {RULE_V33_QUOTE_EDGE_150_C, RULE_V33_INSTANT_GREEN_SCALP})
         pre_cost = float(getattr(pre_pos, "cost_sol", 0.0)) if pre_pos else 0.0
         pre_opened_ts = int(getattr(pre_pos, "opened_ts_ms", ts_ms)) if pre_pos else ts_ms
         pnl = self.broker.close(mint, ts_ms, price, reason, killed)
@@ -5408,7 +5823,7 @@ class SameBlockPiggybackBot(BirthFirstSniper):
         # v32 — when risk worker owns quote exits, do NOT let the event-driven
         # manage loop independently quote/close. The risk worker is the single
         # source of truth for bank/clamp/timebox on these lanes.
-        risk_owned_lanes = {"shadow_lab_canary", "v33_quote_edge_150_C"}
+        risk_owned_lanes = {"shadow_lab_canary", "v33_quote_edge_150_C", "v33_instant_green_scalp"}
         if (
             env_bool("PGG2_RISK_WORKER_OWNS_QUOTE_EXIT", True)
             and pos.lane in risk_owned_lanes

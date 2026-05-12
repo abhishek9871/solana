@@ -1001,7 +1001,15 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         self._inflight_quotes[mint_str] = self._inflight_quotes.get(mint_str, 0) + 1
         _qstart_ms = int(time.time() * 1000)
         try:
-            return self._build_sell_impl(mint_str, amount, slippage, _qstart_ms)
+            result = self._build_sell_impl(mint_str, amount, slippage, _qstart_ms)
+            # v34 — populate recent-sell-quote cache so the close() path for
+            # risk-owned mints can reuse this quote and skip a parallel
+            # network call (broker in_flight=1 invariant).
+            try:
+                self.record_sell_quote(mint_str, result, float(self.rate_amount_out(result)))
+            except Exception:
+                pass
+            return result
         except Exception as exc:
             _qend_ms = int(time.time() * 1000)
             try:
