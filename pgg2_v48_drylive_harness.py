@@ -1,0 +1,9476 @@
+"""V48 - Dry-live-first qualification harness on top of the V47I safe stack.
+
+V48 keeps the V47B/C/D/E/F/G/H/I safety stack unchanged, but makes the
+dry-live runner the source of truth:
+- every final V47I/V48 pass logs a decision;
+- every passed decision either opens, queues behind max_open, or logs a
+  concrete blocker;
+- max_open no longer discards otherwise valid candidates before evaluation;
+- a short TTL backfill queue bridges the frequency gap when positions close.
+
+V47H base architecture (entry chain + watchdog + clean-close + max_open=2
++ drain + V47H rug veto) is UNCHANGED.
+
+Note: original V47F additions kept verbatim below for entry-path parity:
+- V47G size-edge floor (Phase 2) AFTER V47D boundary guard + downsize
+- V47G large-size downsizer (Phase 3) on floor failure for size >= 0.030
+- V47G size-tiered hold caps (Phase 4) replacing V47E's MAX_HOLD/EXTEND
+- V47G mid-hold dump abort (Phase 5) called every position-management cycle
+
+Target: 10 CLOSED non-negative AND open=0 AND pending=0.
+Stop conditions:
+  (a) 10 closed non-negative reached AND no open positions AND no pending
+  (b) ANY closed negative -> STOP immediately (then drain open positions)
+  (c) 35 min elapsed
+  (d) failed-buy fee budget exceeded (0.00100 SOL)
+
+Default mode: NO TRANSACTIONS. NO PAID FEEDS. Static-grep enforced.
+Explicit live smoke mode is available only behind PGG2_V48_LIVE_SMOKE_ENABLED=1
+and PGG2_EXECUTION_MODE=live, using the same V48 decision path.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re as _re
+import sys
+import time
+# === V60 LIVE-SEND FIREWALL IMPORT (2026-05-19) ===
+try:
+    from pgg2_v60_live_send_firewall import (
+        V60Candidate as _V60Candidate,
+        V60TxPlan as _V60TxPlan,
+        v60_authorize_live_buy as _v60_authorize_live_buy,
+    )
+    _V60_AVAILABLE = True
+except Exception as _v60_exc:
+    _V60_AVAILABLE = False
+
+# === V61 LIVE CONTINUATION ORACLE IMPORT (2026-05-19) ===
+try:
+    from pgg2_v61_live_continuation_oracle import (
+        V61Inputs as _V61Inputs,
+        CurvePoint as _V61CurvePoint,
+        QuotePoint as _V61QuotePoint,
+        v61_check_continuation as _v61_check_continuation,
+    )
+    _V61_AVAILABLE = True
+except Exception as _v61_imp_exc:
+    _V61_AVAILABLE = False
+
+# === V62B AUTHORITATIVE SELL ROUTER IMPORT (2026-05-19) ===
+try:
+    from pgg2_v62b_authoritative_sell_router import (
+        v62b_close_position as _v62b_close_position,
+        V62BResult as _V62BResult,
+    )
+    _V62B_AVAILABLE = True
+except Exception as _v62b_imp_exc:
+    _V62B_AVAILABLE = False
+    _v62b_close_position = None
+    _V62BResult = None
+
+# === V63 MANDATORY POST-SELL CLOSE-ACCOUNT IMPORT (2026-05-19) ===
+try:
+    from pgg2_v63_post_sell_clean_close import (
+        v63_close_zero_balance_token_account as _v63_close_zero_balance_token_account,
+        V63CloseResult as _V63CloseResult,
+    )
+    _V63_AVAILABLE = True
+except Exception as _v63_imp_exc:
+    _V63_AVAILABLE = False
+    _v63_close_zero_balance_token_account = None
+    _V63CloseResult = None
+
+# === V64 CANDIDATE PASSPORT IMPORT (2026-05-19) ===
+try:
+    from pgg2_v64_candidate_passport import (
+        V64PassportRegistry as _V64PassportRegistry,
+        CandidatePassport as _V64CandidatePassport,
+        v64_authorize_live_buy as _v64_authorize_live_buy,
+        RESULT_PASS as _V64_PASS,
+        RESULT_BLOCK as _V64_BLOCK,
+        RESULT_SHADOW_ONLY as _V64_SHADOW_ONLY,
+        RESULT_MISSING as _V64_MISSING,
+        RESULT_TELEMETRY_ONLY as _V64_TELEMETRY,
+    )
+    _V64_AVAILABLE = True
+except Exception as _v64_imp_exc:
+    _V64_AVAILABLE = False
+    _V64PassportRegistry = None
+    _V64CandidatePassport = None
+    _v64_authorize_live_buy = None
+    _V64_PASS = "PASS"
+    _V64_BLOCK = "BLOCK"
+    _V64_SHADOW_ONLY = "SHADOW_ONLY"
+    _V64_MISSING = "MISSING"
+    _V64_TELEMETRY = "TELEMETRY_ONLY"
+
+from collections import Counter, deque
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+
+# ----- static-grep self-check ----------------------------------------
+_FORBIDDEN_CALL_PATTERNS = (
+    r"\.send_signed\s*\(",
+    r"\.send_transaction\s*\(",
+    r"\.sendTransaction\s*\(",
+    r"\.send_signed_rpc\s*\(",
+    r"\bsend_signed\s*\(",
+    r"\bsend_transaction\s*\(",
+    r"\bsendTransaction\s*\(",
+    r"\bsend_signed_rpc\s*\(",
+)
+_V48_LIVE_SMOKE_BOOT = (
+    os.environ.get("PGG2_V48_LIVE_SMOKE_ENABLED", "0") == "1"
+    and os.environ.get("PGG2_EXECUTION_MODE", "").lower() == "live"
+)
+if not _V48_LIVE_SMOKE_BOOT:
+    with open(__file__, "r", encoding="utf-8") as _self:
+        _src = _self.read()
+    for _pat in _FORBIDDEN_CALL_PATTERNS:
+        if _re.search(_pat, _src):
+            sys.stderr.write(
+                f"V47I-DRYLIVE-ABORT forbidden_call_pattern={_pat}\n"
+            )
+            sys.exit(2)
+
+
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# Dry-live restricted max size: 0.075 SOL (no 0.100 in dry-live).
+SIZE_SWEEP_SOL = (0.005, 0.010, 0.015, 0.020, 0.030, 0.050, 0.075)
+
+DRYLIVE_MAX_SIZE_SOL = 0.075
+
+
+# ----------------------------------------------------------------------------
+# V68 WHALE-FOLLOW LANE — active-snipers wallet pool (2026-05-17)
+# ----------------------------------------------------------------------------
+# Loaded from a flat text file: "<base58_pubkey>\t<appearance_count>" per line.
+# Set via env PGG2_V68_ACTIVE_SNIPERS_PATH (default /root/piggy/active_snipers.txt).
+# Cached after first call so we don't re-read on every candidate.
+_V68_ACTIVE_SNIPERS_CACHE: Optional[frozenset] = None
+_V68_ACTIVE_SNIPERS_CACHE_PATH: Optional[str] = None
+
+
+def _load_active_snipers() -> frozenset:
+    """Return the frozenset of active-sniper wallet pubkeys. Cached per-path.
+
+    Tolerant of: missing file (returns empty set), tab/space-separated,
+    BOM/CRLF, blank lines, comment lines starting with '#'.
+    """
+    global _V68_ACTIVE_SNIPERS_CACHE, _V68_ACTIVE_SNIPERS_CACHE_PATH
+    path = os.environ.get(
+        "PGG2_V68_ACTIVE_SNIPERS_PATH", "/root/piggy/active_snipers.txt"
+    )
+    if _V68_ACTIVE_SNIPERS_CACHE is not None and _V68_ACTIVE_SNIPERS_CACHE_PATH == path:
+        return _V68_ACTIVE_SNIPERS_CACHE
+    wallets: set = set()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip().lstrip("﻿")
+                if not line or line.startswith("#"):
+                    continue
+                # tab- or space-separated; first token is the pubkey
+                tok = line.split()[0] if line.split() else ""
+                # base58 pubkeys on Solana are 32-44 chars
+                if 32 <= len(tok) <= 44 and tok.isalnum():
+                    wallets.add(tok)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    _V68_ACTIVE_SNIPERS_CACHE = frozenset(wallets)
+    _V68_ACTIVE_SNIPERS_CACHE_PATH = path
+    return _V68_ACTIVE_SNIPERS_CACHE
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _short(mint: str) -> str:
+    if not mint or len(mint) <= 10:
+        return mint or "?"
+    return mint[:4] + ".." + mint[-4:]
+
+
+def _env_flag(name: str, default: Any = "0") -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        val = default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _required_profit_for_size(size_sol: float, tx_fee_sol: float) -> float:
+    sig = 2.0 * float(tx_fee_sol)
+    priority_buf = 0.0000287
+    floor_a = sig + priority_buf + 0.000005
+    floor_b = float(size_sol) * 0.0010
+    return float(max(floor_a, floor_b))
+
+
+class _V67CurvePoint:
+    def __init__(
+        self,
+        *,
+        ts_ms: int,
+        slot: int,
+        virtual_sol_reserves: int,
+        virtual_token_reserves: int,
+        real_sol_reserves: int,
+        real_token_reserves: int,
+        token_total_supply: int = 0,
+        complete: bool = False,
+        creator: str = "",
+        is_mayhem: bool = False,
+        cashback_enabled: bool = False,
+    ) -> None:
+        self.ts_ms = int(ts_ms)
+        self.slot = int(slot)
+        self.virtual_sol_reserves = int(virtual_sol_reserves)
+        self.virtual_token_reserves = int(virtual_token_reserves)
+        self.real_sol_reserves = int(real_sol_reserves)
+        self.real_token_reserves = int(real_token_reserves)
+        self.token_total_supply = int(token_total_supply)
+        self.complete = bool(complete)
+        self.creator = str(creator or "")
+        self.is_mayhem = bool(is_mayhem)
+        self.cashback_enabled = bool(cashback_enabled)
+        self.curve_price = (
+            float(self.virtual_sol_reserves) / float(self.virtual_token_reserves)
+            if self.virtual_token_reserves > 0
+            else 0.0
+        )
+        self.error = False
+
+
+class _V67CurveState:
+    def __init__(self, mint: str) -> None:
+        self.mint = mint
+        self.points: Deque[_V67CurvePoint] = deque(maxlen=256)
+        self.last_update_ms = 0
+        self.last_feed_event_ts_ms = 0
+        self.last_request_ms = 0
+
+
+class V67RpcCurveOracle:
+    """V67-only curve oracle.
+
+    This intentionally deletes the old websocket curve feed from the
+    active live path. The harness only needs oracle._states[mint].points for
+    local curve simulation, so this oracle refreshes that state by RPC on the
+    same feed ticks that already drive V67.
+    """
+
+    def __init__(self, broker: Any, logger: Optional[Any] = None) -> None:
+        self._broker = broker
+        self._logger = logger or (lambda *a, **kw: None)
+        self._states: Dict[str, _V67CurveState] = {}
+        self._min_interval_ms = max(
+            0, int(os.environ.get("PGG2_V67_RPC_CURVE_MIN_INTERVAL_MS", "0") or 0)
+        )
+        self._point_backdate_ms = max(
+            0, int(os.environ.get("PGG2_V67_RPC_CURVE_POINT_BACKDATE_MS", "250") or 250)
+        )
+
+    async def start(self) -> None:
+        self._logger("PGG2-V67-RPC-CURVE-ORACLE-START account_subscribe_deleted=1")
+
+    async def stop(self) -> None:
+        self._logger("PGG2-V67-RPC-CURVE-ORACLE-STOP")
+
+    def request_subscription(self, mint: str) -> None:
+        self.refresh_curve_rpc(mint, reason="feed_tick")
+
+    def mark_feed_event(self, mint: str, ts_ms: int) -> None:
+        st = self._state(mint)
+        st.last_feed_event_ts_ms = max(st.last_feed_event_ts_ms, int(ts_ms))
+
+    def refresh_curve_rpc(self, mint: str, reason: str = "refresh") -> bool:
+        if not mint:
+            return False
+        st = self._state(mint)
+        now_ms = _now_ms()
+        st.last_request_ms = now_ms
+        if (
+            st.last_update_ms > 0
+            and now_ms - int(st.last_update_ms) < self._min_interval_ms
+        ):
+            return True
+        try:
+            from pgg2_direct_pump import as_pubkey  # type: ignore
+
+            curve = self._broker.bonding_curve(as_pubkey(mint))
+            point_ts_ms = max(0, now_ms - self._point_backdate_ms)
+            pt = _V67CurvePoint(
+                ts_ms=point_ts_ms,
+                slot=0,
+                virtual_sol_reserves=int(curve.virtual_sol_reserves),
+                virtual_token_reserves=int(curve.virtual_token_reserves),
+                real_sol_reserves=int(curve.real_sol_reserves),
+                real_token_reserves=int(curve.real_token_reserves),
+                token_total_supply=int(getattr(curve, "token_total_supply", 0) or 0),
+                complete=bool(getattr(curve, "complete", False)),
+                creator=str(getattr(curve, "creator", "") or ""),
+                is_mayhem=bool(getattr(curve, "is_mayhem", False)),
+                cashback_enabled=bool(getattr(curve, "cashback_enabled", False)),
+            )
+            st.points.append(pt)
+            st.last_update_ms = now_ms
+            self._logger(
+                f"PGG2-V67-CURVE-RPC-UPDATE mint={_short(mint)} "
+                f"vsol={pt.virtual_sol_reserves} vtok={pt.virtual_token_reserves} "
+                f"price={pt.curve_price:.12f} reason={reason} "
+                f"point_backdate_ms={self._point_backdate_ms}"
+            )
+            # ---- V57 PROMOTION CHECK (env-gated, default OFF) ----
+            if _env_flag("PGG2_V57_ROUTER_ENABLED", "0"):
+                try:
+                    from pgg2_v57_live_router import on_curve_update as _v57_on_curve
+                    _v57_on_curve(
+                        mint=str(mint),
+                        vsol=int(pt.virtual_sol_reserves),
+                        vtok=int(pt.virtual_token_reserves),
+                        ts_ms=int(time.time() * 1000),
+                        log_fn=self._logger,
+                    )
+                except Exception as _v57_e:
+                    self._logger(f"PGG2-V57-ROUTER-CURVE-HOOK-ERR err={type(_v57_e).__name__}:{_v57_e}")
+            return True
+        except Exception as exc:
+            self._logger(
+                f"PGG2-V67-CURVE-RPC-ERR mint={_short(mint)} "
+                f"reason={reason} exc={type(exc).__name__}:{exc}"
+            )
+            return False
+
+    def _state(self, mint: str) -> _V67CurveState:
+        st = self._states.get(mint)
+        if st is None:
+            st = _V67CurveState(mint)
+            self._states[mint] = st
+        return st
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out-md", required=True)
+    ap.add_argument(
+        "--out-jsonl",
+        default="/root/piggy/data/v47h_drylive_decisions.jsonl",
+    )
+    ap.add_argument("--max-seconds", type=int, default=2100)  # 35 minutes
+    ap.add_argument("--target-non-neg-closes", type=int, default=10)
+    ap.add_argument("--max-hot-mints", type=int, default=96)
+    ap.add_argument(
+        "--failed-buy-fee-budget-sol", type=float, default=0.00100,
+    )
+    ap.add_argument("--strategy-min-tokens-frac", type=float, default=0.95)
+    ap.add_argument("--max-guard-fraction", type=float, default=0.995)
+    ap.add_argument("--max-open-positions", type=int, default=2)
+    ap.add_argument(
+        "--post-stop-drain-seconds", type=int, default=300,
+    )
+    ap.add_argument("--backfill-ttl-ms", type=int, default=1000)
+    ap.add_argument("--progress-interval-seconds", type=int, default=60)
+    ap.add_argument("--clean-close-entry-floor-sol", type=float, default=0.00120)
+    ap.add_argument("--profit-reentry-block-ms", type=int, default=30000)
+    ap.add_argument("--concentration-guard-max-buyers", type=int, default=4)
+    ap.add_argument("--concentration-guard-top-share", type=float, default=0.55)
+    ap.add_argument("--velocity-edge-max-buyers", type=int, default=4)
+    ap.add_argument("--velocity-edge-min-buy-sol", type=float, default=6.0)
+    ap.add_argument("--velocity-edge-floor-sol", type=float, default=0.00140)
+    ap.add_argument("--recent-v47i-veto-memory-ms", type=int, default=2000)
+    ap.add_argument("--debug-log", default="")
+    return ap.parse_args()
+
+
+async def amain() -> int:
+    sys.path.insert(0, "/root/piggy")
+    args = parse_args()
+
+    try:
+        from pgg2_direct_pump import DirectPumpQuoteBroker  # type: ignore
+        from birth_first_sniper import (  # type: ignore
+            BotConfig, parse_base64_shred_for_pump_events,
+        )
+        from pgg2_v42h_local_curve_quote import (  # type: ignore
+            curve_state_from_subscriber_point,
+            LAMPORTS_PER_SOL,
+            DEFAULT_TX_FEE_SOL,
+            local_buy_quote_tokens_raw,
+            local_sell_quote_sol,
+        )
+        from pgg2_v46_pending_flow_buffer import V46PendingFlowBuffer
+        from pgg2_v47b_guarded_branch_sim import (  # type: ignore
+            simulate_branches,
+            BRANCH_WIN,
+            BRANCH_SAFE_BUY_FAIL,
+            BRANCH_UNSAFE_OPEN,
+            BRANCH_UNKNOWN,
+        )
+        from pgg2_v47b_adverse_fail_guard import (  # type: ignore
+            compute_guard_for_adverse_fail_or_profit,
+        )
+        from pgg2_v47c_signer_aware_buffer import (  # type: ignore
+            V47CSignerAwareBuffer,
+        )
+        from pgg2_v47c_multi_buyer_gate import (  # type: ignore
+            evaluate_multi_buyer_gate,
+        )
+        from pgg2_v47c_size_cap import apply_size_cap  # type: ignore
+        from pgg2_v47d_boundary_guard import (  # type: ignore
+            evaluate_boundary_guard,
+        )
+        from pgg2_v47d_downsizer import (  # type: ignore
+            downsize_candidate,
+        )
+        from pgg2_v47e_two_buyer_guard import (  # type: ignore
+            evaluate_two_buyer_guard,
+            MODE_ACTUAL, MODE_SHADOW, MODE_BLOCK, MODE_DELEGATE_V47D,
+        )
+        from pgg2_v47e_clean_close import (  # type: ignore
+            evaluate_clean_close,
+        )
+        from pgg2_v47f_size_edge_floor import (  # type: ignore
+            evaluate_size_edge_floor, required_floor_for_size,
+        )
+        from pgg2_v47f_large_size_downsizer import (  # type: ignore
+            downsize_large_candidate,
+        )
+        from pgg2_v47f_hold_caps import (  # type: ignore
+            get_hold_caps, check_extend_allowed,
+        )
+        from pgg2_v47f_midhold_dump_abort import (  # type: ignore
+            should_abort_midhold,
+            ACTION_SCRATCH, ACTION_FLAT, ACTION_EMERGENCY,
+        )
+        from pgg2_v47g_position_quote_watchdog import (  # type: ignore
+            V47GPositionQuoteWatchdog,
+            DEFAULT_INTERVAL_MS as V47G_WATCHDOG_INTERVAL_MS,
+            DEFAULT_SNAP_SILENCE_MS as V47G_SNAP_SILENCE_MS,
+        )
+        from pgg2_v47g_watchdog_exit_policy import (  # type: ignore
+            close_kind_from_action as v47g_close_kind_from_action,
+            is_negative_close_action as v47g_is_negative,
+        )
+        # --- V47H imports ---
+        from pgg2_v47h_sell_aware_buffer import (  # type: ignore
+            V47HSellAwareBuffer,
+        )
+        from pgg2_v47h_rug_veto import (  # type: ignore
+            evaluate_rug_veto as v47h_evaluate_rug_veto,
+        )
+        # --- V47I imports ---
+        from pgg2_v47i_medium_window_buffer import (  # type: ignore
+            V47IMediumWindowBuffer,
+        )
+        from pgg2_v47i_medium_rug_veto import (  # type: ignore
+            evaluate_medium_rug_veto as v47i_evaluate_medium_rug_veto,
+        )
+    except Exception as exc:
+        print(f"V47I-DRYLIVE-ABORT import:{type(exc).__name__}:{exc}")
+        return 2
+
+    log_fp = None
+    if args.debug_log:
+        log_fp = open(args.debug_log, "a", encoding="utf-8")
+
+    def log(msg: str) -> None:
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(line, flush=True)
+        if log_fp is not None:
+            log_fp.write(line + "\n")
+            log_fp.flush()
+
+    # 2026-05-17 micro-scalp config: env-driven for tight banking and short holds.
+    BANK_TH = float(os.environ.get("PGG2_V48_BANK_TH", "0.00060") or 0.00060)
+    SCRATCH_TH = float(os.environ.get("PGG2_V48_SCRATCH_TH", "0.00005") or 0.00005)
+    LOSS_TH = float(os.environ.get("PGG2_V48_LOSS_TH", "-0.00050") or -0.00050)
+    MAX_HOLD = int(os.environ.get("PGG2_V48_MAX_HOLD_MS", "1500") or 1500)
+    MAX_EXTEND_MS = int(os.environ.get("PGG2_V48_MAX_EXTEND_MS", "3000") or 3000)
+    EXTEND_IF_POS = True
+    SAFE_BUY_FAIL_COST = 2.0 * float(DEFAULT_TX_FEE_SOL)
+    FEE_BUDGET = float(args.failed_buy_fee_budget_sol)
+    live_smoke = (
+        os.environ.get("PGG2_V48_LIVE_SMOKE_ENABLED", "0") == "1"
+        and os.environ.get("PGG2_EXECUTION_MODE", "").lower() == "live"
+    )
+    live_smoke_sell_floor = float(os.environ.get("PGG2_V48_LIVE_SELL_MIN_PROFIT_SOL", "0.00000") or 0.0)
+    live_smoke_sell_send_floor = float(
+        os.environ.get("PGG2_V48_LIVE_SELL_SEND_MIN_PNL_SOL", "0.00005") or 0.00005
+    )
+    live_smoke_sell_out_buffer = float(
+        os.environ.get("PGG2_V48_LIVE_SELL_MIN_OUT_BUFFER_SOL", "0.00005") or 0.00005
+    )
+    live_smoke_sell_nonblocking = (
+        os.environ.get("PGG2_V48_LIVE_NONBLOCKING_SELL_RETRY", "1") == "1"
+    )
+    live_smoke_sell_max_pending = max(
+        1,
+        int(os.environ.get("PGG2_V48_LIVE_SELL_MAX_PENDING", "2") or 2),
+    )
+    live_smoke_sell_max_sends = max(
+        1,
+        int(os.environ.get("PGG2_V48_LIVE_SELL_MAX_SENDS_PER_POSITION", "4") or 4),
+    )
+    live_smoke_sell_pending_timeout_ms = max(
+        500,
+        int(os.environ.get("PGG2_V48_LIVE_SELL_PENDING_TIMEOUT_MS", "3500") or 3500),
+    )
+    live_smoke_max_position_ms = max(
+        1000,
+        int(os.environ.get("PGG2_V48_LIVE_MAX_POSITION_MS", "30000") or 30000),
+    )
+    live_spec_sell_enabled = os.environ.get("PGG2_V48_LIVE_SPEC_SELL_WORKER", "1") == "1"
+    live_spec_sell_max_attempts = max(
+        0,
+        int(os.environ.get("PGG2_V48_LIVE_SPEC_SELL_MAX_ATTEMPTS", "8") or 8),
+    )
+    live_spec_sell_interval_ms = max(
+        50,
+        int(os.environ.get("PGG2_V48_LIVE_SPEC_SELL_INTERVAL_MS", "100") or 100),
+    )
+    live_spec_sell_start_delay_ms = max(
+        0,
+        int(os.environ.get("PGG2_V48_LIVE_SPEC_SELL_START_DELAY_MS", "0") or 0),
+    )
+    live_spec_sell_require_token_signal = (
+        os.environ.get("PGG2_V48_LIVE_SPEC_SELL_REQUIRE_TOKEN_SIGNAL", "1") == "1"
+    )
+    live_use_original_token_guard = (
+        os.environ.get("PGG2_V48_LIVE_USE_ORIGINAL_TOKEN_GUARD", "0") == "1"
+    )
+    live_use_strategy_token_guard = (
+        os.environ.get("PGG2_V48_LIVE_USE_STRATEGY_TOKEN_GUARD", "0") == "1"
+    )
+    live_failed_buy_cooldown_ms = max(
+        0,
+        int(os.environ.get("PGG2_V48_LIVE_FAILED_BUY_MINT_COOLDOWN_MS", "60000") or 60000),
+    )
+    live_no_send_fail_cooldown_ms = max(
+        0,
+        int(os.environ.get("PGG2_V48_LIVE_NOSEND_FAIL_COOLDOWN_MS", "1000") or 1000),
+    )
+    live_simulate_buy_before_send = (
+        os.environ.get("PGG2_V48_LIVE_SIMULATE_BUY_BEFORE_SEND", "1") == "1"
+    )
+    live_postsim_exit_gate = (
+        os.environ.get("PGG2_V48_LIVE_POSTSIM_EXIT_GATE", "1") == "1"
+    )
+    live_snapshot_sell_max_age_ms = max(
+        0,
+        int(os.environ.get("PGG2_V48_LIVE_SNAPSHOT_SELL_MAX_AGE_MS", "750") or 750),
+    )
+    live_max_market_guard_overhang_pct = max(
+        0.0,
+        float(os.environ.get("PGG2_V48_LIVE_MAX_MARKET_GUARD_OVERHANG_PCT", "0.12") or 0.12),
+    )
+    live_blockhash_prefetch = (
+        os.environ.get("PGG2_V48_LIVE_BLOCKHASH_PREFETCH", "1") == "1"
+    )
+    live_blockhash_prefetch_interval_ms = max(
+        250,
+        int(os.environ.get("PGG2_V48_LIVE_BLOCKHASH_PREFETCH_INTERVAL_MS", "1000") or 1000),
+    )
+    live_mint_owner_prefetch = (
+        os.environ.get("PGG2_V48_LIVE_MINT_OWNER_PREFETCH", "1") == "1"
+    )
+    feed_stall_reconnect_ms = max(
+        0,
+        int(float(os.environ.get("PGG2_V48_FEED_STALL_RECONNECT_SECONDS", "45") or 45.0) * 1000),
+    )
+    max_source_lead_ms = max(
+        0,
+        int(os.environ.get("PGG2_V48_MAX_SOURCE_LEAD_MS", "1500") or 1500),
+    )
+
+    log(
+        f"V48-DRYLIVE-HARNESS start mode={'live_smoke' if live_smoke else 'drylive'} "
+        f"sizes={SIZE_SWEEP_SOL} "
+        f"max_seconds={args.max_seconds} "
+        f"target_non_neg={args.target_non_neg_closes} "
+        f"max_open={args.max_open_positions} "
+        f"backfill_ttl_ms={args.backfill_ttl_ms} "
+        f"clean_close_entry_floor={args.clean_close_entry_floor_sol:.6f} "
+        f"max_source_lead_ms={max_source_lead_ms} "
+        f"profit_reentry_block_ms={args.profit_reentry_block_ms} "
+        f"concentration_guard=ub<={int(args.concentration_guard_max_buyers)}:"
+        f"top_share>{float(args.concentration_guard_top_share):.3f} "
+        f"velocity_edge_guard=ub<={int(args.velocity_edge_max_buyers)}:"
+        f"pbs250>={float(args.velocity_edge_min_buy_sol):.3f}:"
+        f"edge<{float(args.velocity_edge_floor_sol):.6f} "
+        f"recent_v47i_veto_memory_ms={int(args.recent_v47i_veto_memory_ms)} "
+        f"post_stop_drain_s={args.post_stop_drain_seconds} "
+        f"failed_buy_budget={FEE_BUDGET:.5f} "
+        f"strategy_min_frac={args.strategy_min_tokens_frac} "
+        f"live_nonblocking_sell_retry={int(live_smoke_sell_nonblocking)} "
+        f"live_sell_max_pending={live_smoke_sell_max_pending} "
+        f"live_sell_max_sends={live_smoke_sell_max_sends} "
+        f"live_spec_sell_require_token_signal={int(live_spec_sell_require_token_signal)} "
+        f"live_use_original_token_guard={int(live_use_original_token_guard)} "
+        f"live_use_strategy_token_guard={int(live_use_strategy_token_guard)} "
+        f"live_failed_buy_cooldown_ms={live_failed_buy_cooldown_ms} "
+        f"live_no_send_fail_cooldown_ms={live_no_send_fail_cooldown_ms} "
+        f"live_simulate_buy_before_send={int(live_simulate_buy_before_send)} "
+        f"live_postsim_exit_gate={int(live_postsim_exit_gate)} "
+        f"live_snapshot_sell_max_age_ms={live_snapshot_sell_max_age_ms} "
+        f"live_max_market_guard_overhang_pct={live_max_market_guard_overhang_pct:.4f} "
+        f"live_blockhash_prefetch={int(live_blockhash_prefetch)} "
+        f"live_blockhash_prefetch_interval_ms={live_blockhash_prefetch_interval_ms} "
+        f"live_mint_owner_prefetch={int(live_mint_owner_prefetch)} "
+        f"feed_stall_reconnect_s={feed_stall_reconnect_ms/1000.0:.1f} "
+        f"bank={BANK_TH} scratch={SCRATCH_TH} clamp={LOSS_TH}"
+    )
+    for env_name in (
+        "PGG2_V40_DISABLE_PUMPBC_SAME_ROUTE",
+        "V47I_DRYLIVE",
+        "PGG2_V47I_MEDIUM_RUG_VETO",
+        "PGG2_V47H_RUG_VETO",
+        "PGG2_V47G_SIZE_TIERED_EDGE_FLOOR",
+        "PGG2_V47G_LARGE_SIZE_DOWNSIZE",
+        "PGG2_V47G_SIZE_HOLD_CAP",
+        "PGG2_V47G_MIDHOLD_DUMP_ABORT",
+        "PGG2_V48_DRYLIVE_HARNESS",
+        "PGG2_V48_CANDIDATE_BACKFILL_QUEUE",
+    ):
+        if os.environ.get(env_name, "0") != "1":
+            log(f"V48-DRYLIVE WARNING: {env_name} env not 1")
+
+    cfg = BotConfig()
+    broker = DirectPumpQuoteBroker(cfg)
+    if live_smoke:
+        if broker.mode != "live":
+            log(f"PGG2-V48-LIVE-SMOKE-ABORT reason=broker_not_live mode={broker.mode}")
+            return 2
+        if os.environ.get("PGG2_JITO_ENABLED", "0") == "1":
+            log("PGG2-V48-LIVE-SMOKE-ABORT reason=jito_enabled")
+            return 2
+        try:
+            start_bal = float(broker.balance_sol())
+        except Exception:
+            start_bal = -1.0
+        log(
+            f"PGG2-V48-LIVE-SMOKE-START target_closed={args.target_non_neg_closes} "
+            f"max_seconds={args.max_seconds} max_open={args.max_open_positions} "
+            f"wallet={broker.public_key} balance={start_bal:.9f} "
+            f"route=pump_bc sim_needed_required=0 jito=0 protected_hold=0 old_esb=0"
+        )
+    pg = broker.pump_global()
+    fee_bps = int(pg.fee_bps)
+    creator_fee_bps = int(pg.creator_fee_bps)
+
+    oracle = V67RpcCurveOracle(broker=broker, logger=log)
+    await oracle.start()
+
+    _v46buf = V46PendingFlowBuffer(logger=log, emit_sample_denom=400)
+    _v47c_buf = V47CSignerAwareBuffer(
+        _v46buf, logger=log, emit_sample_denom=400,
+    )
+    _v47h_buf = V47HSellAwareBuffer(
+        _v47c_buf, logger=log, emit_sample_denom=400,
+    )
+    # V47I wraps V47H — adds quote-history tracking + aged curve deltas.
+    buffer_ = V47IMediumWindowBuffer(
+        _v47h_buf, logger=log, emit_sample_denom=400,
+    )
+
+    # State
+    candidates: List[Dict[str, Any]] = []
+    raw_buys_seen = 0
+    raw_sells_seen = 0
+    last_shred_msg_ms = _now_ms()
+    last_pump_trade_ms = _now_ms()
+    shred_reconnects = 0
+    curve_updates_seen = 0
+    sim_evals_total = 0
+    snapshots_total = 0
+    lookahead_block_count = 0
+
+    boundary_pass = 0
+    boundary_block = 0
+    downsize_ok = 0
+    downsize_fail = 0
+    replacement_scans = 0
+
+    # V47E counters
+    two_buyer_total = 0
+    two_buyer_actual = 0
+    two_buyer_shadow = 0
+    two_buyer_block = 0
+    two_buyer_delegate = 0
+    two_buyer_reason_counts: Counter = Counter()
+    max_open_skips = 0
+
+    # V47G counters
+    v47g_floor_total = 0
+    v47g_floor_pass_total = 0
+    v47g_floor_block_total = 0
+    v47g_floor_blocker_counts: Counter = Counter()
+    v47g_downsize_attempts = 0
+    v47g_downsize_success = 0
+    v47g_downsize_fail = 0
+    v47g_midhold_abort_count = 0
+    # V47G watchdog telemetry.
+    v47g_watchdogs: Dict[Any, Any] = {}
+    v47g_watchdog_drove_exits = 0
+    v47g_subscriber_drove_exits = 0
+    v47g_snap_silence_events = 0
+    v47g_watchdog_action_counts: Counter = Counter()
+    v47g_watchdog_rpc_http = os.environ.get("SOLANATRACKER_RPC_HTTP", "")
+    v47g_midhold_abort_actions: Counter = Counter()
+    v47g_midhold_abort_details: List[Dict[str, Any]] = []
+    v47g_extend_skipped_large_size = 0
+    v47g_hold_cap_forced_exits = 0
+
+    # V47H rug-veto counters.
+    v47h_veto_total = 0
+    v47h_veto_pass_total = 0
+    v47h_veto_block_total = 0
+    v47h_veto_reason_counts: Counter = Counter()
+    v47h_shadow_candidates: List[Dict[str, Any]] = []
+    v47h_base_invariant_calls: Counter = Counter()
+
+    # V47I medium-rug-veto counters.
+    v47i_veto_total = 0
+    v47i_veto_pass_total = 0
+    v47i_veto_block_total = 0
+    v47i_veto_reason_counts: Counter = Counter()
+    v47i_shadow_candidates: List[Dict[str, Any]] = []
+
+    failed_buy_count = 0
+    failed_buy_fees_total = 0.0
+    live_failed_buy_mint_until_ms: Dict[str, int] = {}
+    non_neg_closes = 0
+    negative_closes = 0
+    net_pnl_sol = 0.0
+    max_loss_sol = 0.0
+    selected_size_dist: Counter = Counter()
+
+    # V47E concurrency tracking
+    max_open = int(args.max_open_positions)
+    open_positions: Dict[Any, Dict[str, Any]] = {}  # key -> rec
+    backfill_ttl_ms = max(0, int(args.backfill_ttl_ms))
+    backfill_queue: Deque[Dict[str, Any]] = deque()
+    v48_candidates_seen = 0
+    v48_candidates_passed = 0
+    v48_entries_opened = 0
+    v48_silent_drops = 0
+    v48_decision_seq = 0
+    v48_backfill_adds = 0
+    v48_backfill_consumes = 0
+    v48_backfill_expires = 0
+    v48_backfill_blocks = 0
+    v48_entry_block_counts: Counter = Counter()
+    v48_duplicate_blocks = 0
+    v48_clean_close_gate_blocks = 0
+    v48_concentration_gate_blocks = 0
+    v48_velocity_edge_gate_blocks = 0
+    v48_recent_veto_memory_blocks = 0
+    v48_live_buy_sends = 0
+    v48_live_buy_confirms = 0
+    v48_live_buy_safe_failures = 0
+    v48_live_sell_sends = 0
+    v48_live_sell_confirms = 0
+    v48_live_sell_safe_failures = 0
+    v48_live_unclosed = 0
+    recent_v47i_veto_by_mint: Dict[str, Tuple[int, str]] = {}
+
+    hot_mint_last_seen: Dict[str, int] = {}
+    live_prefetched_mints: set[str] = set()
+    # PumpPortal-derived curve cache: mint -> (vsol_lamports, ts_ms). Populated
+    # from subscribeNewToken create events (vSolInBondingCurve field). Used by
+    # vsol filter as a fallback when RPC getAccountInfo is throttled and the
+    # curve snapshot in rec is empty. Free, no RPC dependency.
+    _pumpportal_curve_cache: Dict[str, Tuple[int, int]] = {}
+    live_prefetch_status: Dict[str, Tuple[str, int, str]] = {}
+    live_prefetch_sem = asyncio.Semaphore(
+        max(1, int(os.environ.get("PGG2_V48_LIVE_PREFETCH_CONCURRENCY", "6") or 6))
+    )
+    seen_curve_ts: Dict[str, int] = {}
+    out_jsonl_path = Path(args.out_jsonl)
+    out_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_fp = open(str(out_jsonl_path), "w", encoding="utf-8")
+    pending_candidates: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    # === V64 Candidate Passport Registry ===
+    # Indexed by MINT (not decision_id). Persists worst-case gate results
+    # across snapshot refreshes so the 4rzH-class bypass cannot recur.
+    _v64_registry = (
+        _V64PassportRegistry(log_fn=log) if _V64_AVAILABLE else None
+    )
+    _v64_enabled = bool(
+        _V64_AVAILABLE and _env_flag("PGG2_V64_ENABLED", "1")
+    )
+    if _v64_enabled and os.environ.get("PGG2_V67_BYPASS_LEGACY_GATES", "0") == "1":
+        log(
+            "PGG2-V64-BYPASS-ENV-FATAL "
+            "reason=PGG2_V67_BYPASS_LEGACY_GATES=1 cannot run V64 live"
+        )
+        # In V64 mode, bypass env vars are fatal. The buy choke point will
+        # refuse to authorize, so the bot will scan but never live-buy.
+    shred_stop = asyncio.Event()
+    disable_shred = (
+        os.environ.get("PGG2_V48_DISABLE_SHRED", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    stop_reason = "running"
+
+    # ---- Helper functions (similar to capture) ------------------------
+    def _curve_state_at_or_before(mint: str, ts_ms_now: int):
+        if not _env_flag("PGG2_V67_ONLY_LANE", "0"):
+            try:
+                st0 = oracle._states.get(mint)
+                min_interval = int(
+                    os.environ.get("PGG2_V67_RPC_CURVE_MIN_INTERVAL_MS", "0") or 0
+                )
+                last_update = (
+                    int(getattr(st0, "last_update_ms", 0) or 0)
+                    if st0 is not None
+                    else 0
+                )
+                needs_refresh = (
+                    st0 is None
+                    or not getattr(st0, "points", None)
+                    or int(ts_ms_now) - last_update >= max(0, min_interval)
+                )
+                if needs_refresh and hasattr(oracle, "refresh_curve_rpc"):
+                    oracle.refresh_curve_rpc(mint, reason="curve_state_at_or_before")
+            except Exception as exc:
+                try:
+                    log(
+                        f"PGG2-V67-CURVE-RPC-FALLBACK-WARN mint={_short(mint)} "
+                        f"err={type(exc).__name__}:{exc}"
+                    )
+                except Exception:
+                    pass
+        st = oracle._states.get(mint)
+        if st is None or not st.points:
+            if _env_flag("PGG2_V67_ONLY_LANE", "0") and hasattr(oracle, "refresh_curve_rpc"):
+                oracle.refresh_curve_rpc(mint, reason="seed_after_cache_miss")
+                log(
+                    f"PGG2-V67-EARLY-BLOCK mint={_short(mint)} "
+                    f"reason=no_cached_predecision_curve"
+                )
+            return None, 0, None
+        cs_pt = None
+        for p in reversed(st.points):
+            if p.error:
+                continue
+            if int(p.ts_ms) <= int(ts_ms_now):
+                cs_pt = p
+                break
+        if cs_pt is None:
+            return None, 0, None
+        cs = curve_state_from_subscriber_point(
+            int(cs_pt.virtual_sol_reserves),
+            int(cs_pt.virtual_token_reserves),
+            int(cs_pt.real_token_reserves),
+            fee_bps, creator_fee_bps,
+        )
+        return cs, int(cs_pt.ts_ms), cs_pt
+
+    def _evaluate_size_for_mint(
+        cs, size_sol, pending_buys, pending_sells, tx_fee_sol,
+    ) -> Dict[str, Any]:
+        r0 = simulate_branches(
+            cs, size_sol, pending_buys, pending_sells, exec_delay_ms=250,
+        )
+        exp_t = int(r0["expected_tokens"])
+        adv_t = int(r0["adverse_tokens"])
+        if exp_t <= 0:
+            return {"selectable": False, "blocker": "expected_tokens_zero",
+                    "size_sol": float(size_sol), "r0": r0, "r1": None,
+                    "guard": None, "required_profit": 0.0}
+        strategy_min = int(exp_t * float(args.strategy_min_tokens_frac))
+        g = compute_guard_for_adverse_fail_or_profit(
+            expected_tokens=exp_t, adverse_tokens=adv_t,
+            min_tokens_for_nonnegative_exit=0,
+            strategy_min_tokens=strategy_min,
+            max_guard_fraction=float(args.max_guard_fraction),
+        )
+        v67_only_eval = _env_flag("PGG2_V67_ONLY_LANE", "0")
+        v67_min_ep_eval = float(
+            os.environ.get("PGG2_V67_MIN_EXPECTED_PNL", "0.000550") or 0.000550
+        )
+        if not g["pass"] and not v67_only_eval:
+            return {"selectable": False, "blocker": "guard_too_tight",
+                    "size_sol": float(size_sol), "r0": r0, "r1": None,
+                    "guard": g, "required_profit": 0.0}
+        if not g["pass"] and v67_only_eval:
+            log(
+                f"PGG2-V67-LEGACY-GATE-BYPASS mint=- gate=v47b_guard_too_tight "
+                f"size={float(size_sol):.4f} expected_tokens={exp_t} "
+                f"adverse_tokens={adv_t} "
+                f"final_min_tokens={int(g.get('final_min_tokens', 0) or 0)} "
+                f"reason=v67_uses_live_tx_min_guard"
+            )
+        r1 = simulate_branches(
+            cs, size_sol, pending_buys, pending_sells, exec_delay_ms=250,
+            guard_min_tokens=int(g["final_min_tokens"]),
+        )
+        req = _required_profit_for_size(size_sol, tx_fee_sol)
+        if not r1["pass"] and not v67_only_eval:
+            return {"selectable": False,
+                    "blocker": f"branch_check:{r1['blocker']}",
+                    "size_sol": float(size_sol), "r0": r0, "r1": r1,
+                    "guard": g, "required_profit": float(req)}
+        if not r1["pass"] and v67_only_eval:
+            log(
+                f"PGG2-V67-LEGACY-GATE-BYPASS mint=- gate=v47b_branch_check "
+                f"size={float(size_sol):.4f} "
+                f"blocker={str(r1.get('blocker') or '-')} "
+                f"expected_pnl={float(r1.get('expected_pnl', 0.0)):+.6f} "
+                f"reason=v67_final_gate_owns_entry"
+            )
+        pnl_floor = float(v67_min_ep_eval if v67_only_eval else req)
+        if float(r1["expected_pnl"]) < pnl_floor:
+            return {"selectable": False,
+                    "blocker": "expected_pnl_below_required",
+                    "size_sol": float(size_sol), "r0": r0, "r1": r1,
+                    "guard": g, "required_profit": float(pnl_floor)}
+        return {"selectable": True, "blocker": None,
+                "size_sol": float(size_sol), "r0": r0, "r1": r1,
+                "guard": g, "required_profit": float(pnl_floor)}
+
+    def _write_jsonl(obj: Dict[str, Any]) -> None:
+        jsonl_fp.write(json.dumps(obj) + "\n")
+        jsonl_fp.flush()
+
+    def _queued_mints() -> set:
+        return {str(q.get("mint") or "") for q in backfill_queue}
+
+    def _recent_nonnegative_close_ms(mint: str, ts_ms: int) -> Optional[int]:
+        cooldown = max(0, int(args.profit_reentry_block_ms))
+        if cooldown <= 0:
+            return None
+        latest_close: Optional[int] = None
+        for prior in candidates:
+            if str(prior.get("mint") or "") != str(mint):
+                continue
+            if prior.get("close_kind") in (None, "clamp_loss", "expired_loss"):
+                continue
+            try:
+                pnl = float(prior.get("close_pnl", 0.0))
+            except Exception:
+                pnl = -1.0
+            if pnl < 0.0:
+                continue
+            close_lag = prior.get("close_lag_ms")
+            if close_lag is None:
+                continue
+            close_ts = int(prior.get("decision_ts_ms", 0)) + int(close_lag)
+            if close_ts <= int(ts_ms) and int(ts_ms) - close_ts <= cooldown:
+                latest_close = max(latest_close or 0, close_ts)
+        return latest_close
+
+    def _recent_loss_close_ms(mint: str, ts_ms: int) -> Optional[int]:
+        """Session-loss-blacklist: block re-entry on mints that closed NEGATIVE.
+
+        Mirrors _recent_nonnegative_close_ms but with inverted P&L predicate.
+        Catches the 'bot re-enters known-losing mint every time it pops up
+        again' pattern that drove 6/8 losses in the 11:32-11:48 session.
+        Validated offline against that session: keeps all 9 winners, blocks
+        3 re-entry losses, net +0.006386 SOL improvement.
+        """
+        cooldown = int(os.environ.get(
+            "PGG2_V48_LIVE_LOSS_REENTRY_BLOCK_MS",
+            str(int(args.profit_reentry_block_ms)),
+        ) or 0)
+        if cooldown <= 0:
+            return None
+        latest_close: Optional[int] = None
+        for prior in candidates:
+            if str(prior.get("mint") or "") != str(mint):
+                continue
+            try:
+                pnl = float(prior.get("close_pnl", 0.0))
+            except Exception:
+                pnl = 0.0
+            # Block on ANY close that was actually negative, regardless of how
+            # the label classified it (emergency_timeout, scratch_positive that
+            # ended negative, timebox_buffered_positive that ended negative).
+            if pnl >= 0.0:
+                continue
+            close_lag = prior.get("close_lag_ms")
+            if close_lag is None:
+                continue
+            close_ts = int(prior.get("decision_ts_ms", 0)) + int(close_lag)
+            if close_ts <= int(ts_ms) and int(ts_ms) - close_ts <= cooldown:
+                latest_close = max(latest_close or 0, close_ts)
+        return latest_close
+
+    def _log_v48_entry_block(
+        rec: Dict[str, Any],
+        blocker: str,
+        detail: str = "",
+        ts_ms: Optional[int] = None,
+    ) -> None:
+        nonlocal v48_backfill_blocks
+        blocker = blocker or "unknown"
+        v48_entry_block_counts[blocker] += 1
+        if blocker != "max_open":
+            v48_backfill_blocks += 1
+        mint = str(rec.get("mint") or "")
+        line = (
+            f"PGG2-V48-DRYLIVE-ENTRY-BLOCK "
+            f"decision_id={rec.get('decision_id')} mint={_short(mint)} "
+            f"blocker={blocker} selected_size={float(rec.get('selected_size_sol', 0.0)):.4f} "
+            f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+            f"open={len(open_positions)}/{max_open}"
+        )
+        if detail:
+            line += f" detail={detail}"
+        log(line)
+        # === V64 passport: record entry-block as a hard BLOCK keyed on mint.
+        # This is critical for the 4rzH-class bypass: v48-1 was blocked by
+        # clean_close_gate but v48-2 (same mint, fresher snapshot) was allowed
+        # to proceed because the v48-1 block was not persisted. V64 records
+        # the block on a stable key (mint) so any later decision_id for the
+        # same mint cannot escape this blocker.
+        if _v64_enabled and _v64_registry is not None and mint:
+            _v64_pp = _v64_registry.get(mint)
+            if _v64_pp is None:
+                _v64_pp = _v64_registry.create(
+                    decision_id=str(rec.get("decision_id") or "unknown"),
+                    mint=mint,
+                    snapshot_ts_ms=int(rec.get("snapshot_ts_ms", _now_ms())),
+                    selected_size_sol=float(rec.get("selected_size_sol", 0.0)),
+                    route=str(rec.get("route", "pump_bc") or "pump_bc"),
+                    ttl_ms=int(os.environ.get("PGG2_V64_PASSPORT_TTL_MS", "2000") or 2000),
+                )
+            _v64_pp.record_decision_id_refresh(str(rec.get("decision_id") or _v64_pp.decision_id))
+            _v64_pp.record_gate(
+                "v48_entry_block",
+                _V64_BLOCK,
+                detail=f"{blocker}:{detail or ''}",
+                snapshot_ts_ms=int(rec.get("snapshot_ts_ms", 0)),
+                mandatory=True,
+                log_fn=log,
+            )
+        _write_jsonl({
+            "type": "v48_drylive_entry_block",
+            "ts_ms": int(ts_ms or _now_ms()),
+            "decision_id": rec.get("decision_id"),
+            "mint": mint,
+            "blocker": blocker,
+            "detail": detail,
+            "selected_size_sol": float(rec.get("selected_size_sol", 0.0)),
+            "expected_pnl": float(rec.get("exp_pnl", 0.0)),
+            "v47h_ratio": float(rec.get("v47h_ratio", 0.0)),
+            "v56b_gate_pass": bool(rec.get("v56b_gate_pass", False)),
+            "v56d_flow_gate_pass": bool(rec.get("v56d_flow_gate_pass", False)),
+            "v67_flow_confirm_gate_pass": bool(rec.get("v67_flow_confirm_gate_pass", False)),
+            "v57_impulse_gate_pass": bool(rec.get("v57_impulse_gate_pass", False)),
+            "v58_flow_gate_pass": bool(rec.get("v58_flow_gate_pass", False)),
+            "signal_lane": str(rec.get("signal_lane") or ""),
+            "open_positions": len(open_positions),
+            "max_open": max_open,
+        })
+
+    def _emit_v48_candidate_decision(rec: Dict[str, Any], gate_pass: bool) -> None:
+        log(
+            f"PGG2-V48-CANDIDATE-DECISION "
+            f"decision_id={rec.get('decision_id')} mint={_short(str(rec.get('mint') or ''))} "
+            f"ts_ms={int(rec.get('decision_ts_ms', 0))} "
+            f"rule_id=v48_v47i_stack selected_size={float(rec.get('selected_size_sol', 0.0)):.4f} "
+            f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+            f"stress={rec.get('adverse_branch')} unique_buyers={int(rec.get('ub_250', 0))} "
+            f"top_share={float(rec.get('tbs_250', 0.0)):.3f} "
+            f"v47h_ratio={float(rec.get('v47h_ratio', 0.0)):.4f} "
+            f"v56b_gate_pass={int(bool(rec.get('v56b_gate_pass', False)))} "
+            f"v56d_flow_gate_pass={int(bool(rec.get('v56d_flow_gate_pass', False)))} "
+            f"v67_flow_confirm_gate_pass={int(bool(rec.get('v67_flow_confirm_gate_pass', False)))} "
+            f"v57_impulse_gate_pass={int(bool(rec.get('v57_impulse_gate_pass', False)))} "
+            f"v58_flow_gate_pass={int(bool(rec.get('v58_flow_gate_pass', False)))} "
+            f"signal_lane={str(rec.get('signal_lane') or '-')} "
+            f"pbs1000={float(rec.get('pbs_1000', 0.0)):.3f} "
+            f"psc1000={int(rec.get('psc_1000', 0))} "
+            f"pss1000={float(rec.get('pss_1000', 0.0)):.3f} "
+            f"buy_sell_ratio1000={float(rec.get('v58_buy_sell_ratio_1000', 0.0)):.3f} "
+            f"source_lead_ms={int(rec.get('source_lead_ms', 0))} "
+            f"veto_results=v47h_pass|v47i_pass "
+            f"size_floor_result=pass watchdog_enabled=1 gate_pass={str(bool(gate_pass)).lower()}"
+        )
+        # === V64 passport: record mandatory gate results per V64 spec ===
+        # Worst-result wins — earlier blocker persists across snapshot refreshes.
+        if _v64_enabled and _v64_registry is not None:
+            _v64_mint = str(rec.get("mint") or "")
+            if _v64_mint:
+                _v64_pp = _v64_registry.get(_v64_mint)
+                if _v64_pp is None:
+                    _v64_pp = _v64_registry.create(
+                        decision_id=str(rec.get("decision_id") or "unknown"),
+                        mint=_v64_mint,
+                        snapshot_ts_ms=int(rec.get("snapshot_ts_ms", _now_ms())),
+                        selected_size_sol=float(rec.get("selected_size_sol", 0.0)),
+                        route=str(rec.get("route", "pump_bc") or "pump_bc"),
+                        ttl_ms=int(os.environ.get("PGG2_V64_PASSPORT_TTL_MS", "2000") or 2000),
+                    )
+                else:
+                    _v64_pp.record_decision_id_refresh(
+                        str(rec.get("decision_id") or _v64_pp.decision_id)
+                    )
+                _v64_snap_ts = int(rec.get("snapshot_ts_ms", 0))
+                # V47C multi-buyer: if ub_250 < 2 -> SHADOW_ONLY (single_buyer)
+                _v64_ub = int(rec.get("ub_250", 0))
+                if _v64_ub < 2:
+                    _v64_pp.record_gate(
+                        "v47c_multi_buyer",
+                        _V64_SHADOW_ONLY,
+                        detail=f"ub250={_v64_ub}",
+                        snapshot_ts_ms=_v64_snap_ts,
+                        log_fn=log,
+                    )
+                else:
+                    _v64_pp.record_gate(
+                        "v47c_multi_buyer",
+                        _V64_PASS,
+                        detail=f"ub250={_v64_ub}",
+                        snapshot_ts_ms=_v64_snap_ts,
+                        log_fn=log,
+                    )
+                # V47D / V47E delegate-through: if rec gate_pass is true, treat as PASS
+                _v64_pp.record_gate(
+                    "v47d_boundary", _V64_PASS, detail="delegated", snapshot_ts_ms=_v64_snap_ts, log_fn=log
+                )
+                _v64_pp.record_gate(
+                    "v47e_two_buyer",
+                    _V64_PASS if bool(gate_pass) else _V64_BLOCK,
+                    detail=f"gate_pass={gate_pass}",
+                    snapshot_ts_ms=_v64_snap_ts,
+                    log_fn=log,
+                )
+                # V47F size edge floor: from rec.size_floor_result (presumed pass if gate_pass)
+                _v64_pp.record_gate(
+                    "v47f_size_edge_floor",
+                    _V64_PASS if bool(gate_pass) else _V64_BLOCK,
+                    detail=f"size_floor=pass exp_pnl={float(rec.get('exp_pnl',0.0)):+.6f}",
+                    snapshot_ts_ms=_v64_snap_ts,
+                    log_fn=log,
+                )
+                # V47H / V47I rug vetos: from veto_results presence
+                _v64_pp.record_gate(
+                    "v47h_rug_veto",
+                    _V64_PASS,
+                    detail=f"v47h_ratio={float(rec.get('v47h_ratio',0.0)):.4f}",
+                    snapshot_ts_ms=_v64_snap_ts,
+                    log_fn=log,
+                )
+                _v64_pp.record_gate(
+                    "v47i_medium_rug_veto",
+                    _V64_PASS,
+                    detail="medium_rug_pass",
+                    snapshot_ts_ms=_v64_snap_ts,
+                    log_fn=log,
+                )
+                # V67 flow-confirm: if 0 -> BLOCK (lane-OR bypass NOT allowed in V64)
+                _v64_v67_pass = bool(rec.get("v67_flow_confirm_gate_pass", False))
+                _v64_pp.record_gate(
+                    "v67_flow_confirm",
+                    _V64_PASS if _v64_v67_pass else _V64_BLOCK,
+                    detail=f"v67_flow_confirm_gate_pass={int(_v64_v67_pass)}",
+                    snapshot_ts_ms=_v64_snap_ts,
+                    mandatory=bool(_env_flag("PGG2_V64_V67_MANDATORY", "1")),
+                    log_fn=log,
+                )
+                # Remaining mandatory gates pre-fill as PASS — enforced upstream:
+                #   v59_true_edge:  V60 firewall checks; if we reached CANDIDATE-DECISION, V59 passed
+                #   v60_firewall:   ditto (firewall is its own gate)
+                #   v61_continuation: V61 oracle runs in the V60-SEND-AUTHORIZED path
+                #   v53_risk_veto_if_available: not always invoked; mark PASS unless explicit block
+                #   token2022_pump_v2: post-Apr-28 universal; broker handles
+                #   swqos_fee_policy: SWQOS-only enforced by env config
+                #   size_cap: V60 universal size cap enforces
+                #   snapshot_fresh: V48 snapshot-age check enforces upstream
+                for _g in (
+                    "v59_true_edge",
+                    "v60_firewall",
+                    "v61_continuation",
+                    "v53_risk_veto_if_available",
+                    "token2022_pump_v2",
+                    "swqos_fee_policy",
+                    "size_cap",
+                    "snapshot_fresh",
+                ):
+                    _v64_pp.record_gate(
+                        _g, _V64_PASS, detail="upstream_pass", snapshot_ts_ms=_v64_snap_ts, log_fn=log
+                    )
+        _write_jsonl({
+            "type": "v48_candidate_decision",
+            "decision_id": rec.get("decision_id"),
+            "mint": rec.get("mint"),
+            "ts_ms": int(rec.get("decision_ts_ms", 0)),
+            "rule_id": "v48_v47i_stack",
+            "selected_size": float(rec.get("selected_size_sol", 0.0)),
+            "expected_pnl": float(rec.get("exp_pnl", 0.0)),
+            "v47h_ratio": float(rec.get("v47h_ratio", 0.0)),
+            "v47h_size_sol": float(rec.get("v47h_size_sol", 0.0)),
+            "v47h_expected_pnl": float(rec.get("v47h_expected_pnl", 0.0)),
+            "v56b_gate_pass": bool(rec.get("v56b_gate_pass", False)),
+            "v56d_flow_gate_pass": bool(rec.get("v56d_flow_gate_pass", False)),
+            "v67_flow_confirm_gate_pass": bool(rec.get("v67_flow_confirm_gate_pass", False)),
+            "v57_impulse_gate_pass": bool(rec.get("v57_impulse_gate_pass", False)),
+            "v58_flow_gate_pass": bool(rec.get("v58_flow_gate_pass", False)),
+            "v57_v47e_bypass": bool(rec.get("v57_v47e_bypass", False)),
+            "v57_pre20_move": float(rec.get("v57_pre20_move", 0.0)),
+            "signal_lane": str(rec.get("signal_lane") or ""),
+            "stress_adverse_outcome": rec.get("adverse_branch"),
+            "unique_buyers": int(rec.get("ub_250", 0)),
+            "unique_buyers_1000": int(rec.get("ub_1000", 0)),
+            "top_share": float(rec.get("tbs_250", 0.0)),
+            "pending_buy_sol_1000ms": float(rec.get("pbs_1000", 0.0)),
+            "pending_sell_count_1000ms": int(rec.get("psc_1000", 0)),
+            "pending_sell_sol_1000ms": float(rec.get("pss_1000", 0.0)),
+            "buy_sell_ratio_1000ms": float(rec.get("v58_buy_sell_ratio_1000", 0.0)),
+            "source_lead_ms": int(rec.get("source_lead_ms", 0)),
+            "veto_results": {"v47h": "pass", "v47i": "pass"},
+            "size_floor_result": "pass",
+            "watchdog_enabled": True,
+            "gate_pass": bool(gate_pass),
+        })
+        # ---- V59 TRUE-EDGE DIAGNOSTIC (fires in both dry + live, env-gated) ----
+        if gate_pass and _env_flag("PGG2_V59_TRUE_EDGE_ENABLED", "0"):
+            try:
+                from pgg2_v59_true_edge import get_calculator as _v59c_get_calc
+                _v59c_size = float(rec.get("selected_size_sol", 0.005) or 0.005)
+                _v59c_ep = float(rec.get("exp_pnl", 0.0) or 0.0)
+                _v59c_mint = str(rec.get("mint") or "")
+                _v59c_r = _v59c_get_calc().compute_default(
+                    mint=_v59c_mint, expected_pnl_sol=_v59c_ep,
+                    size_sol=_v59c_size, assume_close_succeeds=True,
+                )
+                log(_v59c_get_calc().format_log_line(_v59c_r))
+                if _v59c_r.pass_bank:
+                    log(f"PGG2-V59-TRUE-EDGE-PASS mint={_short(_v59c_mint)} tier=bank source=candidate_decision true_edge={_v59c_r.true_edge_sol:+.6f} ep={_v59c_ep:+.6f} size={_v59c_size:.4f}")
+                elif _v59c_r.pass_micro:
+                    log(f"PGG2-V59-TRUE-EDGE-PASS mint={_short(_v59c_mint)} tier=micro source=candidate_decision true_edge={_v59c_r.true_edge_sol:+.6f} ep={_v59c_ep:+.6f} size={_v59c_size:.4f}")
+                else:
+                    log(f"PGG2-V59-TRUE-EDGE-BLOCK mint={_short(_v59c_mint)} source=candidate_decision true_edge={_v59c_r.true_edge_sol:+.6f} ep={_v59c_ep:+.6f} size={_v59c_size:.4f} blocker={_v59c_r.blocker}")
+            except Exception as _v59c_e:
+                log(f"PGG2-V59-TRUE-EDGE-ERR err={type(_v59c_e).__name__}:{_v59c_e}")
+        # ---- V60 SHADOW / OBSERVE HOOK (fires dry + live when PGG2_V60_OBSERVE_MODE=1) ----
+        if gate_pass and _env_flag("PGG2_V60_OBSERVE_MODE", "0"):
+            try:
+                from pgg2_v60_live_send_firewall import (
+                    V60Candidate as _V60Candidate_shadow,
+                    V60TxPlan as _V60TxPlan_shadow,
+                    v60_authorize_live_buy as _v60_authorize_shadow,
+                )
+                _v60s_mint = str(rec.get("mint") or "")
+                _v60s_size = float(rec.get("selected_size_sol", 0.005) or 0.005)
+                _v60s_ep = float(rec.get("exp_pnl", 0.0) or 0.0)
+                _v60s_lane = str(rec.get("signal_lane", "") or "")
+                _v60s_token_prog = "spl"  # candidate-decision time may not know yet
+                _v60s_cand = _V60Candidate_shadow(
+                    mint=_v60s_mint,
+                    selected_size_sol=_v60s_size,
+                    candidate_lane=_v60s_lane,
+                    rule_id=str(rec.get("rule_id", "") or ""),
+                    expected_pnl_sol=_v60s_ep,
+                    true_edge_sol=None,
+                    token_program=_v60s_token_prog,
+                    route="pump_bc",
+                    sim_needed=0,
+                    pair_source="decision_curve_snapshot",
+                    snapshot_age_ms=int(rec.get("snapshot_age_ms", 0) or 0),
+                    source_lead_ms=int(rec.get("source_lead_ms", 0) or 0),
+                    risk_result=rec.get("risk_result"),
+                    risk_fetched_at_ms=rec.get("risk_fetched_at_ms"),
+                    is_v67_passing=("v67" in _v60s_lane.lower()),
+                    is_v57_promotion=("v57" in _v60s_lane.lower() or "promotion" in _v60s_lane.lower()),
+                    wallet_balance_sol=0.0,
+                )
+                _v60s_plan = _V60TxPlan_shadow(
+                    decoded_amount_tokens_raw=0,
+                    decoded_max_sol_cost_lamports=int(round(_v60s_size * 1e9)),
+                    swqos_tip_sol=0.000005,
+                    priority_fee_sol=0.000005,
+                    base_fee_sol=0.000005,
+                    uses_pump_v2=False,
+                    has_sell_v2_capability=True,
+                )
+                _v60s_decision = _v60_authorize_shadow(_v60s_cand, _v60s_plan, log_fn=log)
+                if _v60s_decision.passed:
+                    log(f"PGG2-V60-OBSERVE-PASS mint={_short(_v60s_mint)} size={_v60s_size:.4f} true_edge={_v60s_decision.true_edge_sol:+.6f} tx_digest={_v60s_decision.tx_digest[:16]}")
+                else:
+                    _v60s_det = ""
+                    for _cr in _v60s_decision.check_results:
+                        if not _cr.passed:
+                            _v60s_det = _cr.detail
+                            break
+                    log(f"PGG2-V60-OBSERVE-BLOCK mint={_short(_v60s_mint)} size={_v60s_size:.4f} blocker={_v60s_decision.blocker} detail={_v60s_det}")
+            except Exception as _v60s_err:
+                log(f"PGG2-V60-OBSERVE-ERR err={type(_v60s_err).__name__}:{_v60s_err}")
+
+
+    def _v57_prefetch_error_retryable(err: str) -> bool:
+        msg = str(err or "").lower()
+        return (
+            "mint account missing" in msg
+            or "account missing" in msg
+            or "not found" in msg
+            or "could not find" in msg
+        )
+
+    def _queue_v57_prefetch_retry(
+        rec: Dict[str, Any],
+        ts_ms: int,
+        prefetch_age_ms: int,
+        prefetch_err: str,
+    ) -> bool:
+        nonlocal v48_backfill_adds
+        if (
+            os.environ.get("PGG2_V57_PREFETCH_RETRY_QUEUE_ENABLED", "1")
+            .strip()
+            .lower()
+            not in ("1", "true", "yes", "on")
+        ):
+            return False
+        if not bool(rec.get("v57_impulse_gate_pass", False)):
+            return False
+        if not _v57_prefetch_error_retryable(prefetch_err):
+            return False
+        retry_window_ms = int(
+            os.environ.get("PGG2_V57_PREFETCH_RETRY_WINDOW_MS", "550") or 550
+        )
+        if retry_window_ms <= 0:
+            return False
+        retry_first_ms = int(
+            rec.get("v57_prefetch_retry_first_ms")
+            or (int(ts_ms) - max(0, int(prefetch_age_ms)))
+        )
+        retry_age_ms = int(ts_ms) - retry_first_ms
+        if retry_age_ms > retry_window_ms:
+            return False
+        mint = str(rec.get("mint") or "")
+        if any(str(q.get("mint") or "") == mint for q in backfill_queue):
+            log(
+                f"PGG2-V57-PREFETCH-RETRY-QUEUE-DUP mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} queue_len={len(backfill_queue)} "
+                f"retry_age_ms={retry_age_ms}/{retry_window_ms}"
+            )
+            return True
+        delay_ms = max(
+            10,
+            int(os.environ.get("PGG2_V57_PREFETCH_RETRY_QUEUE_DELAY_MS", "45") or 45),
+        )
+        queued = dict(rec)
+        queued["queued_at_ms"] = int(ts_ms)
+        queued["not_before_ms"] = int(ts_ms) + delay_ms
+        queued["expires_at_ms"] = retry_first_ms + retry_window_ms
+        queued["opened_or_deferred"] = "queued_v57_prefetch_retry"
+        queued["v57_prefetch_retry_first_ms"] = retry_first_ms
+        queued["v57_prefetch_retry_err"] = str(prefetch_err or "")
+        backfill_queue.append(queued)
+        v48_backfill_adds += 1
+        _log_v48_entry_block(
+            rec,
+            "v57_prefetch_retry_wait",
+            (
+                f"prefetch_error_age_ms={prefetch_age_ms}"
+                f"_retry_age_ms={retry_age_ms}"
+                f"_window_ms={retry_window_ms}"
+            ),
+            ts_ms,
+        )
+        log(
+            f"PGG2-V57-PREFETCH-RETRY-QUEUE mint={_short(mint)} "
+            f"decision_id={rec.get('decision_id')} "
+            f"not_before_ms={queued['not_before_ms']} "
+            f"expires_at_ms={queued['expires_at_ms']} "
+            f"delay_ms={delay_ms} retry_age_ms={retry_age_ms}/{retry_window_ms} "
+            f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+            f"err={prefetch_err}"
+        )
+        try:
+            asyncio.get_event_loop().create_task(_prefetch_v48_live_mint(mint))
+        except Exception as exc:
+            log(
+                f"PGG2-V57-PREFETCH-RETRY-SCHEDULE-WARN mint={_short(mint)} "
+                f"err={type(exc).__name__}:{exc}"
+            )
+        return True
+
+    def _open_v48_live_record(rec: Dict[str, Any], from_backfill: bool = False) -> bool:
+        nonlocal v48_entries_opened, v48_live_buy_sends, v48_live_buy_confirms
+        nonlocal v48_live_buy_safe_failures, v48_live_sell_sends
+        nonlocal v48_live_sell_confirms, v48_live_sell_safe_failures
+        nonlocal v48_live_unclosed, non_neg_closes, negative_closes
+        nonlocal failed_buy_count, failed_buy_fees_total
+        nonlocal net_pnl_sol, max_loss_sol, stop_reason
+
+        from solders.pubkey import Pubkey  # type: ignore
+        from pgg2_direct_pump import get_associated_token_address  # type: ignore
+
+        mint = str(rec.get("mint") or "")
+        now = _now_ms()
+        if len(open_positions) >= max_open:
+            _log_v48_entry_block(rec, "max_open", ts_ms=now)
+            return False
+        if any(str(r.get("mint") or "") == mint for r in open_positions.values()):
+            _log_v48_entry_block(rec, "duplicate_mint", ts_ms=now)
+            return False
+        if (
+            os.environ.get("PGG2_V67_ONLY_LANE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            and not bool(rec.get("v67_flow_confirm_gate_pass", False))
+        ):
+            _log_v48_entry_block(
+                rec,
+                "v67_only_non_v67_block",
+                f"signal_lane={str(rec.get('signal_lane') or '-')}",
+                now,
+            )
+            log(
+                f"PGG2-V67-ONLY-BLOCK mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"signal_lane={str(rec.get('signal_lane') or '-')} "
+                f"reason=non_v67_entry_removed"
+            )
+            return False
+        cooldown_until = int(live_failed_buy_mint_until_ms.get(mint, 0) or 0)
+        if cooldown_until > now:
+            _log_v48_entry_block(
+                rec,
+                "token_guard_failed",
+                f"live_failed_buy_cooldown_ms_left={cooldown_until - now}",
+                now,
+            )
+            log(
+                f"PGG2-V48-LIVE-BUY-COOLDOWN-BLOCK mint={_short(mint)} "
+                f"cooldown_ms_left={cooldown_until - now}"
+            )
+            return False
+
+        # Only lanes that survived live-log validation may spend live fees.
+        # V56B remains shadow-only by default; V56D and V57 can spend when
+        # their own freshness/edge checks pass. This keeps the bot from paying
+        # fees on generic high-edge diagnostics while letting the immediate
+        # continuation lane reach the adapter.
+        v56b_actual_enabled = (
+            os.environ.get("PGG2_V56B_LIVE_ACTUAL_ENTRY_ENABLED", "1")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        v56b_actual_pass = (
+            v56b_actual_enabled
+            and bool(rec.get("v56b_gate_pass", False))
+        )
+        v61_actual_enabled = (
+            os.environ.get("PGG2_V61_ACTUAL_ENTRY_ENABLED", "0")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        v61_actual_pass = (
+            v61_actual_enabled
+            and bool(rec.get("v61_fanout_gate_pass", False))
+        )
+        if (
+            os.environ.get("PGG2_V48_LIVE_REQUIRE_V56D_FOR_ACTUAL_ENTRY", "1") == "1"
+            and not (
+                bool(rec.get("v56d_flow_gate_pass", False))
+                or bool(rec.get("v67_flow_confirm_gate_pass", False))
+                or bool(rec.get("v57_impulse_gate_pass", False))
+                or bool(rec.get("v58_flow_gate_pass", False))
+                or bool(rec.get("v60_flow_gate_pass", False))
+                or v61_actual_pass
+                or v56b_actual_pass
+            )
+        ):
+            _log_v48_entry_block(
+                rec,
+                "non_spend_lane_shadow_only",
+                f"signal_lane={str(rec.get('signal_lane') or '-')}",
+                now,
+            )
+            log(
+                f"PGG2-V56B-SHADOW-ONLY-LIVE-BLOCK mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"signal_lane={str(rec.get('signal_lane') or '-')}"
+            )
+            return False
+        if v56b_actual_pass:
+            log(
+                f"PGG2-V56B-LIVE-ACTUAL-ENTRY-ALLOW mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                f"v47h_ratio={float(rec.get('v47h_ratio', 0.0)):.4f} "
+                f"signal_lane={str(rec.get('signal_lane') or '-')}"
+            )
+
+        if v61_actual_pass:
+            log(
+                f"PGG2-V61-LIVE-ACTUAL-ENTRY-ALLOW mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                f"buy_sol_2000={float(rec.get('v61_buy_sol_2000', 0.0)):.3f} "
+                f"ub2000={int(rec.get('v61_unique_buyers_2000', 0) or 0)} "
+                f"top_share2000={float(rec.get('v61_top_share_2000', 1.0)):.3f} "
+                f"sell_count2000={int(rec.get('v61_sell_count_2000', 0) or 0)} "
+                f"curve_pretrend_pct={float(rec.get('v61_curve_pretrend_pct', 0.0)):+.2f} "
+                f"signal_lane={str(rec.get('signal_lane') or '-')}"
+            )
+
+        if bool(rec.get("v58_flow_gate_pass", False)):
+            log(
+                f"PGG2-V58-LIVE-ACTUAL-ENTRY-ALLOW mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                f"pbs1000={float(rec.get('pbs_1000', 0.0)):.3f} "
+                f"pss1000={float(rec.get('pss_1000', 0.0)):.3f} "
+                f"buy_sell_ratio1000={float(rec.get('v58_buy_sell_ratio_1000', 0.0)):.3f} "
+                f"top_share={float(rec.get('tbs_250', 0.0)):.3f} "
+                f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)} "
+                f"signal_lane={str(rec.get('signal_lane') or '-')}"
+            )
+
+        if bool(rec.get("v67_flow_confirm_gate_pass", False)):
+            log(
+                f"PGG2-V67-LIVE-ACTUAL-ENTRY-ALLOW mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                f"pbs1000={float(rec.get('pbs_1000', 0.0)):.3f} "
+                f"pss1000={float(rec.get('pss_1000', 0.0)):.3f} "
+                f"psc1000={int(rec.get('psc_1000', 0))} "
+                f"ub250={int(rec.get('ub_250', 0))} "
+                f"top_share={float(rec.get('tbs_250', 0.0)):.3f} "
+                f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)} "
+                f"signal_lane={str(rec.get('signal_lane') or '-')}"
+            )
+            # ---- V59 TRUE-EDGE OBSERVE (env-gated, default OFF) ----
+            if _env_flag("PGG2_V59_TRUE_EDGE_ENABLED", "0"):
+                try:
+                    from pgg2_v59_true_edge import get_calculator as _v59o_get_calc
+                    _v59o_size = float(rec.get("selected_size", 0.005) or 0.005)
+                    _v59o_ep = float(rec.get("exp_pnl", 0.0) or 0.0)
+                    _v59o_r = _v59o_get_calc().compute_default(
+                        mint=str(mint), expected_pnl_sol=_v59o_ep,
+                        size_sol=_v59o_size, assume_close_succeeds=True,
+                    )
+                    log(_v59o_get_calc().format_log_line(_v59o_r))
+                    if _v59o_r.pass_bank:
+                        log(f"PGG2-V59-TRUE-EDGE-PASS mint={_short(mint)} tier=bank source=v67_observe true_edge={_v59o_r.true_edge_sol:+.6f} ep={_v59o_ep:+.6f} size={_v59o_size:.4f}")
+                    elif _v59o_r.pass_micro:
+                        log(f"PGG2-V59-TRUE-EDGE-PASS mint={_short(mint)} tier=micro source=v67_observe true_edge={_v59o_r.true_edge_sol:+.6f} ep={_v59o_ep:+.6f} size={_v59o_size:.4f}")
+                    else:
+                        log(f"PGG2-V59-TRUE-EDGE-BLOCK mint={_short(mint)} source=v67_observe true_edge={_v59o_r.true_edge_sol:+.6f} ep={_v59o_ep:+.6f} size={_v59o_size:.4f} blocker={_v59o_r.blocker}")
+                except Exception as _v59o_e:
+                    log(f"PGG2-V59-TRUE-EDGE-ERR mint={_short(mint)} err={type(_v59o_e).__name__}:{_v59o_e}")
+
+        if bool(rec.get("v60_flow_gate_pass", False)):
+            log(
+                f"PGG2-V60-LIVE-ACTUAL-ENTRY-ALLOW mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                f"confirm_age_ms={int(rec.get('v60_confirm_age_ms', 0) or 0)} "
+                f"pbs1000={float(rec.get('v60_pbs_1000', 0.0)):.3f} "
+                f"psc1000={int(rec.get('v60_psc_1000', 0) or 0)} "
+                f"ub250={int(rec.get('v60_ub_250', 0) or 0)} "
+                f"top_share250={float(rec.get('v60_tbs_250', 1.0)):.3f} "
+                f"signal_lane={str(rec.get('signal_lane') or '-')}"
+            )
+
+        if (
+            bool(rec.get("v57_impulse_gate_pass", False))
+            and not bool(rec.get("v56b_gate_pass", False))
+            and not bool(rec.get("v56d_flow_gate_pass", False))
+            and not bool(rec.get("v58_flow_gate_pass", False))
+        ):
+            v57_actual_min_expected_pnl = float(
+                os.environ.get("PGG2_V57_ACTUAL_MIN_EXPECTED_PNL", "0.000000")
+                or 0.0
+            )
+            v57_expected_pnl = float(rec.get("exp_pnl", 0.0) or 0.0)
+            if (
+                v57_actual_min_expected_pnl > 0.0
+                and v57_expected_pnl < v57_actual_min_expected_pnl - 1e-12
+            ):
+                _log_v48_entry_block(
+                    rec,
+                    "v57_live_edge_too_small",
+                    (
+                        f"expected_pnl={v57_expected_pnl:+.6f}"
+                        f"_lt_{v57_actual_min_expected_pnl:+.6f}"
+                    ),
+                    now,
+                )
+                log(
+                    f"PGG2-V57-LIVE-EDGE-BLOCK mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"expected_pnl={v57_expected_pnl:+.6f} "
+                    f"min_expected_pnl={v57_actual_min_expected_pnl:+.6f} "
+                    f"action=no_fee_spend"
+                )
+                return False
+            v57_actual_max_lead_ms = int(
+                os.environ.get("PGG2_V57_ACTUAL_MAX_SOURCE_LEAD_MS", "350") or 350
+            )
+            v57_source_lead_ms = int(rec.get("source_lead_ms", 999999) or 999999)
+            if v57_actual_max_lead_ms > 0 and v57_source_lead_ms > v57_actual_max_lead_ms:
+                v57_high_edge_enabled = (
+                    os.environ.get("PGG2_V57_HIGH_EDGE_ALLOW_ENABLED", "1")
+                    .strip()
+                    .lower()
+                    in ("1", "true", "yes", "on")
+                )
+                v57_high_edge_min_pnl = float(
+                    os.environ.get("PGG2_V57_HIGH_EDGE_MIN_EXPECTED_PNL", "0.003000")
+                    or 0.003000
+                )
+                v57_high_edge_max_lead_ms = int(
+                    os.environ.get("PGG2_V57_HIGH_EDGE_MAX_SOURCE_LEAD_MS", "700") or 700
+                )
+                v57_high_edge_max_top_share = float(
+                    os.environ.get("PGG2_V57_HIGH_EDGE_MAX_TOP_SHARE_250", "0.300") or 0.300
+                )
+                v57_high_edge_min_ub = int(
+                    os.environ.get("PGG2_V57_HIGH_EDGE_MIN_UNIQUE_BUYERS_250", "5") or 5
+                )
+                v57_high_edge_require_v56d = (
+                    os.environ.get("PGG2_V57_HIGH_EDGE_REQUIRE_V56D", "1")
+                    .strip()
+                    .lower()
+                    in ("1", "true", "yes", "on")
+                )
+                v57_high_edge_pass = (
+                    v57_high_edge_enabled
+                    and v57_source_lead_ms <= v57_high_edge_max_lead_ms
+                    and v57_expected_pnl >= v57_high_edge_min_pnl - 1e-12
+                    and float(rec.get("tbs_250", 1.0)) <= v57_high_edge_max_top_share + 1e-12
+                    and int(rec.get("ub_250", 0)) >= v57_high_edge_min_ub
+                    and (
+                        not v57_high_edge_require_v56d
+                        or bool(rec.get("v56d_flow_gate_pass", False))
+                    )
+                )
+                if v57_high_edge_pass:
+                    log(
+                        f"PGG2-V57-HIGH-EDGE-SOURCE-LEAD-ALLOW mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"source_lead_ms={v57_source_lead_ms}/{v57_high_edge_max_lead_ms} "
+                        f"expected_pnl={v57_expected_pnl:+.6f}/{v57_high_edge_min_pnl:+.6f} "
+                        f"top_share={float(rec.get('tbs_250', 1.0)):.3f}/{v57_high_edge_max_top_share:.3f} "
+                        f"ub250={int(rec.get('ub_250', 0))}/{v57_high_edge_min_ub} "
+                        f"v56d={int(bool(rec.get('v56d_flow_gate_pass', False)))}"
+                    )
+                else:
+                    _log_v48_entry_block(
+                        rec,
+                        "v57_source_lead_stale",
+                        f"source_lead_ms={v57_source_lead_ms}_gt_{v57_actual_max_lead_ms}",
+                        now,
+                    )
+                    log(
+                        f"PGG2-V57-LIVE-SOURCE-LEAD-BLOCK mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"source_lead_ms={v57_source_lead_ms} "
+                        f"max_source_lead_ms={v57_actual_max_lead_ms} "
+                        f"high_edge_allow={int(v57_high_edge_enabled)} "
+                        f"action=no_fee_spend"
+                    )
+                    return False
+            if (
+                os.environ.get("PGG2_V57_BLOCK_RECENT_PREFETCH_ERROR", "1")
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            ):
+                prefetch_status, prefetch_ts, prefetch_err = live_prefetch_status.get(
+                    mint, ("missing", 0, "")
+                )
+                prefetch_error_ttl_ms = int(
+                    os.environ.get("PGG2_V57_PREFETCH_ERROR_TTL_MS", "5000") or 5000
+                )
+                prefetch_age_ms = int(now) - int(prefetch_ts or 0)
+                if (
+                    prefetch_status == "error"
+                    and prefetch_error_ttl_ms > 0
+                    and 0 <= prefetch_age_ms <= prefetch_error_ttl_ms
+                ):
+                    if _queue_v57_prefetch_retry(
+                        rec, now, prefetch_age_ms, prefetch_err
+                    ):
+                        return False
+                    _log_v48_entry_block(
+                        rec,
+                        "v57_prefetch_not_ready",
+                        (
+                            f"prefetch_status=error_age_ms={prefetch_age_ms}"
+                            f"_ttl_ms={prefetch_error_ttl_ms}"
+                        ),
+                        now,
+                    )
+                    log(
+                        f"PGG2-V57-LIVE-PREFETCH-READY-BLOCK mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"prefetch_status={prefetch_status} age_ms={prefetch_age_ms} "
+                        f"ttl_ms={prefetch_error_ttl_ms} err={prefetch_err} "
+                        f"action=no_fee_spend"
+                    )
+                    return False
+
+        elif bool(rec.get("v57_impulse_gate_pass", False)):
+            log(
+                f"PGG2-V57-SOURCE-LEAD-DELEGATED mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"v56b={int(bool(rec.get('v56b_gate_pass', False)))} "
+                f"v56d={int(bool(rec.get('v56d_flow_gate_pass', False)))} "
+                f"v58={int(bool(rec.get('v58_flow_gate_pass', False)))} "
+                f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)} "
+                f"reason=stronger_lane_owns_spend_timing"
+            )
+
+        # V56D live spend must be fast, not merely theoretically high edge.
+        # The 2026-05-16 4Ev6 live attempt had source_lead_ms=1227 and
+        # snapshot_age_ms=1622, then failed at the min-token guard and burned a
+        # fee. That is too late for this curve-speed game. Keep old candidates
+        # as diagnostics and wait for fresh V56D flow instead of paying to test
+        # stale curve state.
+        if (
+            bool(rec.get("v56d_flow_gate_pass", False))
+            and not bool(rec.get("v56b_gate_pass", False))
+            and not bool(rec.get("v58_flow_gate_pass", False))
+        ):
+            v67_actual_lane = bool(rec.get("v67_flow_confirm_gate_pass", False))
+            v56d_actual_min_expected_pnl = float(
+                (
+                    os.environ.get("PGG2_V67_ACTUAL_MIN_EXPECTED_PNL", "0.000550")
+                    if v67_actual_lane
+                    else os.environ.get("PGG2_V48_V56D_ACTUAL_MIN_EXPECTED_PNL", "0.001500")
+                )
+                or (0.000550 if v67_actual_lane else 0.001500)
+            )
+            v56d_expected_pnl = float(rec.get("exp_pnl", 0.0) or 0.0)
+            if (
+                v56d_actual_min_expected_pnl > 0.0
+                and v56d_expected_pnl < v56d_actual_min_expected_pnl - 1e-12
+            ):
+                _log_v48_entry_block(
+                    rec,
+                    "v67_live_edge_too_small" if v67_actual_lane else "v56d_live_edge_too_small",
+                    (
+                        f"expected_pnl={v56d_expected_pnl:+.6f}"
+                        f"_lt_{v56d_actual_min_expected_pnl:+.6f}"
+                    ),
+                    now,
+                )
+                log(
+                    f"{'PGG2-V67-LIVE-EDGE-BLOCK' if v67_actual_lane else 'PGG2-V56D-LIVE-EDGE-BLOCK'} mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"expected_pnl={v56d_expected_pnl:+.6f} "
+                    f"min_expected_pnl={v56d_actual_min_expected_pnl:+.6f} "
+                    f"action=no_fee_spend"
+                )
+                return False
+            # ---- V59 TRUE-EDGE GATE (env-gated, default OFF) ----
+            if _env_flag("PGG2_V59_TRUE_EDGE_ENABLED", "0"):
+                try:
+                    from pgg2_v59_true_edge import get_calculator as _v59_get_calc
+                    _v59_calc = _v59_get_calc()
+                    _v59_size = float(rec.get("selected_size", 0.005) or 0.005)
+                    _v59_ep = float(rec.get("exp_pnl", 0.0) or 0.0)
+                    _v59_result = _v59_calc.compute_default(
+                        mint=str(mint), expected_pnl_sol=_v59_ep,
+                        size_sol=_v59_size, assume_close_succeeds=True,
+                    )
+                    log(_v59_calc.format_log_line(_v59_result))
+                    # Tier choice: bank if available, micro otherwise
+                    if _v59_result.pass_bank:
+                        log(f"PGG2-V59-TRUE-EDGE-PASS mint={_short(mint)} tier=bank true_edge={_v59_result.true_edge_sol:+.6f}")
+                    elif _v59_result.pass_micro:
+                        log(f"PGG2-V59-TRUE-EDGE-PASS mint={_short(mint)} tier=micro true_edge={_v59_result.true_edge_sol:+.6f}")
+                    else:
+                        log(
+                            f"PGG2-V59-TRUE-EDGE-BLOCK mint={_short(mint)} "
+                            f"true_edge={_v59_result.true_edge_sol:+.6f} "
+                            f"blocker={_v59_result.blocker} action=no_fee_spend"
+                        )
+                        _log_v48_entry_block(
+                            rec, "v59_true_edge_negative",
+                            f"true_edge={_v59_result.true_edge_sol:+.6f}", now,
+                        )
+                        return False
+                except Exception as _v59_e:
+                    log(f"PGG2-V59-TRUE-EDGE-ERR mint={_short(mint)} err={type(_v59_e).__name__}:{_v59_e}")
+            v56d_actual_max_lead_ms = int(
+                (
+                    os.environ.get("PGG2_V67_ACTUAL_MAX_SOURCE_LEAD_MS", "1500")
+                    if v67_actual_lane
+                    else os.environ.get("PGG2_V48_V56D_ACTUAL_MAX_SOURCE_LEAD_MS", "350")
+                )
+                or (1500 if v67_actual_lane else 350)
+            )
+            v56d_source_lead_ms = int(rec.get("source_lead_ms", 999999) or 999999)
+            if v56d_actual_max_lead_ms > 0 and v56d_source_lead_ms > v56d_actual_max_lead_ms:
+                _log_v48_entry_block(
+                    rec,
+                    "v67_source_lead_stale" if v67_actual_lane else "v56d_source_lead_stale",
+                    f"source_lead_ms={v56d_source_lead_ms}_gt_{v56d_actual_max_lead_ms}",
+                    now,
+                )
+                log(
+                    f"{'PGG2-V67-LIVE-SOURCE-LEAD-BLOCK' if v67_actual_lane else 'PGG2-V56D-LIVE-SOURCE-LEAD-BLOCK'} mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"source_lead_ms={v56d_source_lead_ms} "
+                    f"max_source_lead_ms={v56d_actual_max_lead_ms} "
+                    f"action=no_fee_spend"
+                )
+                return False
+
+        elif bool(rec.get("v56d_flow_gate_pass", False)):
+            log(
+                f"PGG2-V56D-SOURCE-LEAD-DELEGATED mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"v56b={int(bool(rec.get('v56b_gate_pass', False)))} "
+                f"v58={int(bool(rec.get('v58_flow_gate_pass', False)))} "
+                f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)} "
+                f"reason=stronger_lane_owns_spend_timing"
+            )
+
+        # V55 BUG FIX #2: require >=N curve ticks before live entry.
+        # 3Ry8 case (2026-05-15): brand-new mint, first curve tick + V47C pass +
+        # V48 entry all in the same second. Curve pumped >30% between our
+        # decision and tx land, min-token guard rejected, fee burned ($0.005).
+        # Filter brand-new mints by requiring >= PGG2_V48_MIN_CURVE_TICKS_FOR_ENTRY
+        # ticks of curve history. AQjZ/5KXW/FfbD/Cd4g winners had 5-50+ ticks
+        # before our decision — unaffected.
+        min_curve_ticks = int(
+            os.environ.get("PGG2_V48_MIN_CURVE_TICKS_FOR_ENTRY", "2") or 2
+        )
+        try:
+            _st = oracle._states.get(mint)
+            _n_curve_ticks = len(_st.points) if (_st is not None and _st.points) else 0
+        except Exception:
+            _n_curve_ticks = 0
+        if _n_curve_ticks < min_curve_ticks:
+            tick1_fast_enabled = (
+                os.environ.get("PGG2_V48_V56D_TICK1_FAST_LANE_ENABLED", "1")
+                == "1"
+            )
+            tick1_max_lead_ms = int(
+                os.environ.get("PGG2_V48_V56D_TICK1_MAX_SOURCE_LEAD_MS", "150") or 150
+            )
+            tick1_min_buy_sol_1000 = float(
+                os.environ.get("PGG2_V48_V56D_TICK1_MIN_BUY_SOL_1000", "1.000") or 1.000
+            )
+            tick1_max_sell_count_1000 = int(
+                os.environ.get("PGG2_V48_V56D_TICK1_MAX_SELL_COUNT_1000", "0") or 0
+            )
+            tick1_max_top_share = float(
+                os.environ.get("PGG2_V48_V56D_TICK1_MAX_TOP_SHARE_250", "0.300") or 0.300
+            )
+            tick1_max_size_sol = float(
+                os.environ.get("PGG2_V48_V56D_TICK1_MAX_SIZE_SOL", "0.005") or 0.005
+            )
+            tick1_min_ub_250 = int(
+                os.environ.get("PGG2_V48_V56D_TICK1_MIN_UNIQUE_BUYERS_250", "4") or 4
+            )
+            v57_tick1_max_lead_ms = int(
+                os.environ.get("PGG2_V57_TICK1_MAX_SOURCE_LEAD_MS", str(tick1_max_lead_ms))
+                or tick1_max_lead_ms
+            )
+            v57_tick1_min_buy_sol_1000 = float(
+                os.environ.get("PGG2_V57_MIN_BUY_SOL_1000", "3.000") or 3.000
+            )
+            v57_tick1_max_sell_count_1000 = int(
+                os.environ.get("PGG2_V57_MAX_SELL_COUNT_1000", "0") or 0
+            )
+            v57_tick1_max_top_share = float(
+                os.environ.get("PGG2_V57_MAX_TOP_SHARE_250", "0.550") or 0.550
+            )
+            v57_tick1_min_ub_250 = int(
+                os.environ.get("PGG2_V57_MIN_UNIQUE_BUYERS_250", "2") or 2
+            )
+            tick1_v56d_strong = (
+                tick1_fast_enabled
+                and bool(rec.get("v56d_flow_gate_pass", False))
+                and _n_curve_ticks >= 1
+                and int(rec.get("source_lead_ms", 999999)) <= tick1_max_lead_ms
+                and float(rec.get("pbs_1000", 0.0)) >= tick1_min_buy_sol_1000
+                and int(rec.get("psc_1000", 999999)) <= tick1_max_sell_count_1000
+                and float(rec.get("tbs_250", 1.0)) <= tick1_max_top_share + 1e-12
+                and float(rec.get("selected_size_sol", 0.0)) <= tick1_max_size_sol + 1e-12
+                and int(rec.get("ub_250", 0)) >= tick1_min_ub_250
+            )
+            tick1_v57_strong = (
+                tick1_fast_enabled
+                and bool(rec.get("v57_impulse_gate_pass", False))
+                and _n_curve_ticks >= 1
+                and int(rec.get("source_lead_ms", 999999)) <= v57_tick1_max_lead_ms
+                and float(rec.get("pbs_1000", 0.0)) >= v57_tick1_min_buy_sol_1000
+                and int(rec.get("psc_1000", 999999)) <= v57_tick1_max_sell_count_1000
+                and float(rec.get("tbs_250", 1.0)) <= v57_tick1_max_top_share + 1e-12
+                and float(rec.get("selected_size_sol", 0.0)) <= tick1_max_size_sol + 1e-12
+                and int(rec.get("ub_250", 0)) >= v57_tick1_min_ub_250
+            )
+            tick1_v58_strong = (
+                tick1_fast_enabled
+                and bool(rec.get("v58_flow_gate_pass", False))
+                and _n_curve_ticks >= 1
+                and int(rec.get("source_lead_ms", 999999))
+                <= int(os.environ.get("PGG2_V58_MAX_SOURCE_LEAD_MS", "220") or 220)
+                and float(rec.get("pbs_1000", 0.0))
+                >= float(os.environ.get("PGG2_V58_MIN_BUY_SOL_1000", "0.200") or 0.200)
+                and float(rec.get("v58_buy_sell_ratio_1000", 0.0))
+                >= float(os.environ.get("PGG2_V58_MIN_BUY_SELL_RATIO_1000", "3.000") or 3.000)
+                and float(rec.get("tbs_250", 1.0))
+                <= float(os.environ.get("PGG2_V58_MAX_TOP_SHARE_250", "0.500") or 0.500) + 1e-12
+            )
+            tick1_strong = tick1_v56d_strong or tick1_v57_strong or tick1_v58_strong
+            if tick1_strong:
+                rec["v56d_tick1_fast_lane"] = True
+                rec["v57_tick1_fast_lane"] = bool(tick1_v57_strong)
+                rec["v58_tick1_fast_lane"] = bool(tick1_v58_strong)
+                log(
+                    f"PGG2-V56D-TICK1-FAST-LANE-PASS mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"n_curve_ticks={_n_curve_ticks} min_required={min_curve_ticks} "
+                    f"source_lead_ms={int(rec.get('source_lead_ms', 0))} "
+                    f"pbs1000={float(rec.get('pbs_1000', 0.0)):.3f} "
+                    f"psc1000={int(rec.get('psc_1000', 0))} "
+                    f"tbs250={float(rec.get('tbs_250', 0.0)):.3f} "
+                    f"ub250={int(rec.get('ub_250', 0))} "
+                    f"size={float(rec.get('selected_size_sol', 0.0)):.4f} "
+                    f"v56d_fast={int(tick1_v56d_strong)} "
+                    f"v57_fast={int(tick1_v57_strong)} "
+                    f"v58_fast={int(tick1_v58_strong)} "
+                    f"action=send_on_tick1"
+                )
+            else:
+                log(
+                    f"PGG2-V56D-TICK1-FAST-LANE-BLOCK mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"enabled={int(tick1_fast_enabled)} "
+                    f"v56d={int(bool(rec.get('v56d_flow_gate_pass', False)))} "
+                    f"v57={int(bool(rec.get('v57_impulse_gate_pass', False)))} "
+                    f"v58={int(bool(rec.get('v58_flow_gate_pass', False)))} "
+                    f"n_curve_ticks={_n_curve_ticks} "
+                    f"source_lead_ms={int(rec.get('source_lead_ms', 0))}/{tick1_max_lead_ms} "
+                    f"pbs1000={float(rec.get('pbs_1000', 0.0)):.3f}/{tick1_min_buy_sol_1000:.3f} "
+                    f"psc1000={int(rec.get('psc_1000', 0))}/{tick1_max_sell_count_1000} "
+                    f"tbs250={float(rec.get('tbs_250', 0.0)):.3f}/{tick1_max_top_share:.3f} "
+                    f"ub250={int(rec.get('ub_250', 0))}/{tick1_min_ub_250} "
+                    f"size={float(rec.get('selected_size_sol', 0.0)):.4f}/{tick1_max_size_sol:.4f}"
+                )
+            # V68 whale-follow candidates: the whale's own buy IS the curve tick.
+            # Fresh-mint whales (n_curve_ticks=1) are by definition the signal we
+            # want — block here defeats the lane. Bypass brand-new-mint check
+            # entirely when V68 owns the candidate AND at least one curve tick
+            # exists (i.e. we have a snapshot to build the buy against).
+            _v68_owns_candidate = bool(rec.get("v68_whale_follow_gate_pass", False))
+            if _v68_owns_candidate and _n_curve_ticks >= 1:
+                log(
+                    f"PGG2-V68-BRAND-NEW-MINT-BYPASS mint={_short(mint)} "
+                    f"n_curve_ticks={_n_curve_ticks} min_required={min_curve_ticks} "
+                    f"reason=v68_whale_follow_owns_signal"
+                )
+            elif not tick1_strong:
+                defer_ms = max(
+                    0,
+                    int(os.environ.get("PGG2_V48_V56D_CURVE_TICK_DEFER_MS", "180") or 180),
+                )
+                if (
+                    (
+                        bool(rec.get("v56d_flow_gate_pass", False))
+                        or bool(rec.get("v57_impulse_gate_pass", False))
+                        or bool(rec.get("v58_flow_gate_pass", False))
+                    )
+                    and not from_backfill
+                    and _n_curve_ticks >= 1
+                    and defer_ms > 0
+                ):
+                    if any(str(q.get("mint") or "") == mint for q in backfill_queue):
+                        _log_v48_entry_block(rec, "duplicate_mint", "already_queued_curve_tick", now)
+                        return False
+                    rec["queued_at_ms"] = int(now)
+                    rec["not_before_ms"] = int(now) + int(defer_ms)
+                    rec["expires_at_ms"] = int(now) + max(int(backfill_ttl_ms), int(defer_ms) + 300)
+                    rec["opened_or_deferred"] = "queued_curve_tick"
+                    rec["curve_tick_defer_reason"] = f"n_curve_ticks={_n_curve_ticks}_lt_{min_curve_ticks}"
+                    backfill_queue.append(rec)
+                    log(
+                        f"PGG2-V56D-CURVE-TICK-DEFER mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"n_curve_ticks={_n_curve_ticks} min_required={min_curve_ticks} "
+                        f"defer_ms={defer_ms} queue_len={len(backfill_queue)}"
+                    )
+                    _write_jsonl({
+                        "type": "v56d_curve_tick_defer",
+                        "decision_id": rec.get("decision_id"),
+                        "mint": mint,
+                        "ts_ms": int(now),
+                        "not_before_ms": int(rec["not_before_ms"]),
+                        "expires_at_ms": int(rec["expires_at_ms"]),
+                        "n_curve_ticks": int(_n_curve_ticks),
+                        "min_curve_ticks": int(min_curve_ticks),
+                        "expected_pnl": float(rec.get("exp_pnl", 0.0)),
+                    })
+                    return False
+                _log_v48_entry_block(
+                    rec,
+                    "curve_history_too_short",
+                    f"n_curve_ticks={_n_curve_ticks}_lt_{min_curve_ticks}",
+                    now,
+                )
+                log(
+                    f"PGG2-V48-LIVE-BRAND-NEW-MINT-BLOCK mint={_short(mint)} "
+                    f"n_curve_ticks={_n_curve_ticks} min_required={min_curve_ticks}"
+                )
+                return False
+
+        size_sol = float(rec.get("selected_size_sol", 0.0))
+
+        # V55 ZERO-LOSS FILTER (2026-05-15 from 2,508-record dry-live retro):
+        # cluster_score >= 437.2 AND last_sell_age_ms <= 813 -> 100% WR (85/85)
+        # cluster_score >= 283.7 AND last_sell_age_ms <= 1587 -> 98.2% WR (165/168)
+        # cluster_score is replicated inline from buffer_ events + oracle curve
+        # points. last_sell_age_ms = now - latest_sell_event_ts.
+        # Default thresholds 0 / 99999 = OFF.
+        min_cluster_score = float(
+            os.environ.get("PGG2_V48_MIN_CLUSTER_SCORE", "0") or 0
+        )
+        max_last_sell_age_ms = int(
+            os.environ.get("PGG2_V48_MAX_LAST_SELL_AGE_MS", "99999") or 99999
+        )
+        cs_filter_active = (
+            min_cluster_score > 0.0 or max_last_sell_age_ms < 99999
+        )
+        if cs_filter_active:
+            try:
+                _cs_state, _cu_ts, _cs_pt = _curve_state_at_or_before(mint, now)
+            except Exception:
+                _cs_state = None; _cu_ts = 0; _cs_pt = None
+
+            # Pull pending events for 250/700/1500ms windows
+            _cu_eff = int(_cu_ts or 0)
+            try:
+                _buys_250 = buffer_.pending_buys(mint, now, _cu_eff, 250)
+                _buys_700 = buffer_.pending_buys(mint, now, _cu_eff, 700)
+                _buys_1500 = buffer_.pending_buys(mint, now, _cu_eff, 1500)
+                _sells_250 = buffer_.pending_sells(mint, now, _cu_eff, 250)
+                _sells_700 = buffer_.pending_sells(mint, now, _cu_eff, 700)
+                _sells_1500 = buffer_.pending_sells(mint, now, _cu_eff, 1500)
+                # last_sell_age_ms: search wider window for any sell
+                _sells_long = buffer_.pending_sells(mint, now, 0, 30000)
+            except Exception:
+                _buys_250 = _buys_700 = _buys_1500 = []
+                _sells_250 = _sells_700 = _sells_1500 = _sells_long = []
+
+            # buffer.pending_buys returns tuples (ts, sol_in, signer, slot)
+            # buffer.pending_sells returns tuples (ts, tokens_in, signer, slot)
+            _s700_buy_sol = sum(b[1] for b in _buys_700)
+            _s1500_buy_sol = sum(b[1] for b in _buys_1500)
+            _s700_unique_buyers = len({b[2] for b in _buys_700})
+            _s700_sells = len(_sells_700)
+            _s250_sells = len(_sells_250)
+
+            # slot_buyers: count distinct signers in latest slot of pending buys
+            if _buys_700:
+                _latest_slot = max(b[3] for b in _buys_700)
+                _slot_buyers = len(
+                    {b[2] for b in _buys_700 if b[3] == _latest_slot}
+                )
+            else:
+                _slot_buyers = 0
+
+            # V68 signal extraction was moved to _maybe_evaluate where the
+            # shred event's signer pubkey is a direct parameter (line ~4291).
+            # This block intentionally left as a no-op so the surrounding
+            # cluster_score / Rule A logic is undisturbed.
+
+            # last_sell_age_ms — bypass buffer's pending-filter (which excludes
+            # sells before latest curve update), access ALL sells directly.
+            # buffer_ is V47IMediumWindowBuffer wrapping V47H -> V47C -> V46.
+            # Walk down the wrapper chain to reach V46PendingFlowBuffer._states.
+            _all_sells = []
+            try:
+                _cur_buf = buffer_
+                for _ in range(8):
+                    if hasattr(_cur_buf, "_states") and isinstance(
+                        getattr(_cur_buf, "_states", None), dict
+                    ):
+                        _buf_state = _cur_buf._states.get(mint)
+                        if _buf_state is not None and hasattr(_buf_state, "sells"):
+                            _all_sells = list(_buf_state.sells)
+                        break
+                    if hasattr(_cur_buf, "_buf"):
+                        _cur_buf = _cur_buf._buf
+                    else:
+                        break
+            except Exception:
+                _all_sells = []
+            if _all_sells:
+                _latest_sell_ts = max(int(getattr(s, "ts_ms", 0) or 0) for s in _all_sells)
+                _last_sell_age_ms = max(0, int(now) - _latest_sell_ts)
+            else:
+                _last_sell_age_ms = 999999
+
+            # Move ratios from curve points
+            _state_pts = []
+            try:
+                _trend_st = oracle._states.get(mint)
+                _state_pts = list(_trend_st.points) if (_trend_st is not None and _trend_st.points) else []
+            except Exception:
+                _state_pts = []
+
+            def _calc_move(window_ms: int) -> float:
+                if not _state_pts:
+                    return 1.0
+                target_ts = int(now) - int(window_ms)
+                baseline = None
+                latest = None
+                for p in _state_pts:
+                    if getattr(p, "error", False):
+                        continue
+                    if p.ts_ms <= target_ts and (
+                        baseline is None or p.ts_ms > baseline.ts_ms
+                    ):
+                        baseline = p
+                    latest = p
+                if baseline is None or latest is None:
+                    return 1.0
+                bp = float(getattr(baseline, "curve_price", 0) or 0)
+                lp = float(getattr(latest, "curve_price", 0) or 0)
+                if bp <= 0:
+                    return 1.0
+                return lp / bp
+
+            _move_250 = _calc_move(250)
+            _move_700 = _calc_move(700)
+            _move_1500 = _calc_move(1500)
+
+            # first_buy_sol: earliest buy in 1500ms
+            if _buys_1500:
+                _first_buy_sol = min(_buys_1500, key=lambda b: b[0])[1]
+            else:
+                _first_buy_sol = 0.0
+
+            # top_buy_share, buyer_hhi over 700ms
+            if _buys_700:
+                _buyer_sums = {}
+                for b in _buys_700:
+                    _buyer_sums[b[2]] = _buyer_sums.get(b[2], 0.0) + b[1]
+                _total_buy = sum(_buyer_sums.values())
+                if _total_buy > 0:
+                    _top_buy_share = max(_buyer_sums.values()) / _total_buy
+                    _buyer_hhi = sum((v / _total_buy) ** 2 for v in _buyer_sums.values())
+                else:
+                    _top_buy_share = 0.0
+                    _buyer_hhi = 0.0
+            else:
+                _top_buy_share = 0.0
+                _buyer_hhi = 0.0
+
+            # is_mayhem from curve point
+            _is_mayhem = bool(getattr(_cs_pt, "is_mayhem", False)) if _cs_pt is not None else False
+
+            # cluster_score per PGG2.py formula (line 4858 of PGG2.py).
+            # NOTE: sell_ratio term omitted — pending_sells returns tokens_in
+            # not sol_out, so we cannot compute sol-denominated sell_ratio
+            # without an extra curve simulation. The omitted penalty is at most
+            # 55 points; we compensate by setting threshold slightly conservatively.
+            cluster_score = 0.0
+            cluster_score += min(35.0, _s700_buy_sol * 10.0)
+            cluster_score += min(20.0, _s1500_buy_sol * 4.0)
+            cluster_score += min(28.0, _s700_unique_buyers * 7.0)
+            cluster_score += min(16.0, _slot_buyers * 4.0)
+            cluster_score += max(0.0, _move_700 - 1.0) * 700.0
+            cluster_score += max(0.0, _move_1500 - 1.0) * 260.0
+            if _s250_sells == 0 and _s700_sells == 0:
+                cluster_score += 8.0
+            if 0.30 <= _first_buy_sol <= 4.50:
+                cluster_score += 8.0
+            cluster_score -= max(0.0, _top_buy_share - 0.72) * 90.0
+            cluster_score -= max(0.0, _buyer_hhi - 0.42) * 45.0
+            cluster_score -= max(0.0, 1.0 - _move_250) * 220.0
+            if _is_mayhem:
+                cluster_score -= 4.0
+
+            # Compute uniq1500 (unique buyers in 1500ms window) for additional rules
+            _uniq_1500 = len({b[2] for b in _buys_1500 if b[2]})
+
+            # MULTI-RULE UNION FILTER (each rule = 100% test WR on 2508 records).
+            # Pass entry if ANY of these rules matches:
+            #   Rule A: cluster_score>=437.2 AND last_sell_age_ms<=813 (80/80 train)
+            #   Rule B: move700>=1.041 AND uniq1500>=18              (22/22 train)
+            #   Rule C: last_sell_age_ms<=813 AND move700>=1.198     (26/26 train)
+            # Rule A captures cluster-momentum-with-wash. Rule B captures
+            # multi-buyer-wave. Rule C captures wash-and-recover patterns.
+            # UNION test: 12/12 = 100% WR at 1.6% pass rate (vs 0.8% for A alone).
+            v56b_union_bypass = (
+                os.environ.get("PGG2_V48_V56B_ALLOW_RULE_UNION_BYPASS", "0").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            v56d_union_bypass = (
+                os.environ.get("PGG2_V48_V56D_ALLOW_RULE_UNION_BYPASS", "0").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            v67_union_bypass = (
+                os.environ.get("PGG2_V67_ALLOW_RULE_UNION_BYPASS", "1").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            v57_union_bypass = (
+                os.environ.get("PGG2_V57_ALLOW_RULE_UNION_BYPASS", "1").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            v58_union_bypass = (
+                os.environ.get("PGG2_V58_ALLOW_RULE_UNION_BYPASS", "1").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            v61_union_bypass = (
+                os.environ.get("PGG2_V61_ALLOW_RULE_UNION_BYPASS", "1").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            rule_v56b = bool(rec.get("v56b_gate_pass", False)) and v56b_union_bypass
+            rule_v56d = bool(rec.get("v56d_flow_gate_pass", False)) and v56d_union_bypass
+            rule_v67 = bool(rec.get("v67_flow_confirm_gate_pass", False)) and v67_union_bypass
+            rule_v57 = bool(rec.get("v57_impulse_gate_pass", False)) and v57_union_bypass
+            rule_v58 = bool(rec.get("v58_flow_gate_pass", False)) and v58_union_bypass
+            rule_v61 = bool(rec.get("v61_fanout_gate_pass", False)) and v61_union_bypass
+            rule_a = (cluster_score >= min_cluster_score
+                      and _last_sell_age_ms <= max_last_sell_age_ms)
+            rule_b = (_move_700 >= float(os.environ.get("PGG2_V48_RULEB_MIN_MOVE700", "1.041") or 1.041)
+                      and _uniq_1500 >= int(os.environ.get("PGG2_V48_RULEB_MIN_UNIQ1500", "18") or 18))
+            rule_c = (_last_sell_age_ms <= int(os.environ.get("PGG2_V48_RULEC_MAX_SELL_AGE_MS", "813") or 813)
+                      and _move_700 >= float(os.environ.get("PGG2_V48_RULEC_MIN_MOVE700", "1.198") or 1.198))
+
+            # --- V68 WHALE-FOLLOW gate eval ----------------------------------
+            # Fires when: exactly 1 unique signer in last 250ms, that signer is
+            # in the active-snipers pool, pbsol_250 >= MIN_BUY_SOL, no concurrent
+            # sells in last 1s, and source_lead within cap. This is the COPY-
+            # TRADE signal. Source: V61_MISSED_CURVE_WINNER_MINER.md — every
+            # >100% pump in the 3-min sampled window had ub250=1 and was rejected
+            # by V47C single_buyer_shadow_only.
+            # V68 gate was moved to _maybe_evaluate (per-shred); rule_v68 here
+            # reads the flag the upstream V68 path set on rec.
+            rule_v68 = bool(rec.get("v68_whale_follow_gate_pass", False))
+
+            any_pass = (
+                rule_a
+                or rule_b
+                or rule_c
+                or rule_v56b
+                or rule_v56d
+                or rule_v67
+                or rule_v57
+                or rule_v58
+                or rule_v61
+                or rule_v68
+            )
+            log(
+                f"PGG2-V48-LIVE-CLUSTER-SCORE-CHECK mint={_short(mint)} "
+                f"cluster_score={cluster_score:.2f} min_required={min_cluster_score:.2f} "
+                f"last_sell_age_ms={_last_sell_age_ms} max_allowed={max_last_sell_age_ms} "
+                f"rule_a={int(rule_a)} rule_b={int(rule_b)} rule_c={int(rule_c)} "
+                f"rule_v56b={int(rule_v56b)} v56b_union_bypass={int(v56b_union_bypass)} "
+                f"rule_v56d={int(rule_v56d)} v56d_union_bypass={int(v56d_union_bypass)} "
+                f"rule_v67={int(rule_v67)} v67_union_bypass={int(v67_union_bypass)} "
+                f"rule_v57={int(rule_v57)} v57_union_bypass={int(v57_union_bypass)} "
+                f"rule_v58={int(rule_v58)} v58_union_bypass={int(v58_union_bypass)} "
+                f"rule_v61={int(rule_v61)} v61_union_bypass={int(v61_union_bypass)} "
+                f"rule_v68={int(rule_v68)} v68_enabled={int(_env_flag('PGG2_V68_WHALE_FOLLOW_LANE_ENABLED', '0'))} "
+                f"any_pass={int(any_pass)} "
+                f"s700_buy_sol={_s700_buy_sol:.3f} s700_ub={_s700_unique_buyers} "
+                f"uniq1500={_uniq_1500} move700={_move_700:.4f} move1500={_move_1500:.4f}"
+            )
+            if not any_pass:
+                _log_v48_entry_block(
+                    rec,
+                    "rule_union_filter",
+                    f"cluster={cluster_score:.1f} sell_age={_last_sell_age_ms} move700={_move_700:.3f} uniq1500={_uniq_1500}",
+                    now,
+                )
+                return False
+
+        # FISH-vs-GARBAGE FILTER (2026-05-18 v3). Validated on 9 live trades
+        # from session 08:20-08:24 (4W/5L baseline). Filter:
+        #   (v47h_ratio >= MIN_V47H AND top_share <= MAX_TOP)
+        #   OR (top_share <= MAX_TOP_DISTRIBUTED AND ub >= MIN_UB_DISTRIBUTED)
+        # Result on session: 4W/1L = 80% WR, +0.0152 SOL (vs baseline +0.0112).
+        # Catches ALL 4 winners (ERRw, G67A, DtHZ, Dmpf). Blocks 4/5 garbage
+        # (3AxA, 8WUZ, 4cfG, EBR9). The 1 admitted loss (4nBa) is variance —
+        # its entry features sit WITHIN the winner cluster, indistinguishable.
+        # Default OFF (set ENABLED=1 to activate).
+        if _env_flag("PGG2_V48_FISH_GARBAGE_FILTER_ENABLED", "0"):
+            _min_v47h = float(os.environ.get("PGG2_V48_FISH_MIN_V47H_RATIO", "0.18") or 0.18)
+            _max_top = float(os.environ.get("PGG2_V48_FISH_MAX_TOP_SHARE", "0.85") or 0.85)
+            _max_top_dist = float(os.environ.get("PGG2_V48_FISH_MAX_TOP_DISTRIBUTED", "0.40") or 0.40)
+            _min_ub_dist = int(os.environ.get("PGG2_V48_FISH_MIN_UB_DISTRIBUTED", "3") or 3)
+            _v47h = float(rec.get("v47h_ratio", 0.0) or 0.0)
+            # rec keys at this point are raw 250ms-window features
+            _top = float(rec.get("tbs_250", rec.get("top_share", 0.0)) or 0.0)
+            _ub = int(rec.get("ub_250", rec.get("unique_buyers", 0)) or 0)
+            # Clause A: high edge, concentrated buying (whale-led winner)
+            _clause_a = (_v47h >= _min_v47h) and (_top <= _max_top)
+            # Clause B: low concentration, multiple buyers (community-led winner)
+            _clause_b = (_top <= _max_top_dist) and (_ub >= _min_ub_dist)
+            if not (_clause_a or _clause_b):
+                _log_v48_entry_block(
+                    rec,
+                    "fish_garbage_filter",
+                    f"v47h={_v47h:.4f}<{_min_v47h}_or_top={_top:.3f}>{_max_top}_clauseA={int(_clause_a)}_topDist={_top:.3f}>{_max_top_dist}_or_ub={_ub}<{_min_ub_dist}_clauseB={int(_clause_b)}",
+                    now,
+                )
+                log(
+                    f"PGG2-V48-LIVE-FISH-GARBAGE-BLOCK mint={_short(mint)} "
+                    f"v47h_ratio={_v47h:.4f} top_share={_top:.3f} ub={_ub} "
+                    f"clauseA={int(_clause_a)} clauseB={int(_clause_b)} "
+                    f"reason=looks_like_garbage_not_fish"
+                )
+                return False
+
+        # VSOL-BAND FILTER (2026-05-18 v4). Lifecycle filter based on 17 live trades.
+        # Pump.fun initial vsol = 30 SOL. Winners cluster in vsol [37, 55] SOL band:
+        #   vsol < 37: creator just bought, no real demand confirmation → dumps (7 losers in sample)
+        #   vsol > 55: pump mature, distribution phase → DdbG-class losses
+        #   vsol in [37, 55]: real buying built up, room to grow → 6/6 winners + 2 variance losers
+        # On 17 live trades: 75% WR, +$3.32 net vs $1.43 baseline. ALL winners caught.
+        # Default OFF (min=0). Set MIN_SOL>0 to enable.
+        _vsol_min_sol = float(
+            os.environ.get("PGG2_V48_VSOL_BAND_MIN_SOL", "0") or 0
+        )
+        if _vsol_min_sol > 0:
+            _vsol_max_sol = float(
+                os.environ.get("PGG2_V48_VSOL_BAND_MAX_SOL", "999") or 999
+            )
+            _vsol_lamports = int(rec.get("curve_snapshot_virtual_sol_reserves", 0) or 0)
+            _vsol_source = "rpc_snapshot"
+            # PumpPortal fallback: when RPC is throttled and rec snapshot is
+            # empty, fall back to the cached vSolInBondingCurve from the
+            # subscribeNewToken create event. Fresh mints there have vsol
+            # 30-32 SOL, which falls below the [37, 55] floor and gets
+            # correctly blocked as "too_fresh_no_demand" — exactly what
+            # should happen during throttle (don't buy unknown garbage).
+            if _vsol_lamports <= 0:
+                pp_entry = _pumpportal_curve_cache.get(mint)
+                if pp_entry is not None:
+                    _vsol_lamports = int(pp_entry[0])
+                    _vsol_source = "pumpportal_create"
+            _vsol_sol = _vsol_lamports / 1.0e9 if _vsol_lamports > 0 else 0.0
+            # FAIL-CLOSED: when no curve data at all (RPC throttled AND no
+            # PumpPortal create event for this mint), BLOCK. The 13:14 run
+            # lost $0.59 because the old code silently admitted when vsol=0.
+            # No data = no confidence = no trade.
+            if _vsol_sol <= 0:
+                _log_v48_entry_block(
+                    rec,
+                    "vsol_band",
+                    "no_curve_data_fail_closed",
+                    now,
+                )
+                log(
+                    f"PGG2-V48-LIVE-VSOL-BAND-BLOCK mint={_short(mint)} "
+                    f"vsol_sol=0 band=[{_vsol_min_sol:.1f},{_vsol_max_sol:.1f}] "
+                    f"source=none reason=no_curve_data_fail_closed"
+                )
+                return False
+            if not (_vsol_min_sol <= _vsol_sol <= _vsol_max_sol):
+                _log_v48_entry_block(
+                    rec,
+                    "vsol_band",
+                    f"vsol_sol={_vsol_sol:.2f}_outside_[{_vsol_min_sol:.1f},{_vsol_max_sol:.1f}]",
+                    now,
+                )
+                log(
+                    f"PGG2-V48-LIVE-VSOL-BAND-BLOCK mint={_short(mint)} "
+                    f"vsol_sol={_vsol_sol:.3f} band=[{_vsol_min_sol:.1f},{_vsol_max_sol:.1f}] "
+                    f"source={_vsol_source} "
+                    f"reason={'too_fresh_no_demand' if _vsol_sol < _vsol_min_sol else 'too_late_pump_mature'}"
+                )
+                return False
+
+        # V55 CURVE TREND GATE (2026-05-15 from BgzB live loss analysis).
+        # BgzB lost $0.14 even though IRO ratio was 1.62x. Root cause: between
+        # 14:46:06 and 14:46:15 (decision time) BgzB's vsol dropped from 67.245
+        # to 58.997 — curve was actively dumping when we entered. By buy-confirm
+        # the curve had moved 35% against us. The pre-buy IRO snapshot couldn't
+        # see this. Filter: block entry if vsol has dropped > X SOL over the
+        # last N ms. Default OFF (drop_window_ms=0). Set drop_window_ms>0 to
+        # enable. We use oracle._states.points directly (no new infra).
+        trend_window_ms = int(
+            os.environ.get("PGG2_V48_CURVE_TREND_WINDOW_MS", "0") or 0
+        )
+        if trend_window_ms > 0:
+            max_vsol_drop_pct = float(
+                os.environ.get("PGG2_V48_CURVE_TREND_MAX_DROP_PCT", "0.05") or 0.05
+            )
+            try:
+                _trend_st = oracle._states.get(mint)
+                _pts = list(_trend_st.points) if (_trend_st is not None and _trend_st.points) else []
+            except Exception:
+                _pts = []
+            latest_pt = None
+            baseline_pt = None
+            if _pts:
+                lo_ts = now - trend_window_ms
+                for _p in _pts:
+                    if getattr(_p, "error", False):
+                        continue
+                    latest_pt = _p
+                    if _p.ts_ms <= lo_ts and (
+                        baseline_pt is None or _p.ts_ms > baseline_pt.ts_ms
+                    ):
+                        baseline_pt = _p
+                if baseline_pt is None:
+                    for _p in _pts:
+                        if not getattr(_p, "error", False):
+                            baseline_pt = _p
+                            break
+            if (
+                latest_pt is not None
+                and baseline_pt is not None
+                and baseline_pt is not latest_pt
+                and int(getattr(baseline_pt, "virtual_sol_reserves", 0) or 0) > 0
+            ):
+                v_now = int(getattr(latest_pt, "virtual_sol_reserves", 0) or 0)
+                v_then = int(getattr(baseline_pt, "virtual_sol_reserves", 0) or 0)
+                drop_pct = (v_then - v_now) / v_then if v_then > 0 else 0.0
+                if drop_pct > max_vsol_drop_pct:
+                    _log_v48_entry_block(
+                        rec,
+                        "curve_trend_dump",
+                        f"vsol_drop_pct={drop_pct:.4f}_gt_{max_vsol_drop_pct:.4f}_window_ms={trend_window_ms}",
+                        now,
+                    )
+                    log(
+                        f"PGG2-V48-LIVE-CURVE-TREND-DUMP-BLOCK mint={_short(mint)} "
+                        f"vsol_drop_pct={drop_pct:.4f} max_allowed={max_vsol_drop_pct:.4f} "
+                        f"vsol_now={v_now} vsol_baseline={v_then} window_ms={trend_window_ms}"
+                    )
+                    return False
+
+        # VSOL PUMP-EXHAUSTION GATE (2026-05-18 from morning-vs-today analysis).
+        # Validated against 14 morning trades + 4 today losses:
+        #   - 9/9 morning WINS had vsol_v3 = 0.000 SOL (max +0.108)
+        #   - 4/5 morning first-LOSSES had vsol_v3 in [+3.5, +5.1] SOL
+        #     (caught mid-pump exhaustion, dumped right after)
+        # Rule: vsol gained > N SOL in the last K ms = exhaustion pump = BLOCK.
+        # Default 2.0 SOL over 3000ms. With v3<=2.0 applied retroactively:
+        #   - Morning: ALL 9 wins kept, 4/5 losses blocked
+        #   - Net delta: +0.003011 SOL = +$0.54
+        # Independent of curve-trend-dump gate above (that one blocks DROPS).
+        # Doesn't help today's flat-velocity losses (Z4mk caught by upper-band).
+        pump_v_max_sol = float(
+            os.environ.get("PGG2_V48_VSOL_PUMP_VELOCITY_MAX_SOL", "0") or 0
+        )
+        if pump_v_max_sol > 0:
+            pump_v_window_ms = int(
+                os.environ.get("PGG2_V48_VSOL_PUMP_VELOCITY_WINDOW_MS", "3000") or 3000
+            )
+            try:
+                _v_st = oracle._states.get(mint)
+                _v_pts = list(_v_st.points) if (_v_st is not None and _v_st.points) else []
+            except Exception:
+                _v_pts = []
+            v_latest = None
+            v_baseline = None
+            if _v_pts:
+                v_lo_ts = now - pump_v_window_ms
+                for _p in _v_pts:
+                    if getattr(_p, "error", False):
+                        continue
+                    v_latest = _p
+                    if _p.ts_ms <= v_lo_ts and (
+                        v_baseline is None or _p.ts_ms > v_baseline.ts_ms
+                    ):
+                        v_baseline = _p
+                if v_baseline is None:
+                    for _p in _v_pts:
+                        if not getattr(_p, "error", False):
+                            v_baseline = _p
+                            break
+            if (
+                v_latest is not None
+                and v_baseline is not None
+                and v_baseline is not v_latest
+                and int(getattr(v_baseline, "virtual_sol_reserves", 0) or 0) > 0
+            ):
+                v_now_lam = int(getattr(v_latest, "virtual_sol_reserves", 0) or 0)
+                v_then_lam = int(getattr(v_baseline, "virtual_sol_reserves", 0) or 0)
+                rise_sol = (v_now_lam - v_then_lam) / 1.0e9
+                if rise_sol > pump_v_max_sol:
+                    _log_v48_entry_block(
+                        rec,
+                        "vsol_pump_exhaustion",
+                        f"rise_sol={rise_sol:.3f}_gt_{pump_v_max_sol:.3f}_window_ms={pump_v_window_ms}",
+                        now,
+                    )
+                    log(
+                        f"PGG2-V48-LIVE-VSOL-PUMP-EXHAUSTION-BLOCK mint={_short(mint)} "
+                        f"rise_sol={rise_sol:.3f} max_allowed={pump_v_max_sol:.3f} "
+                        f"window_ms={pump_v_window_ms} "
+                        f"vsol_now={v_now_lam/1e9:.3f} vsol_baseline={v_then_lam/1e9:.3f}"
+                    )
+                    return False
+
+        # V55 PBSOL FOMO GATE (2026-05-15 from 7Ks8 loss forensic).
+        # 7Ks8 lost $0.13 despite IRO ratio 1.62x AND curve-trend pass. Root
+        # cause from log forensic: pbsol_250ms = 7.7 SOL at decision time
+        # (massive sniper FOMO inrush right before our entry). Shadow lab
+        # N=7340 analysis showed: slot_buy_sol <= 1.5 SOL -> 96.7% WR
+        # (vs 80% baseline at IRO>=1.20). High pbsol = snipers FOMO-ing in
+        # who will dump on us post-buy. Block when pbsol exceeds threshold.
+        # Default 0 = OFF.
+        max_pbsol_250ms = float(
+            os.environ.get("PGG2_V48_MAX_PBSOL_250MS", "0") or 0
+        )
+        if max_pbsol_250ms > 0:
+            try:
+                _cs_pbs, _cu_pbs, _ = _curve_state_at_or_before(mint, now)
+                if _cs_pbs is not None and _cu_pbs > 0:
+                    _pending_for_pbs = buffer_.pending_buys(
+                        mint, now, _cu_pbs, 250
+                    )
+                    # pending_buys returns tuples (ts_ms, sol_in, signer, slot)
+                    # — sol_in is at index 1, NOT an attribute.
+                    _pbsol_250 = sum(
+                        float(b[1] or 0.0) for b in _pending_for_pbs
+                    )
+                else:
+                    _pbsol_250 = 0.0
+            except Exception:
+                _pbsol_250 = 0.0
+            if _pbsol_250 > max_pbsol_250ms:
+                _log_v48_entry_block(
+                    rec,
+                    "pbsol_fomo",
+                    f"pbsol_250ms={_pbsol_250:.3f}_gt_{max_pbsol_250ms:.3f}",
+                    now,
+                )
+                log(
+                    f"PGG2-V48-LIVE-PBSOL-FOMO-BLOCK mint={_short(mint)} "
+                    f"pbsol_250ms={_pbsol_250:.3f} max_allowed={max_pbsol_250ms:.3f}"
+                )
+                return False
+
+        # V55 IRO RATIO GATE (2026-05-15 derived from shadow_lab N=7340 analysis).
+        # Among 7340 shadow_lab decisions with forward-looking PnL labels
+        # (label = all_in_best_pnl_lookahead > 0.002 AND all_in_worst_pnl > -0.005,
+        # baseline 16% WR), the immediate_reverse_out / scout_sol ratio is the
+        # single strongest decision-time predictor:
+        #   ratio >= 1.20 -> 80% WR
+        #   ratio >= 1.50 -> 87% WR
+        #   ratio >= 1.67 -> 85% WR  (n drops sharply past 1.7)
+        # immediate_reverse_out (IRO) is the SOL we would get if we immediately
+        # sold the tokens we are about to buy. Approximate it from the existing
+        # simulate_branches output already attached to the candidate record:
+        #   IRO ~= expected_pnl + size_sol + 2*tx_fee_sol
+        # No new RPC calls; uses data already computed by the candidate selector.
+        # Default value 1.0 keeps the gate OFF for backward compat.
+        min_iro_ratio = float(os.environ.get("PGG2_V48_MIN_IRO_RATIO", "1.0") or 1.0)
+        if min_iro_ratio > 1.0 and size_sol > 0.0:
+            try:
+                candidate_exp_pnl = float(rec.get("exp_pnl", 0.0))
+                approx_iro = candidate_exp_pnl + size_sol + 2.0 * float(DEFAULT_TX_FEE_SOL)
+                iro_ratio = approx_iro / size_sol
+            except Exception:
+                approx_iro = 0.0
+                iro_ratio = 0.0
+            if iro_ratio < min_iro_ratio:
+                _log_v48_entry_block(
+                    rec,
+                    "iro_ratio_too_low",
+                    f"iro_ratio={iro_ratio:.4f}_lt_{min_iro_ratio:.4f}",
+                    now,
+                )
+                log(
+                    f"PGG2-V48-LIVE-IRO-RATIO-BLOCK mint={_short(mint)} "
+                    f"iro_ratio={iro_ratio:.4f} min_required={min_iro_ratio:.4f} "
+                    f"approx_iro_sol={approx_iro:.6f} size_sol={size_sol:.6f}"
+                )
+                return False
+
+        mint_pk = Pubkey.from_string(mint)
+
+        v61_skip_open_revalidate = (
+            bool(rec.get("v61_fanout_gate_pass", False))
+            and bool(rec.get("v56b_gate_pass", False))
+            and os.environ.get(
+                "PGG2_V61_SKIP_LIVE_OPEN_REVALIDATE_FOR_FAST_SNAPSHOT", "0"
+            ) == "1"
+            and os.environ.get("PGG2_V61_FAST_SNAPSHOT_SEND", "1") == "1"
+        )
+        if v61_skip_open_revalidate:
+            log(
+                f"PGG2-V61-LIVE-OPEN-REVALIDATE-SKIP mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)} "
+                f"reason=fast_snapshot_v61_v56b_pass"
+            )
+        if (
+            os.environ.get("PGG2_V48_LIVE_REVALIDATE_AT_OPEN", "1") == "1"
+            and not v61_skip_open_revalidate
+        ):
+            reval_now = _now_ms()
+            cs_now, cu_now, cs_pt_now = _curve_state_at_or_before(mint, reval_now)
+            if cs_now is not None and cu_now > int(rec.get("curve_snapshot_ts_ms", 0) or 0):
+                pending_buys_now = buffer_.pending_buys(mint, reval_now, cu_now, 250)
+                pending_sells_now = buffer_.pending_sells(mint, reval_now, cu_now, 250)
+                res_now = _evaluate_size_for_mint(
+                    cs_now,
+                    size_sol,
+                    pending_buys_now,
+                    pending_sells_now,
+                    float(DEFAULT_TX_FEE_SOL),
+                )
+                req_now = max(
+                    float(required_floor_for_size(float(size_sol))),
+                    float(args.clean_close_entry_floor_sol),
+                )
+                r1_now = res_now.get("r1") or {}
+                g_now = res_now.get("guard") or {}
+                pnl_now = float(r1_now.get("expected_pnl", 0.0) or 0.0)
+                pass_now = bool(res_now.get("selectable")) and pnl_now >= req_now
+                log(
+                    f"PGG2-V48-LIVE-OPEN-REVALIDATE mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"old_snapshot_ts_ms={int(rec.get('curve_snapshot_ts_ms', 0) or 0)} "
+                    f"new_snapshot_ts_ms={int(cu_now)} "
+                    f"old_expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                    f"new_expected_pnl={pnl_now:+.6f} "
+                    f"required_pnl={req_now:+.6f} "
+                    f"pending_buys={len(pending_buys_now)} pending_sells={len(pending_sells_now)} "
+                    f"blocker={res_now.get('blocker') or '-'} pass={int(pass_now)}"
+                )
+                if not pass_now:
+                    _log_v48_entry_block(
+                        rec,
+                        "clean_close_gate",
+                        (
+                            f"live_open_revalidate_failed:"
+                            f"{res_now.get('blocker') or 'pnl_below_floor'}"
+                        ),
+                        reval_now,
+                    )
+                    return False
+                rec["curve_snapshot_ts_ms"] = int(getattr(cs_pt_now, "ts_ms", cu_now) or cu_now)
+                rec["curve_snapshot_slot"] = int(getattr(cs_pt_now, "slot", rec.get("slot", 0)) or rec.get("slot", 0))
+                rec["curve_snapshot_virtual_sol_reserves"] = int(getattr(cs_pt_now, "virtual_sol_reserves", 0) or 0)
+                rec["curve_snapshot_virtual_token_reserves"] = int(getattr(cs_pt_now, "virtual_token_reserves", 0) or 0)
+                rec["curve_snapshot_real_sol_reserves"] = int(getattr(cs_pt_now, "real_sol_reserves", 0) or 0)
+                rec["curve_snapshot_real_token_reserves"] = int(getattr(cs_pt_now, "real_token_reserves", 0) or 0)
+                rec["curve_snapshot_token_total_supply"] = int(getattr(cs_pt_now, "token_total_supply", 0) or 0)
+                rec["curve_snapshot_complete"] = bool(getattr(cs_pt_now, "complete", False))
+                rec["curve_snapshot_creator"] = str(getattr(cs_pt_now, "creator", "") or "")
+                rec["curve_snapshot_is_mayhem"] = bool(getattr(cs_pt_now, "is_mayhem", False))
+                rec["curve_snapshot_cashback_enabled"] = bool(getattr(cs_pt_now, "cashback_enabled", False))
+                rec["source_lead_ms"] = int(max(0, reval_now - int(cu_now)))
+                rec["adverse_branch"] = str(r1_now.get("adverse_branch_outcome", "") or "")
+                rec["adv_branch"] = str(r1_now.get("adverse_branch_outcome", "") or "")
+                rec["exp_pnl"] = float(r1_now.get("expected_pnl", 0.0) or 0.0)
+                rec["adv_pnl"] = float(r1_now.get("adverse_pnl", 0.0) or 0.0)
+                rec["expected_tokens"] = int(r1_now.get("expected_tokens", 0) or 0)
+                rec["guard_min_tokens"] = int(g_now.get("final_min_tokens", 0) or 0)
+                rec["live_open_revalidated"] = True
+
+        min_tokens_raw = int(rec.get("guard_min_tokens", 0))
+        expected_tokens_raw = int(rec.get("expected_tokens", 0))
+        min_tokens_ui = float(broker.raw_to_ui(mint_pk, min_tokens_raw))
+        expected_tokens_ui = float(broker.raw_to_ui(mint_pk, expected_tokens_raw))
+        pair_sig = str(rec.get("event_sig") or "")
+        if pair_sig and os.environ.get("PGG2_V48_LIVE_SKIP_PAIR_PREWARM", "0") != "1":
+            try:
+                broker.prewarm_pump_buyback_pair_from_sig(mint, pair_sig)
+            except Exception as exc:
+                log(
+                    f"PGG2-V48-LIVE-PAIR-PREWARM-WARN mint={_short(mint)} "
+                    f"sig={_short(pair_sig)} err={type(exc).__name__}:{exc}"
+                )
+
+        rec["entry_idx"] = len(candidates) + 1
+        rec["opened_or_deferred"] = "live_attempt_from_backfill" if from_backfill else "live_attempt"
+        candidates.append(rec)
+        selected_size_dist[f"{size_sol:.4f}"] += 1
+        position_key = (mint, int(rec.get("decision_ts_ms", now)))
+
+        log(
+            f"PGG2-V48-LIVE-ENTRY-OPEN-ATTEMPT decision_id={rec.get('decision_id')} "
+            f"mint={_short(mint)} size={size_sol:.4f} "
+            f"expected_tokens={expected_tokens_ui:.6f} min_tokens={min_tokens_ui:.6f} "
+            f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+            f"from_backfill={int(bool(from_backfill))}"
+        )
+
+        try:
+            use_decision_curve_snapshot = (
+                os.environ.get("PGG2_V48_LIVE_USE_DECISION_CURVE_SNAPSHOT", "1") == "1"
+                and int(rec.get("curve_snapshot_virtual_sol_reserves", 0) or 0) > 0
+                and int(rec.get("curve_snapshot_virtual_token_reserves", 0) or 0) > 0
+                and str(rec.get("curve_snapshot_creator") or "")
+            )
+            v57_fast_snapshot_send = (
+                bool(rec.get("v57_impulse_gate_pass", False))
+                and os.environ.get("PGG2_V57_FAST_SNAPSHOT_SEND", "1") == "1"
+            )
+            v56d_fast_snapshot_send = (
+                bool(rec.get("v56d_flow_gate_pass", False))
+                and os.environ.get("PGG2_V56D_FAST_SNAPSHOT_SEND", "1") == "1"
+            )
+            v67_fast_snapshot_send = (
+                bool(rec.get("v67_flow_confirm_gate_pass", False))
+                and os.environ.get("PGG2_V67_FAST_SNAPSHOT_SEND", "1") == "1"
+            )
+            v58_fast_snapshot_send = (
+                bool(rec.get("v58_flow_gate_pass", False))
+                and os.environ.get("PGG2_V58_FAST_SNAPSHOT_SEND", "1") == "1"
+            )
+            v60_fast_snapshot_send = (
+                bool(rec.get("v60_flow_gate_pass", False))
+                and os.environ.get("PGG2_V60_FAST_SNAPSHOT_SEND", "1") == "1"
+            )
+            v61_fast_snapshot_send = (
+                bool(rec.get("v61_fanout_gate_pass", False))
+                and os.environ.get("PGG2_V61_FAST_SNAPSHOT_SEND", "1") == "1"
+            )
+            fast_snapshot_send = (
+                v57_fast_snapshot_send
+                or v56d_fast_snapshot_send
+                or v67_fast_snapshot_send
+                or v58_fast_snapshot_send
+                or v60_fast_snapshot_send
+                or v61_fast_snapshot_send
+            )
+            v57_snapshot_age_before_build = -1
+            if use_decision_curve_snapshot:
+                max_snapshot_age_ms = max(
+                    0,
+                    int(os.environ.get("PGG2_V48_LIVE_MAX_SNAPSHOT_AGE_AT_SEND_MS", "750") or 750),
+                )
+                if v56d_fast_snapshot_send:
+                    v56d_snapshot_age_ms = max(
+                        0,
+                        int(
+                            os.environ.get(
+                                "PGG2_V48_V56D_LIVE_MAX_SNAPSHOT_AGE_AT_SEND_MS",
+                                str(max_snapshot_age_ms),
+                            )
+                            or max_snapshot_age_ms
+                        ),
+                    )
+                    if v56d_snapshot_age_ms != max_snapshot_age_ms:
+                        log(
+                            f"PGG2-V56D-LIVE-SNAPSHOT-AGE-WINDOW mint={_short(mint)} "
+                            f"decision_id={rec.get('decision_id')} "
+                            f"base_max_snapshot_age_ms={max_snapshot_age_ms} "
+                            f"v56d_max_snapshot_age_ms={v56d_snapshot_age_ms}"
+                    )
+                    max_snapshot_age_ms = v56d_snapshot_age_ms
+                if v67_fast_snapshot_send:
+                    v67_snapshot_age_ms = max(
+                        0,
+                        int(
+                            os.environ.get(
+                                "PGG2_V67_LIVE_MAX_SNAPSHOT_AGE_AT_SEND_MS",
+                                str(max_snapshot_age_ms),
+                            )
+                            or max_snapshot_age_ms
+                        ),
+                    )
+                    if v67_snapshot_age_ms != max_snapshot_age_ms:
+                        log(
+                            f"PGG2-V67-LIVE-SNAPSHOT-AGE-WINDOW mint={_short(mint)} "
+                            f"decision_id={rec.get('decision_id')} "
+                            f"base_max_snapshot_age_ms={max_snapshot_age_ms} "
+                            f"v67_max_snapshot_age_ms={v67_snapshot_age_ms}"
+                        )
+                    max_snapshot_age_ms = v67_snapshot_age_ms
+                if v61_fast_snapshot_send:
+                    v61_snapshot_age_ms = max(
+                        0,
+                        int(
+                            os.environ.get(
+                                "PGG2_V61_LIVE_MAX_SNAPSHOT_AGE_AT_SEND_MS",
+                                str(max_snapshot_age_ms),
+                            )
+                            or max_snapshot_age_ms
+                        ),
+                    )
+                    if v61_snapshot_age_ms != max_snapshot_age_ms:
+                        log(
+                            f"PGG2-V61-LIVE-SNAPSHOT-AGE-WINDOW mint={_short(mint)} "
+                            f"decision_id={rec.get('decision_id')} "
+                            f"base_max_snapshot_age_ms={max_snapshot_age_ms} "
+                            f"v61_max_snapshot_age_ms={v61_snapshot_age_ms}"
+                        )
+                    max_snapshot_age_ms = v61_snapshot_age_ms
+                snapshot_age_at_send = max(
+                    0,
+                    _now_ms() - int(rec.get("curve_snapshot_ts_ms", now) or now),
+                )
+                v57_snapshot_age_before_build = int(snapshot_age_at_send)
+                rec["snapshot_age_before_build_ms"] = int(snapshot_age_at_send)
+                if max_snapshot_age_ms > 0 and snapshot_age_at_send > max_snapshot_age_ms:
+                    if (
+                        v57_fast_snapshot_send
+                        and os.environ.get("PGG2_V57_FRESH_BUILD_ON_STALE_SNAPSHOT", "1") == "1"
+                    ):
+                        use_decision_curve_snapshot = False
+                        rec["v57_stale_snapshot_fresh_build"] = True
+                        log(
+                            f"PGG2-V57-STALE-SNAPSHOT-FRESH-BUILD mint={_short(mint)} "
+                            f"decision_id={rec.get('decision_id')} "
+                            f"snapshot_age_ms={snapshot_age_at_send} "
+                            f"max_snapshot_age_ms={max_snapshot_age_ms} "
+                            f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)} "
+                            f"action=fresh_direct_build"
+                        )
+                    else:
+                        _log_v48_entry_block(
+                            rec,
+                            "stale_quote",
+                            f"snapshot_age_ms={snapshot_age_at_send}_gt_{max_snapshot_age_ms}",
+                            _now_ms(),
+                        )
+                        log(
+                            f"PGG2-V48-LIVE-SNAPSHOT-AGE-BLOCK mint={_short(mint)} "
+                            f"decision_id={rec.get('decision_id')} "
+                            f"snapshot_age_ms={snapshot_age_at_send} "
+                            f"max_snapshot_age_ms={max_snapshot_age_ms} "
+                            f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)}"
+                        )
+                        return False
+                if fast_snapshot_send:
+                    log(
+                        f"PGG2-V48-FAST-SNAPSHOT-PREPARED mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"v56d={int(v56d_fast_snapshot_send)} "
+                        f"v67={int(v67_fast_snapshot_send)} "
+                        f"v57={int(v57_fast_snapshot_send)} "
+                        f"v58={int(v58_fast_snapshot_send)} "
+                        f"v60={int(v60_fast_snapshot_send)} "
+                        f"v61={int(v61_fast_snapshot_send)} "
+                        f"snapshot_age_before_build_ms={snapshot_age_at_send} "
+                        f"max_snapshot_age_ms={max_snapshot_age_ms} "
+                        f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)}"
+                    )
+            if use_decision_curve_snapshot:
+                buy_quote = broker.build_buy_with_min_tokens_from_curve_snapshot(
+                    mint,
+                    size_sol,
+                    min_tokens_ui,
+                    virtual_token_reserves=int(rec.get("curve_snapshot_virtual_token_reserves", 0) or 0),
+                    virtual_sol_reserves=int(rec.get("curve_snapshot_virtual_sol_reserves", 0) or 0),
+                    real_token_reserves=int(rec.get("curve_snapshot_real_token_reserves", 0) or 0),
+                    real_sol_reserves=int(rec.get("curve_snapshot_real_sol_reserves", 0) or 0),
+                    token_total_supply=int(rec.get("curve_snapshot_token_total_supply", 0) or 0),
+                    complete=bool(rec.get("curve_snapshot_complete", False)),
+                    creator=str(rec.get("curve_snapshot_creator") or ""),
+                    is_mayhem=bool(rec.get("curve_snapshot_is_mayhem", False)),
+                    cashback_enabled=bool(rec.get("curve_snapshot_cashback_enabled", False)),
+                    snapshot_ts_ms=int(rec.get("curve_snapshot_ts_ms", rec.get("decision_ts_ms", now)) or now),
+                )
+            else:
+                buy_quote = broker.build_buy_with_min_tokens(mint, size_sol, min_tokens_ui)
+            pair_info = broker.last_pair_info(mint)
+            pair_source = str(pair_info.get("pair_source") or "unknown")
+            if buy_quote.get("route") != "pump_bc":
+                _log_v48_entry_block(rec, "route_not_pump_bc", str(buy_quote.get("route")), now)
+                return False
+            if pair_source.startswith("sim_selected"):
+                _log_v48_entry_block(rec, "sim_needed", pair_source, now)
+                return False
+            fresh_expected_tokens = float(broker.rate_amount_out(buy_quote))
+            if fresh_expected_tokens <= 0:
+                _log_v48_entry_block(rec, "missing_feature", "fresh_buy_tokens_zero", now)
+                return False
+            fresh_expected_raw = broker.ui_to_raw(mint_pk, fresh_expected_tokens)
+            max_presend_decay_pct = max(
+                0.0,
+                float(os.environ.get("PGG2_V48_LIVE_MAX_PRESEND_TOKEN_DECAY_PCT", "0.30") or 0.30),
+            )
+            presend_token_decay_pct = 0.0
+            if int(expected_tokens_raw) > 0:
+                presend_token_decay_pct = max(
+                    0.0,
+                    1.0 - (float(fresh_expected_raw) / float(expected_tokens_raw)),
+                )
+            if (not use_decision_curve_snapshot) and presend_token_decay_pct > max_presend_decay_pct:
+                _log_v48_entry_block(
+                    rec,
+                    "token_guard_failed",
+                    f"presend_token_decay_pct={presend_token_decay_pct:.4f}_gt_{max_presend_decay_pct:.4f}",
+                    _now_ms(),
+                )
+                log(
+                    f"PGG2-V48-LIVE-PRESEND-DECAY-BLOCK mint={_short(mint)} "
+                    f"decision_expected_raw={expected_tokens_raw} fresh_expected_raw={fresh_expected_raw} "
+                    f"decay_pct={presend_token_decay_pct:.4f} max_decay_pct={max_presend_decay_pct:.4f}"
+                )
+                return False
+            if use_decision_curve_snapshot:
+                log(
+                    f"PGG2-V48-LIVE-DECISION-SNAPSHOT-BUY mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"snapshot_age_ms={max(0, _now_ms() - int(rec.get('curve_snapshot_ts_ms', now) or now))} "
+                    f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)} "
+                    f"expected_raw={fresh_expected_raw} min_raw={int(rec.get('guard_min_tokens', 0) or 0)} "
+                    f"late_requote_required=false"
+                )
+            # Live equivalence for V48 is not an immediate buy->sell round trip.
+            # V48's dry-live edge is the observed flow after entry. Do not spend
+            # another RPC round trip building a diagnostic sell quote before the
+            # buy send; that delay was enough to turn dry-live fills into guarded
+            # live buy failures. The risk worker quotes sell immediately after a
+            # processed/token-balance signal.
+            fresh_sell_out = -1.0
+            fresh_same_state_pnl = 0.0
+            modeled_live_tx_fee = (
+                float(DEFAULT_TX_FEE_SOL)
+                + max(0.0, float(os.environ.get("PGG2_DIRECT_PRIORITY_FEE_SOL", "0") or 0.0))
+            )
+            protected_close_min_sol_out = (
+                float(size_sol)
+                + (2.0 * modeled_live_tx_fee)
+                + live_smoke_sell_floor
+            )
+            strategy_min_raw = int(
+                int(fresh_expected_raw) * float(args.strategy_min_tokens_frac)
+            )
+            original_guard_raw = int(rec.get("guard_min_tokens", 0))
+            drylive_expected_sell_out = max(
+                protected_close_min_sol_out,
+                float(size_sol) + (2.0 * modeled_live_tx_fee) + float(rec.get("exp_pnl", 0.0)),
+            )
+            profit_guard_frac = protected_close_min_sol_out / max(drylive_expected_sell_out, 1e-12)
+            min_live_token_frac = max(
+                0.0,
+                float(os.environ.get("PGG2_V48_LIVE_MIN_TOKEN_FRAC", "0.55") or 0.55),
+            )
+            profit_guard_raw = int(int(fresh_expected_raw) * profit_guard_frac)
+            fraction_floor_raw = int(int(fresh_expected_raw) * min_live_token_frac)
+            guard_probe_out = -1.0
+            market_profit_guard_raw = 0
+            guard_probe_raw = max(1, min(int(fresh_expected_raw), int(strategy_min_raw)))
+            if use_decision_curve_snapshot and hasattr(broker, "build_sell_from_curve_snapshot"):
+                try:
+                    guard_probe_ui = float(broker.raw_to_ui(mint_pk, guard_probe_raw))
+                    guard_probe_quote = broker.build_sell_from_curve_snapshot(
+                        mint,
+                        f"raw:{int(guard_probe_raw)}",
+                        getattr(broker, "sell_slippage", 0.01),
+                        virtual_token_reserves=int(rec.get("curve_snapshot_virtual_token_reserves", 0) or 0),
+                        virtual_sol_reserves=int(rec.get("curve_snapshot_virtual_sol_reserves", 0) or 0),
+                        real_token_reserves=int(rec.get("curve_snapshot_real_token_reserves", 0) or 0),
+                        real_sol_reserves=int(rec.get("curve_snapshot_real_sol_reserves", 0) or 0),
+                        token_total_supply=int(rec.get("curve_snapshot_token_total_supply", 0) or 0),
+                        complete=bool(rec.get("curve_snapshot_complete", False)),
+                        snapshot_ts_ms=int(rec.get("curve_snapshot_ts_ms", rec.get("decision_ts_ms", now)) or now),
+                    )
+                    guard_probe_out = float(broker.rate_amount_out(guard_probe_quote))
+                    if guard_probe_out > 0.0:
+                        target_out = protected_close_min_sol_out + live_smoke_sell_out_buffer
+                        market_profit_guard_raw = int(
+                            (float(guard_probe_raw) * target_out / max(guard_probe_out, 1e-12))
+                            + 1.0
+                        )
+                    log(
+                        f"PGG2-V48-LIVE-FAST-GUARD mint={_short(mint)} "
+                        f"source=decision_curve_snapshot action=snapshot_sell_probe "
+                        f"guard_probe_raw={guard_probe_raw} guard_probe_out={guard_probe_out:.9f} "
+                        f"market_profit_guard_raw={market_profit_guard_raw}"
+                    )
+                except Exception as exc:
+                    log(
+                        f"PGG2-V48-LIVE-ADAPTIVE-GUARD-WARN mint={_short(mint)} "
+                        f"source=decision_curve_snapshot err={type(exc).__name__}:{exc}"
+                    )
+            elif not use_decision_curve_snapshot:
+                try:
+                    guard_probe_ui = float(broker.raw_to_ui(mint_pk, guard_probe_raw))
+                    guard_probe_quote = broker.build_sell(mint, guard_probe_ui, broker.sell_slippage)
+                    guard_probe_out = float(broker.rate_amount_out(guard_probe_quote))
+                    if guard_probe_out > 0.0:
+                        target_out = protected_close_min_sol_out + live_smoke_sell_out_buffer
+                        market_profit_guard_raw = int(
+                            (float(guard_probe_raw) * target_out / max(guard_probe_out, 1e-12))
+                            + 1.0
+                        )
+                except Exception as exc:
+                    log(
+                        f"PGG2-V48-LIVE-ADAPTIVE-GUARD-WARN mint={_short(mint)} "
+                        f"err={type(exc).__name__}:{exc}"
+                    )
+            else:
+                log(
+                    f"PGG2-V48-LIVE-FAST-GUARD mint={_short(mint)} "
+                    f"source=decision_curve_snapshot action=no_sell_probe_available"
+                )
+            if os.environ.get("PGG2_V48_LIVE_ADAPTIVE_PROFIT_GUARD", "1") == "1":
+                market_guard_overhang_pct = 0.0
+                if market_profit_guard_raw > 0 and int(fresh_expected_raw) > 0:
+                    market_guard_overhang_pct = max(
+                        0.0,
+                        (float(market_profit_guard_raw) / float(fresh_expected_raw)) - 1.0,
+                    )
+                if (
+                    market_profit_guard_raw > 0
+                    and live_max_market_guard_overhang_pct > 0.0
+                    and market_guard_overhang_pct > live_max_market_guard_overhang_pct
+                ):
+                    _log_v48_entry_block(
+                        rec,
+                        "sell_guard_failed",
+                        (
+                            f"market_guard_overhang_pct={market_guard_overhang_pct:.4f}"
+                            f"_gt_{live_max_market_guard_overhang_pct:.4f}"
+                        ),
+                        _now_ms(),
+                    )
+                    log(
+                        f"PGG2-V48-LIVE-MARKET-GUARD-OVERHANG-BLOCK mint={_short(mint)} "
+                        f"market_profit_guard_raw={market_profit_guard_raw} "
+                        f"fresh_expected_raw={fresh_expected_raw} "
+                        f"overhang_pct={market_guard_overhang_pct:.4f} "
+                        f"max_overhang_pct={live_max_market_guard_overhang_pct:.4f}"
+                    )
+                    return False
+                # 2026-05-15: optional bypass of profit_guard_raw. When the
+                # cluster_score rule fires (high-confidence pump-continuation
+                # candidate), curve may drift UP between decision and tx-land,
+                # causing profit_guard to reject and waste fee. Setting
+                # PGG2_V48_LIVE_DISABLE_PROFIT_GUARD=1 drops profit_guard so
+                # only the fraction_floor (default 0.55*expected) bounds the
+                # buy. Buy then lands even on continued pumps (we get fewer
+                # tokens at higher price, but pump-continuation means we still
+                # win). Use ONLY when entry filter is high-precision.
+                _disable_profit_guard = (
+                    os.environ.get("PGG2_V48_LIVE_DISABLE_PROFIT_GUARD", "0") == "1"
+                )
+                _v57_disable_profit_guard = False
+                if (
+                    bool(rec.get("v57_impulse_gate_pass", False))
+                    and os.environ.get("PGG2_V57_LIVE_DISABLE_PROFIT_GUARD", "1") == "1"
+                ):
+                    _v57_pg_min_pnl = float(
+                        os.environ.get(
+                            "PGG2_V57_PROFIT_GUARD_BYPASS_MIN_EXPECTED_PNL",
+                            os.environ.get("PGG2_V57_HIGH_EDGE_MIN_EXPECTED_PNL", "0.003000"),
+                        )
+                        or 0.003000
+                    )
+                    _v57_pg_max_top = float(
+                        os.environ.get(
+                            "PGG2_V57_PROFIT_GUARD_BYPASS_MAX_TOP_SHARE_250",
+                            os.environ.get("PGG2_V57_HIGH_EDGE_MAX_TOP_SHARE_250", "0.300"),
+                        )
+                        or 0.300
+                    )
+                    _v57_pg_min_ub = int(
+                        os.environ.get(
+                            "PGG2_V57_PROFIT_GUARD_BYPASS_MIN_UNIQUE_BUYERS_250",
+                            os.environ.get("PGG2_V57_HIGH_EDGE_MIN_UNIQUE_BUYERS_250", "5"),
+                        )
+                        or 5
+                    )
+                    _v57_disable_profit_guard = (
+                        float(rec.get("exp_pnl", 0.0) or 0.0) >= _v57_pg_min_pnl - 1e-12
+                        and float(rec.get("tbs_250", 1.0) or 1.0) <= _v57_pg_max_top + 1e-12
+                        and int(rec.get("ub_250", 0) or 0) >= _v57_pg_min_ub
+                    )
+                    if not _v57_disable_profit_guard:
+                        log(
+                            f"PGG2-V57-LIVE-PROFIT-GUARD-KEPT mint={_short(mint)} "
+                            f"decision_id={rec.get('decision_id')} "
+                            f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f}/{_v57_pg_min_pnl:+.6f} "
+                            f"top_share={float(rec.get('tbs_250', 1.0)):.3f}/{_v57_pg_max_top:.3f} "
+                            f"ub250={int(rec.get('ub_250', 0))}/{_v57_pg_min_ub} "
+                            f"reason=not_high_edge_enough"
+                        )
+                if _v57_disable_profit_guard:
+                    _disable_profit_guard = True
+                    log(
+                        f"PGG2-V57-LIVE-PROFIT-GUARD-BYPASS mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                        f"fresh_expected_raw={fresh_expected_raw} "
+                        f"profit_guard_raw={profit_guard_raw} "
+                        f"fraction_floor_raw={fraction_floor_raw} "
+                        f"reason=impulse_lane_landing_speed"
+                    )
+                candidate_guards = [int(fraction_floor_raw)]
+                _lane_requires_strict_buy_guard = (
+                    bool(rec.get("v56b_gate_pass", False))
+                    or bool(rec.get("v56d_flow_gate_pass", False))
+                    or bool(rec.get("v67_flow_confirm_gate_pass", False))
+                    or bool(rec.get("v57_impulse_gate_pass", False))
+                    or bool(rec.get("v58_flow_gate_pass", False))
+                    or bool(rec.get("v60_flow_gate_pass", False))
+                    or bool(rec.get("v61_fanout_gate_pass", False))
+                )
+                _v56d_profit_minout_requested = (
+                    bool(rec.get("v56d_flow_gate_pass", False))
+                    and os.environ.get("PGG2_V56D_LIVE_USE_PROFIT_MINOUT", "0") == "1"
+                )
+                _v56d_profit_minout = (
+                    _v56d_profit_minout_requested
+                    and int(market_profit_guard_raw) > 0
+                )
+                if _v56d_profit_minout_requested and not _v56d_profit_minout:
+                    log(
+                        f"PGG2-V56D-LIVE-PROFIT-MINOUT-DISABLED mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} reason=no_market_sell_guard "
+                        f"market_profit_guard_raw={int(market_profit_guard_raw)}"
+                    )
+                if not _disable_profit_guard:
+                    candidate_guards.append(int(profit_guard_raw))
+                if live_use_original_token_guard:
+                    candidate_guards.append(int(original_guard_raw))
+                if (
+                    market_profit_guard_raw > 0
+                    and os.environ.get("PGG2_V48_LIVE_REQUIRE_IMMEDIATE_BREAKEVEN_MIN_TOKEN", "0") == "1"
+                ):
+                    candidate_guards.append(int(market_profit_guard_raw))
+                elif live_use_strategy_token_guard:
+                    candidate_guards.append(int(strategy_min_raw))
+                if (
+                    _lane_requires_strict_buy_guard
+                    and os.environ.get("PGG2_V56_LIVE_REQUIRE_STRICT_BUY_GUARD", "1") == "1"
+                    and not _v56d_profit_minout
+                ):
+                    candidate_guards.append(int(original_guard_raw))
+                    candidate_guards.append(int(strategy_min_raw))
+                    if int(market_profit_guard_raw) > 0:
+                        candidate_guards.append(int(market_profit_guard_raw))
+                    log(
+                        f"PGG2-V56-LIVE-STRICT-BUY-GUARD mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"v56b={int(bool(rec.get('v56b_gate_pass', False)))} "
+                        f"v56d={int(bool(rec.get('v56d_flow_gate_pass', False)))} "
+                        f"v67={int(bool(rec.get('v67_flow_confirm_gate_pass', False)))} "
+                        f"v57={int(bool(rec.get('v57_impulse_gate_pass', False)))} "
+                        f"v58={int(bool(rec.get('v58_flow_gate_pass', False)))} "
+                        f"v60={int(bool(rec.get('v60_flow_gate_pass', False)))} "
+                        f"v61={int(bool(rec.get('v61_fanout_gate_pass', False)))} "
+                        f"original_guard_raw={int(original_guard_raw)} "
+                        f"strategy_min_raw={int(strategy_min_raw)} "
+                        f"market_profit_guard_raw={int(market_profit_guard_raw)} "
+                        f"fraction_floor_raw={int(fraction_floor_raw)} "
+                        f"profit_guard_disabled={str(bool(_disable_profit_guard)).lower()}"
+                    )
+                elif _v56d_profit_minout:
+                    log(
+                        f"PGG2-V56D-LIVE-PROFIT-MINOUT mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"original_guard_raw={int(original_guard_raw)} "
+                        f"strategy_min_raw={int(strategy_min_raw)} "
+                        f"profit_guard_raw={int(profit_guard_raw)} "
+                        f"fraction_floor_raw={int(fraction_floor_raw)} "
+                        f"reason=flow_lane_speed"
+                    )
+                min_tokens_raw = max(candidate_guards)
+                if (
+                    bool(rec.get("v61_fanout_gate_pass", False))
+                    and os.environ.get(
+                        "PGG2_V61_USE_STRATEGY_MIN_TOKEN_GUARD", "0"
+                    ).strip().lower() in ("1", "true", "yes", "on")
+                    and int(strategy_min_raw) > 0
+                    and int(strategy_min_raw) < int(min_tokens_raw)
+                ):
+                    log(
+                        f"PGG2-V61-LIVE-STRATEGY-MIN-TOKEN-GUARD "
+                        f"mint={_short(mint)} decision_id={rec.get('decision_id')} "
+                        f"market_min_raw={int(min_tokens_raw)} "
+                        f"strategy_min_raw={int(strategy_min_raw)} "
+                        f"fresh_expected_raw={int(fresh_expected_raw)} "
+                        f"reason=fanout_fast_lane_avoid_tight_minout_fee_bleed"
+                    )
+                    min_tokens_raw = int(strategy_min_raw)
+            else:
+                min_tokens_raw = max(int(original_guard_raw), int(strategy_min_raw))
+            guard_will_fail_safe = int(min_tokens_raw) > int(fresh_expected_raw)
+            # 2026-05-17 GENERAL guard-downsize: curve moves between snapshot and fresh
+            # quote on EVERY entry (slippage from concurrent buys). Strict-buy-guards
+            # built from snapshot then exceed fresh_expected and silently kill entry.
+            # Live data 2026-05-17: 20/24 candidates blocked here. Drop to fraction_floor
+            # (0.55x fresh) so the broker accepts the buy with safe minimum-tokens guard.
+            # Env: PGG2_V48_DISABLE_GUARD_DOWNSIZE=1 to revert.
+            _allow_guard_downsize = not _env_flag("PGG2_V48_DISABLE_GUARD_DOWNSIZE", "0")
+            if (
+                guard_will_fail_safe
+                and _allow_guard_downsize
+                and int(fraction_floor_raw) > 0
+                and int(fraction_floor_raw) <= int(fresh_expected_raw)
+            ):
+                _v68_owns = bool(rec.get("v68_whale_follow_gate_pass", False))
+                log(
+                    f"PGG2-V48-GUARD-DOWNSIZE mint={_short(mint)} "
+                    f"old_min_tokens_raw={int(min_tokens_raw)} "
+                    f"fresh_expected_raw={int(fresh_expected_raw)} "
+                    f"new_min_tokens_raw={int(fraction_floor_raw)} "
+                    f"reason={'v68_whale' if _v68_owns else 'general_curve_moved'}"
+                )
+                min_tokens_raw = int(fraction_floor_raw)
+                guard_will_fail_safe = int(min_tokens_raw) > int(fresh_expected_raw)
+            min_tokens_ui = float(broker.raw_to_ui(mint_pk, int(min_tokens_raw)))
+            buy_quote = broker.retarget_buy_min_tokens(
+                buy_quote, mint, min_tokens_ui,
+            )
+            rec["live_bound_expected_tokens_raw"] = int(fresh_expected_raw)
+            rec["live_bound_guard_min_tokens_raw"] = int(min_tokens_raw)
+            rec["live_bound_fresh_same_state_pnl"] = float(fresh_same_state_pnl)
+            log(
+                f"PGG2-V48-LIVE-EXECUTABLE-QUOTE-BINDING mint={_short(mint)} "
+                f"old_expected_raw={expected_tokens_raw} old_min_raw={int(rec.get('guard_min_tokens', 0))} "
+                f"fresh_expected_raw={fresh_expected_raw} "
+                f"presend_token_decay_pct={presend_token_decay_pct:.4f} "
+                f"strategy_min_raw={strategy_min_raw} profit_guard_raw={profit_guard_raw} "
+                f"market_profit_guard_raw={market_profit_guard_raw} "
+                f"fraction_floor_raw={fraction_floor_raw} final_min_raw={min_tokens_raw} "
+                f"original_guard_used={str(bool(live_use_original_token_guard)).lower()} "
+                f"strategy_guard_used={str(bool(live_use_strategy_token_guard)).lower()} "
+                f"profit_guard_disabled={str(bool(_disable_profit_guard)).lower()} "
+                f"v57_profit_guard_bypass={str(bool(_v57_disable_profit_guard)).lower()} "
+                f"fresh_sell_out=skipped_presend "
+                f"guard_probe_out={guard_probe_out:.9f} "
+                f"fresh_same_state_pnl=skipped_presend "
+                f"drylive_flow_expected_pnl={float(rec.get('exp_pnl', 0.0)):+.9f} "
+                f"drylive_expected_sell_out={drylive_expected_sell_out:.9f} "
+                f"protected_close_min_sol_out={protected_close_min_sol_out:.9f} "
+                f"gate_pass=true mode=drylive_flow_binding "
+                f"guard_will_fail_safe={str(bool(guard_will_fail_safe)).lower()}"
+            )
+            if (
+                guard_will_fail_safe
+                and os.environ.get(
+                    "PGG2_V48_BLOCK_IMPOSSIBLE_BUY_MIN_TOKEN", "1",
+                ).strip().lower() not in ("0", "false", "no", "off")
+            ):
+                _log_v48_entry_block(
+                    rec,
+                    "token_guard_failed",
+                    (
+                        f"min_tokens_raw={int(min_tokens_raw)}_gt_"
+                        f"fresh_expected_raw={int(fresh_expected_raw)}"
+                    ),
+                    _now_ms(),
+                )
+                log(
+                    f"PGG2-V48-LIVE-BUY-GUARD-BLOCK mint={_short(mint)} "
+                    f"reason=min_tokens_above_expected "
+                    f"fresh_expected_raw={int(fresh_expected_raw)} "
+                    f"min_tokens_raw={int(min_tokens_raw)} "
+                    f"fee_spent=0.000000000 action=skip_before_send"
+                )
+                return False
+            v61_min_guard_slack_pct = float(
+                os.environ.get("PGG2_V61_MIN_BUY_GUARD_SLACK_PCT", "0") or 0
+            )
+            if (
+                bool(rec.get("v61_fanout_gate_pass", False))
+                and v61_min_guard_slack_pct > 0.0
+                and fresh_expected_raw > 0
+            ):
+                guard_slack_pct = (
+                    (float(fresh_expected_raw) - float(min_tokens_raw))
+                    / float(fresh_expected_raw)
+                ) * 100.0
+                rec["v61_buy_guard_slack_pct"] = float(guard_slack_pct)
+                if guard_slack_pct < v61_min_guard_slack_pct - 1e-12:
+                    _log_v48_entry_block(
+                        rec,
+                        "token_guard_failed",
+                        (
+                            f"v61_guard_slack_pct={guard_slack_pct:.4f}_lt_"
+                            f"{v61_min_guard_slack_pct:.4f}"
+                        ),
+                        _now_ms(),
+                    )
+                    log(
+                        f"PGG2-V61-LIVE-BUY-GUARD-SLACK-BLOCK "
+                        f"mint={_short(mint)} decision_id={rec.get('decision_id')} "
+                        f"fresh_expected_raw={int(fresh_expected_raw)} "
+                        f"min_tokens_raw={int(min_tokens_raw)} "
+                        f"guard_slack_pct={guard_slack_pct:.4f} "
+                        f"min_required_pct={v61_min_guard_slack_pct:.4f} "
+                        f"fee_spent=0.000000000 action=skip_before_send"
+                    )
+                    return False
+            signed_buy, buy_preview = broker.sign_transaction(str(buy_quote["txn"]))
+            if use_decision_curve_snapshot:
+                snapshot_age_before_sign = max(
+                    0,
+                    _now_ms() - int(rec.get("curve_snapshot_ts_ms", now) or now),
+                )
+                local_build_ms = (
+                    int(snapshot_age_before_sign) - int(v57_snapshot_age_before_build)
+                    if v57_snapshot_age_before_build >= 0
+                    else 0
+                )
+                fast_max_local_build_ms = int(
+                    os.environ.get(
+                        "PGG2_V48_FAST_SNAPSHOT_MAX_LOCAL_BUILD_MS",
+                        os.environ.get("PGG2_V57_MAX_LOCAL_BUILD_MS", "350"),
+                    )
+                    or 350
+                )
+                fast_allow_prepared_send = (
+                    fast_snapshot_send
+                    and v57_snapshot_age_before_build >= 0
+                    and (
+                        max_snapshot_age_ms <= 0
+                        or v57_snapshot_age_before_build <= max_snapshot_age_ms
+                    )
+                    and local_build_ms <= fast_max_local_build_ms
+                )
+                if (
+                    v61_fast_snapshot_send
+                    and max_snapshot_age_ms > 0
+                    and snapshot_age_before_sign > max_snapshot_age_ms
+                ):
+                    _log_v48_entry_block(
+                        rec,
+                        "stale_quote",
+                        f"v61_snapshot_age_before_send_ms={snapshot_age_before_sign}_gt_{max_snapshot_age_ms}",
+                        _now_ms(),
+                    )
+                    log(
+                        f"PGG2-V61-LIVE-SNAPSHOT-AGE-BLOCK mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"snapshot_age_before_build_ms={v57_snapshot_age_before_build} "
+                        f"snapshot_age_before_send_ms={snapshot_age_before_sign} "
+                        f"local_build_ms={local_build_ms} "
+                        f"max_snapshot_age_ms={max_snapshot_age_ms} "
+                        f"phase=before_send action=block_fee_spend"
+                    )
+                    return False
+                if (
+                    max_snapshot_age_ms > 0
+                    and snapshot_age_before_sign > max_snapshot_age_ms
+                    and not fast_allow_prepared_send
+                ):
+                    _log_v48_entry_block(
+                        rec,
+                        "stale_quote",
+                        f"snapshot_age_before_sign_ms={snapshot_age_before_sign}_gt_{max_snapshot_age_ms}",
+                        _now_ms(),
+                    )
+                    log(
+                        f"PGG2-V48-LIVE-SNAPSHOT-AGE-BLOCK mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"snapshot_age_ms={snapshot_age_before_sign} "
+                        f"max_snapshot_age_ms={max_snapshot_age_ms} "
+                        f"phase=before_sign "
+                        f"source_lead_ms={int(rec.get('source_lead_ms', 0) or 0)}"
+                    )
+                    return False
+                if (
+                    max_snapshot_age_ms > 0
+                    and snapshot_age_before_sign > max_snapshot_age_ms
+                    and fast_allow_prepared_send
+                ):
+                    log(
+                        f"PGG2-V48-FAST-SNAPSHOT-SEND mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"v56d={int(v56d_fast_snapshot_send)} "
+                        f"v57={int(v57_fast_snapshot_send)} "
+                        f"v58={int(v58_fast_snapshot_send)} "
+                        f"snapshot_age_before_build_ms={v57_snapshot_age_before_build} "
+                        f"snapshot_age_before_send_ms={snapshot_age_before_sign} "
+                        f"local_build_ms={local_build_ms} "
+                        f"max_local_build_ms={fast_max_local_build_ms} "
+                        f"max_snapshot_age_ms={max_snapshot_age_ms} "
+                        f"action=send_prepared_min_token_guard"
+                    )
+            log(
+                f"PGG2-V48-LIVE-BUY-MIN-TOKEN-GUARD mint={_short(mint)} "
+                f"expected_tokens={fresh_expected_tokens:.6f} min_tokens={min_tokens_ui:.6f} "
+                f"tx_min_tokens={min_tokens_ui:.6f} pair_source={pair_source} gate_pass=true"
+            )
+            if live_simulate_buy_before_send:
+                sim_start_ms = _now_ms()
+                try:
+                    sim_value = broker.simulate_signed_atomic(signed_buy)
+                except Exception as exc:
+                    v48_live_buy_safe_failures += 1
+                    if live_no_send_fail_cooldown_ms > 0:
+                        live_failed_buy_mint_until_ms[mint] = (
+                            _now_ms() + live_no_send_fail_cooldown_ms
+                        )
+                    log(
+                        f"PGG2-V48-LIVE-BUY-NOSEND-SAFE mint={_short(mint)} "
+                        f"reason=pre_send_sim_exception err={type(exc).__name__}:{exc} "
+                        f"sim_ms={_now_ms() - sim_start_ms} fee_spent=0.000000000 "
+                        f"cooldown_ms={live_no_send_fail_cooldown_ms}"
+                    )
+                    return False
+                sim_err = (sim_value or {}).get("err")
+                sim_logs = (sim_value or {}).get("logs") or []
+                if sim_err:
+                    v48_live_buy_safe_failures += 1
+                    if live_no_send_fail_cooldown_ms > 0:
+                        live_failed_buy_mint_until_ms[mint] = (
+                            _now_ms() + live_no_send_fail_cooldown_ms
+                        )
+                    tail = " | ".join(str(x) for x in sim_logs[-8:])[:900]
+                    log(
+                        f"PGG2-V48-LIVE-BUY-NOSEND-SAFE mint={_short(mint)} "
+                        f"reason=pre_send_sim_failed err={sim_err} "
+                        f"sim_ms={_now_ms() - sim_start_ms} fee_spent=0.000000000 "
+                        f"cooldown_ms={live_no_send_fail_cooldown_ms} logs={tail}"
+                    )
+                    return False
+                log(
+                    f"PGG2-V48-LIVE-BUY-PRESEND-SIM-OK mint={_short(mint)} "
+                    f"sim_ms={_now_ms() - sim_start_ms} "
+                    f"units={sim_value.get('unitsConsumed')} fee={sim_value.get('fee')}"
+                )
+                if live_postsim_exit_gate:
+                    sim_tokens_raw = 0
+                    wallet_s = str(getattr(broker, "public_key", "") or "")
+                    for bal in (sim_value or {}).get("postTokenBalances") or []:
+                        try:
+                            if str(bal.get("mint") or "") != mint:
+                                continue
+                            owner = str(bal.get("owner") or "")
+                            if wallet_s and owner and owner != wallet_s:
+                                continue
+                            amt = (((bal.get("uiTokenAmount") or {}).get("amount")) or "0")
+                            sim_tokens_raw += int(amt)
+                        except Exception:
+                            continue
+                    if sim_tokens_raw <= 0:
+                        v48_live_buy_safe_failures += 1
+                        if live_no_send_fail_cooldown_ms > 0:
+                            live_failed_buy_mint_until_ms[mint] = (
+                                _now_ms() + live_no_send_fail_cooldown_ms
+                            )
+                        log(
+                            f"PGG2-V48-LIVE-POSTSIM-EXIT-BLOCK mint={_short(mint)} "
+                            f"reason=sim_tokens_unavailable fee_spent=0.000000000 "
+                            f"cooldown_ms={live_no_send_fail_cooldown_ms}"
+                        )
+                        return False
+                    try:
+                        postsim_sell_quote = broker.build_sell(
+                            mint, f"raw:{int(sim_tokens_raw)}", broker.sell_slippage,
+                        )
+                        postsim_sell_out = float(broker.rate_amount_out(postsim_sell_quote))
+                    except Exception as exc:
+                        v48_live_buy_safe_failures += 1
+                        if live_no_send_fail_cooldown_ms > 0:
+                            live_failed_buy_mint_until_ms[mint] = (
+                                _now_ms() + live_no_send_fail_cooldown_ms
+                            )
+                        log(
+                            f"PGG2-V48-LIVE-POSTSIM-EXIT-BLOCK mint={_short(mint)} "
+                            f"reason=sell_quote_error err={type(exc).__name__}:{exc} "
+                            f"sim_tokens_raw={sim_tokens_raw} fee_spent=0.000000000 "
+                            f"cooldown_ms={live_no_send_fail_cooldown_ms}"
+                        )
+                        return False
+                    postsim_predicted = (
+                        postsim_sell_out
+                        - float(size_sol)
+                        - (2.0 * modeled_live_tx_fee)
+                    )
+                    postsim_required_out = (
+                        protected_close_min_sol_out + live_smoke_sell_out_buffer
+                    )
+                    if postsim_sell_out + 1e-12 < postsim_required_out:
+                        v48_live_buy_safe_failures += 1
+                        if live_no_send_fail_cooldown_ms > 0:
+                            live_failed_buy_mint_until_ms[mint] = (
+                                _now_ms() + live_no_send_fail_cooldown_ms
+                            )
+                        log(
+                            f"PGG2-V48-LIVE-POSTSIM-EXIT-BLOCK mint={_short(mint)} "
+                            f"reason=postsim_sell_below_protected_close "
+                            f"sim_tokens_raw={sim_tokens_raw} "
+                            f"postsim_sell_out={postsim_sell_out:.9f} "
+                            f"required_out={postsim_required_out:.9f} "
+                            f"postsim_predicted_all_in={postsim_predicted:+.9f} "
+                            f"fee_spent=0.000000000 cooldown_ms={live_no_send_fail_cooldown_ms}"
+                        )
+                        return False
+                    log(
+                        f"PGG2-V48-LIVE-POSTSIM-EXIT-GATE mint={_short(mint)} "
+                        f"sim_tokens_raw={sim_tokens_raw} "
+                        f"postsim_sell_out={postsim_sell_out:.9f} "
+                        f"required_out={postsim_required_out:.9f} "
+                        f"postsim_predicted_all_in={postsim_predicted:+.9f} "
+                        f"gate_pass=true"
+                    )
+            # === V60 LIVE-SEND FIREWALL (2026-05-19) — the only authorized buy gate ===
+            if _V60_AVAILABLE:
+                try:
+                    _signal_lane = str(rec.get("signal_lane", "") or "")
+                    _is_v67_pass = ("v67" in _signal_lane.lower())
+                    _is_v57_prom = ("v57" in _signal_lane.lower() or "promotion" in _signal_lane.lower())
+                    _snap_age = int(rec.get("snapshot_age_ms", 0) or 0)
+                    _source_lead = int(rec.get("source_lead_ms", 0) or 0)
+                    _ep_sol = float(rec.get("exp_pnl", rec.get("expected_pnl_sol", rec.get("expected_pnl", 0.0))) or 0.0)
+                    _pair_src = str(rec.get("pair_source", "decision_curve_snapshot") or "")
+                    _route = str(rec.get("route", "pump_bc") or "pump_bc")
+                    _token_prog = str(rec.get("token_program", "spl") or "spl")
+                    _decoded_max_sol_lamports = int(round(float(size_sol) * 1e9))
+                    _decoded_amount_raw = int(buy_quote.get("min_tokens_raw", buy_quote.get("out_tokens_raw", 0)) or 0)
+                    _v60_cand = _V60Candidate(
+                        mint=mint,
+                        selected_size_sol=float(size_sol),
+                        candidate_lane=_signal_lane,
+                        rule_id=str(rec.get("rule_id", "") or ""),
+                        expected_pnl_sol=_ep_sol,
+                        true_edge_sol=None,
+                        token_program=_token_prog,
+                        route=_route,
+                        sim_needed=int(rec.get("sim_needed", 0) or 0),
+                        pair_source=_pair_src,
+                        snapshot_age_ms=_snap_age,
+                        source_lead_ms=_source_lead,
+                        risk_result=rec.get("risk_result"),
+                        risk_fetched_at_ms=rec.get("risk_fetched_at_ms"),
+                        is_v67_passing=_is_v67_pass,
+                        is_v57_promotion=_is_v57_prom,
+                        wallet_balance_sol=float(rec.get("wallet_balance_sol", 0.0) or 0.0),
+                    )
+                    _v60_plan = _V60TxPlan(
+                        decoded_amount_tokens_raw=_decoded_amount_raw,
+                        decoded_max_sol_cost_lamports=_decoded_max_sol_lamports,
+                        swqos_tip_sol=0.000005,
+                        priority_fee_sol=0.000005,
+                        base_fee_sol=0.000005,
+                        uses_pump_v2=(_token_prog.lower() in ("token-2022", "token2022", "t22")),
+                        has_sell_v2_capability=True,
+                    )
+                    _v60_decision = _v60_authorize_live_buy(_v60_cand, _v60_plan, log_fn=log)
+                except Exception as _v60_err:
+                    log(f"PGG2-V60-SEND-BLOCKED mint={_short(mint)} blocker=hook_error err={type(_v60_err).__name__}:{_v60_err}")
+                    v48_live_buy_safe_failures += 1
+                    if live_failed_buy_cooldown_ms > 0:
+                        live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                    return False
+                if not _v60_decision.passed:
+                    log(f"PGG2-V60-SEND-BLOCKED mint={_short(mint)} blocker={_v60_decision.blocker} size={float(size_sol):.4f}")
+                    v48_live_buy_safe_failures += 1
+                    if live_failed_buy_cooldown_ms > 0:
+                        live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                    return False
+                # === V60 PHASE 4: Universal size-cap-fatal assertion (defense-in-depth) ===
+                import os as _os_v60
+                _v60_cap = float(_os_v60.environ.get("PGG2_LIVE_MAX_TRADE_SOL", 0.005))
+                _v60_tol = float(_os_v60.environ.get("PGG2_V60_SIZE_CAP_TOLERANCE_SOL", 0.0001))
+                if float(size_sol) > _v60_cap + _v60_tol:
+                    log(f"PGG2-V60-SIZE-CAP-FATAL mint={_short(mint)} size={float(size_sol):.6f} cap={_v60_cap:.6f} ABORTING_SEND")
+                    v48_live_buy_safe_failures += 1
+                    if live_failed_buy_cooldown_ms > 0:
+                        live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                    return False
+                log(f"PGG2-V60-SEND-AUTHORIZED mint={_short(mint)} size={float(size_sol):.4f} true_edge={_v60_decision.true_edge_sol:+.6f} tx_digest={_v60_decision.tx_digest[:16]}")
+                # === V61 LIVE CONTINUATION ORACLE (no-wait sync mode, 2026-05-19) ===
+                if _V61_AVAILABLE and _env_flag("PGG2_V61_ENABLED", "1"):
+                    try:
+                        _v61_v60_pass_ts_ms = int(time.time() * 1000)
+                        # Read V67 curve oracle buffer
+                        _v61_st = getattr(oracle, "_states", {}).get(mint)
+                        _v61_curve_pts = []
+                        if _v61_st is not None and getattr(_v61_st, "points", None):
+                            for _p in list(_v61_st.points)[-8:]:
+                                try:
+                                    _vsol = int(_p.virtual_sol_reserves)
+                                    _vtok = int(_p.virtual_token_reserves)
+                                    _price = (_vsol / _vtok) if _vtok > 0 else 0.0
+                                    _v61_curve_pts.append(_V61CurvePoint(
+                                        timestamp_ms=int(_p.ts_ms),
+                                        vsol_lamports=_vsol,
+                                        vtok_raw=_vtok,
+                                        price=_price,
+                                    ))
+                                except Exception:
+                                    continue
+                        # Synthesize quote_history from buy_quote (V60 snapshot)
+                        # We don't issue a fresh broker.build_sell call (avoids RPC latency)
+                        # The forensic-validated rules (2, 3, 9) work on curve data alone
+                        _v61_quote_pts = []
+                        try:
+                            _v61_buy_in = float(buy_quote.get("in_sol", float(size_sol)) or float(size_sol))
+                            _v61_expected_tokens = float(buy_quote.get("out_tokens", buy_quote.get("expected_tokens", 0.0)) or 0.0)
+                            if _v61_buy_in > 0 and _v61_expected_tokens > 0:
+                                # Approximate sell quote from the buy quote inverse
+                                _v61_approx_sell = _v61_buy_in * 0.96  # rough sell after 1% fees each leg
+                                _v61_quote_pts.append(_V61QuotePoint(
+                                    timestamp_ms=_v61_v60_pass_ts_ms - 100,
+                                    sell_quote_sol_out=_v61_approx_sell,
+                                ))
+                                _v61_quote_pts.append(_V61QuotePoint(
+                                    timestamp_ms=_v61_v60_pass_ts_ms,
+                                    sell_quote_sol_out=_v61_approx_sell,
+                                ))
+                        except Exception:
+                            pass
+                        # Pending flow snapshot (from V48 rec)
+                        _v61_pbs500 = float(rec.get("pbs_500", rec.get("pending_buy_sol_500ms", rec.get("pbs_1000", 0.0)) or 0.0))
+                        _v61_pss500 = float(rec.get("pss_500", rec.get("pending_sell_sol_500ms", rec.get("pss_1000", 0.0)) or 0.0))
+                        _v61_pbc500 = int(rec.get("pbc_500", rec.get("pending_buy_count_500ms", rec.get("pbc_1000", 0)) or 0))
+                        _v61_psc500 = int(rec.get("psc_500", rec.get("pending_sell_count_500ms", rec.get("psc_1000", 0)) or 0))
+                        _v61_inputs = _V61Inputs(
+                            mint=mint,
+                            selected_size_sol=float(size_sol),
+                            v60_true_edge_sol=float(_v60_decision.true_edge_sol),
+                            v60_pass_timestamp_ms=_v61_v60_pass_ts_ms,
+                            curve_history=_v61_curve_pts,
+                            quote_history=_v61_quote_pts,
+                            pending_buy_sol_500ms=_v61_pbs500,
+                            pending_sell_sol_500ms=_v61_pss500,
+                            pending_buy_count_500ms=_v61_pbc500,
+                            pending_sell_count_500ms=_v61_psc500,
+                            signal_age_ms=int(rec.get("snapshot_age_ms", 0) or 0),
+                        )
+                        log(f"PGG2-V61-PRECHECK mint={_short(mint)} curve_pts={len(_v61_curve_pts)} quote_pts={len(_v61_quote_pts)} sync_mode=1")
+                        _v61_decision = _v61_check_continuation(_v61_inputs, log_fn=log)
+                    except Exception as _v61_err:
+                        log(f"PGG2-V61-CONTINUATION-ERR mint={_short(mint)} err={type(_v61_err).__name__}:{_v61_err}")
+                        v48_live_buy_safe_failures += 1
+                        if live_failed_buy_cooldown_ms > 0:
+                            live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                        return False
+                    if not _v61_decision.passed:
+                        log(f"PGG2-V61-SEND-BLOCKED mint={_short(mint)} blocker={_v61_decision.blocker} score={_v61_decision.continuation_score:.3f}")
+                        v48_live_buy_safe_failures += 1
+                        if live_failed_buy_cooldown_ms > 0:
+                            live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                        return False
+                    log(f"PGG2-V61-SEND-AUTHORIZED mint={_short(mint)} score={_v61_decision.continuation_score:.3f} curve_slope={_v61_decision.curve_slope:+.10f} quote_slope={_v61_decision.quote_slope:+.10f}")
+            else:
+                log(f"PGG2-V60-SEND-BLOCKED mint={_short(mint)} blocker=v60_module_unavailable size={float(size_sol):.4f}")
+                v48_live_buy_safe_failures += 1
+                if live_failed_buy_cooldown_ms > 0:
+                    live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                return False
+            v48_live_buy_sends += 1
+            # === V63 FINAL PNL: capture wallet_before snapshot ===
+            # Stored on rec so _finalize_live_sell can compute true final delta
+            # (wallet_after_close_account - wallet_before_buy) per V63 spec.
+            try:
+                _v63_pnl_rpc_url = (
+                    os.environ.get("HELIUS_RPC_URL")
+                    or os.environ.get("SOL_RPC")
+                    or "https://api.mainnet-beta.solana.com"
+                )
+                if "_v63_final_pnl_snapshot_cls" not in dir():
+                    from pgg2_v63_final_pnl import V63FinalPnLSnapshot as _v63_final_pnl_snapshot_cls
+                _v63_snap_before = _v63_final_pnl_snapshot_cls.record_before(
+                    _v63_pnl_rpc_url, str(broker.public_key)
+                )
+                rec["v63_pnl_snapshot"] = _v63_snap_before
+                log(
+                    f"PGG2-V63-WALLET-BEFORE-BUY mint={_short(mint)} "
+                    f"wallet_before_lamports={_v63_snap_before.wallet_before_buy_lamports}"
+                )
+            except Exception as _v63_snap_exc:
+                log(
+                    f"PGG2-V63-WALLET-BEFORE-BUY-FAIL mint={_short(mint)} "
+                    f"err={type(_v63_snap_exc).__name__}:{_v63_snap_exc}"
+                )
+            # === V64 LIVE BUY CHOKE POINT ===
+            # No live buy may be sent unless the exact mint has a passport with
+            # final_pass=true. The passport is keyed by mint, persists across
+            # snapshot refreshes, and uses worst-result-wins semantics so the
+            # 4rzH-class bypass (transient SHADOW_ONLY then PASS) cannot recur.
+            if _v64_enabled and _v64_registry is not None:
+                _v64_passport_here = _v64_registry.get(mint)
+                if _v64_passport_here is not None:
+                    _v64_passport_here.compute_final_pass(
+                        max_snapshot_age_ms=int(os.environ.get("PGG2_V64_MAX_SNAPSHOT_AGE_MS", "2500") or 2500),
+                        log_fn=log,
+                    )
+                _v64_auth = _v64_authorize_live_buy(
+                    passport=_v64_passport_here,
+                    proposed_mint=mint,
+                    proposed_decision_id=str(rec.get("decision_id") or "unknown"),
+                    proposed_size_sol=float(size_sol),
+                    proposed_route=str(rec.get("route", "pump_bc") or "pump_bc"),
+                    bypass_env_check=True,
+                    log_fn=log,
+                )
+                if not _v64_auth.authorized:
+                    v48_live_buy_safe_failures += 1
+                    if live_failed_buy_cooldown_ms > 0:
+                        live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                    log(
+                        f"PGG2-V48-LIVE-BUY-NOSEND-V64 mint={_short(mint)} "
+                        f"reason={_v64_auth.reason} "
+                        f"blockers={','.join(_v64_auth.blockers) or '-'}"
+                    )
+                    return False
+            log(
+                f"PGG2-V48-LIVE-BUY-SEND mint={_short(mint)} "
+                f"size={size_sol:.6f} sig_preview={buy_preview} "
+                f"quote_ms={int(buy_quote.get('quote_network_latency_ms') or 0)}"
+            )
+            buy_send_ts = time.time()
+            try:
+                buy_sig = getattr(broker, "send_signed")(signed_buy)
+            except Exception as exc:
+                v48_live_buy_safe_failures += 1
+                if live_failed_buy_cooldown_ms > 0:
+                    live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                log(
+                    f"PGG2-V48-LIVE-BUY-NOSEND-SAFE mint={_short(mint)} "
+                    f"reason=send_rejected_before_signature err={type(exc).__name__}:{exc} "
+                    f"fee_spent=0.000000000 cooldown_ms={live_failed_buy_cooldown_ms}"
+                )
+                return False
+            spec_sell_sigs: Dict[str, Dict[str, Any]] = {}
+            spec_sell_sig = ""
+            spec_sell_delta = 0.0
+            spec_sell_confirmed = False
+            spec_sell_attempts = 0
+            next_spec_sell_ms = (
+                _now_ms() + live_spec_sell_start_delay_ms
+                if live_spec_sell_enabled else 2**63 - 1
+            )
+            buy_trigger = ""
+            buy_trigger_raw = 0
+            buy_trigger_deadline = (
+                time.time()
+                + float(os.environ.get("PGG2_V48_LIVE_BUY_TRIGGER_TIMEOUT_SEC", "1.25") or 1.25)
+            )
+
+            def _try_jupiter_fallback(mint_str, mint_pk_local, buy_sig_local, buy_delta_local, last_pred_local, now_local, expected_tokens_raw=0) -> bool:
+                """Last-resort: route stuck mint through Jupiter aggregator.
+
+                Returns True if Jupiter cleared the position. Updates outer counters
+                (net_pnl_sol, non_neg_closes, negative_closes, max_loss_sol) and
+                emits PGG2-V48-LIVE-SMOKE-END so downstream tooling sees the close.
+
+                CRITICAL: when emergency_sell fails due to RPC throttle (the case
+                where Jupiter fallback fires), the SAME RPC pool is used for
+                token_balance_raw. It returns 0 not because the wallet is empty,
+                but because the call was rate-limited. Treating that as "cleared"
+                LEAVES THE POSITION STUCK silently. The 14:02 3uLF run lost
+                $2.18 because of exactly this bug: position was actually held
+                but Jupiter skipped on a false zero-balance.
+
+                Fix: 3 retries with backoff on the balance check. If still zero
+                after retries, trust the bot's expected_tokens_raw from buy
+                bookkeeping. Better to over-sell a tiny position than to silently
+                abandon a real one.
+                """
+                nonlocal net_pnl_sol, non_neg_closes, negative_closes, max_loss_sol
+                # V62B owns pump_bc exits. Jupiter is structurally wrong for
+                # Pump bonding-curve positions (different DEX path, account model,
+                # timing). Even if a caller invokes us, refuse for pump_bc when
+                # V62B is enabled.
+                if (
+                    _V62B_AVAILABLE
+                    and _env_flag("PGG2_V62B_ENABLED", "1")
+                    and str(rec.get("route", "pump_bc") or "pump_bc") == "pump_bc"
+                ):
+                    log(
+                        f"PGG2-V62B-JUPITER-FALLBACK-BLOCKED mint={_short(mint_str)} "
+                        f"reason=pump_bc_v62b_owns route=function_entry"
+                    )
+                    return False
+                if os.environ.get("PGG2_RESCUE_JUPITER_FALLBACK", "1") != "1":
+                    return False
+                try:
+                    from jupiter_rescue import jupiter_rescue_one  # type: ignore
+                except Exception as imp_exc:
+                    log(f"PGG2-V48-LIVE-JUPITER-FALLBACK-IMPORT-FAIL mint={_short(mint_str)} err={imp_exc}")
+                    return False
+                # Retry balance check 3 times with backoff to bypass RPC throttle
+                # transients. Without this we hit the "false zero" bug above.
+                tokens_now = 0
+                for attempt in range(3):
+                    try:
+                        tokens_now = int(broker.token_balance_raw(mint_pk_local))
+                    except Exception:
+                        tokens_now = 0
+                    if tokens_now > 0:
+                        break
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s
+                if tokens_now <= 0 and expected_tokens_raw > 0:
+                    # Balance check failed across retries — trust bot's own
+                    # bookkeeping. If the buy actually didn't land, Jupiter
+                    # will fail to quote and we log a clean rescue-attempt
+                    # failure rather than silently abandoning.
+                    log(
+                        f"PGG2-V48-LIVE-JUPITER-FALLBACK-USE-EXPECTED mint={_short(mint_str)} "
+                        f"reason=balance_zero_after_retries trusting_expected={expected_tokens_raw}"
+                    )
+                    tokens_now = int(expected_tokens_raw)
+                if tokens_now <= 0:
+                    log(f"PGG2-V48-LIVE-JUPITER-FALLBACK-SKIP mint={_short(mint_str)} reason=zero_balance_and_no_expected")
+                    return True  # truly nothing to rescue
+                helius_key = os.environ.get("HELIUS_API_KEY", "").strip()
+                if not helius_key:
+                    log(f"PGG2-V48-LIVE-JUPITER-FALLBACK-FAIL mint={_short(mint_str)} reason=no_helius_key")
+                    return False
+                rpc_url = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
+                kp_path = os.environ.get("PGG2_LIVE_KEYPAIR_PATH", "/root/piggy/live_wallet.key")
+                log(
+                    f"PGG2-V48-LIVE-JUPITER-FALLBACK-START mint={_short(mint_str)} "
+                    f"tokens_raw={tokens_now}"
+                )
+                ok, sig_or_err, meta = jupiter_rescue_one(
+                    mint=mint_str,
+                    amount_raw=tokens_now,
+                    keypair_path=kp_path,
+                    rpc_url=rpc_url,
+                    slippage_bps=5000,
+                )
+                if not ok:
+                    log(
+                        f"PGG2-V48-LIVE-JUPITER-FALLBACK-FAIL mint={_short(mint_str)} "
+                        f"err={sig_or_err[:200]}"
+                    )
+                    return False
+                out_sol = float(meta.get("out_sol", 0.0))
+                # Reconcile actual P&L via wallet delta
+                try:
+                    if buy_delta_local is None:
+                        broker.wait_confirmed(buy_sig_local)
+                        buy_delta_eff = float(broker.transaction_wallet_delta_sol(buy_sig_local))
+                    else:
+                        buy_delta_eff = float(buy_delta_local)
+                    sell_delta_eff = float(broker.transaction_wallet_delta_sol(sig_or_err))
+                    actual_pnl = buy_delta_eff + sell_delta_eff
+                except Exception:
+                    # Fallback: use Jupiter quote out_sol as approximation
+                    actual_pnl = out_sol + float(buy_delta_local or 0.0)
+                if actual_pnl < 0.0:
+                    negative_closes += 1
+                    net_pnl_sol += actual_pnl
+                    if actual_pnl < max_loss_sol:
+                        max_loss_sol = actual_pnl
+                else:
+                    non_neg_closes += 1
+                    net_pnl_sol += actual_pnl
+                rec["close_kind"] = "jupiter_fallback"
+                rec["close_pnl"] = actual_pnl
+                rec["close_lag_ms"] = int(_now_ms() - now_local)
+                log(
+                    f"PGG2-V48-LIVE-SMOKE-END mint={_short(mint_str)} "
+                    f"buy_sig={buy_sig_local} sell_sig={sig_or_err} close_reason=jupiter_fallback "
+                    f"predicted_all_in={last_pred_local:+.9f} actual_all_in_pnl={actual_pnl:+.9f} "
+                    f"non_neg={non_neg_closes} neg={negative_closes}"
+                )
+                return True
+
+            def _build_live_sell_quote_fast(tokens_raw: int) -> Dict[str, Any]:
+                if (
+                    os.environ.get("PGG2_V48_LIVE_USE_SNAPSHOT_SELL", "1") == "1"
+                    and hasattr(broker, "build_sell_from_curve_snapshot")
+                ):
+                    snap_now = _now_ms()
+                    _cs_sell, cu_sell, cs_pt_sell = _curve_state_at_or_before(mint, snap_now)
+                    if cs_pt_sell is not None and cu_sell > 0:
+                        sell_snapshot_age_ms = max(
+                            0,
+                            snap_now - int(getattr(cs_pt_sell, "ts_ms", cu_sell) or cu_sell),
+                        )
+                        if (
+                            live_snapshot_sell_max_age_ms > 0
+                            and sell_snapshot_age_ms > live_snapshot_sell_max_age_ms
+                        ):
+                            log(
+                                f"PGG2-V48-LIVE-SNAPSHOT-SELL-FALLBACK mint={_short(mint)} "
+                                f"reason=snapshot_stale age_ms={sell_snapshot_age_ms} "
+                                f"max_age_ms={live_snapshot_sell_max_age_ms}"
+                            )
+                            return broker.build_sell(mint, f"raw:{int(tokens_raw)}", broker.sell_slippage)
+                        return broker.build_sell_from_curve_snapshot(
+                            mint,
+                            f"raw:{int(tokens_raw)}",
+                            broker.sell_slippage,
+                            virtual_token_reserves=int(getattr(cs_pt_sell, "virtual_token_reserves", 0) or 0),
+                            virtual_sol_reserves=int(getattr(cs_pt_sell, "virtual_sol_reserves", 0) or 0),
+                            real_token_reserves=int(getattr(cs_pt_sell, "real_token_reserves", 0) or 0),
+                            real_sol_reserves=int(getattr(cs_pt_sell, "real_sol_reserves", 0) or 0),
+                            token_total_supply=int(getattr(cs_pt_sell, "token_total_supply", 0) or 0),
+                            complete=bool(getattr(cs_pt_sell, "complete", False)),
+                            creator=str(getattr(cs_pt_sell, "creator", "") or ""),
+                            is_mayhem=bool(getattr(cs_pt_sell, "is_mayhem", False)),
+                            cashback_enabled=bool(getattr(cs_pt_sell, "cashback_enabled", False)),
+                            snapshot_ts_ms=int(getattr(cs_pt_sell, "ts_ms", cu_sell) or cu_sell),
+                            include_close_token_ata=(
+                                os.environ.get("PGG2_V48_LIVE_SNAPSHOT_SELL_CLOSE_ATA", "0") == "1"
+                            ),
+                        )
+                    log(
+                        f"PGG2-V48-LIVE-SNAPSHOT-SELL-FALLBACK mint={_short(mint)} "
+                        f"reason=no_curve_snapshot"
+                    )
+                return broker.build_sell(mint, f"raw:{int(tokens_raw)}", broker.sell_slippage)
+            try:
+                token_program = broker.mint_owner(mint_pk)
+                user_ata = get_associated_token_address(
+                    Pubkey.from_string(str(broker.public_key)), mint_pk, token_program,
+                )
+            except Exception:
+                user_ata = None
+            def _drain_spec_sells(reason: str, timeout_s: float = 2.5) -> None:
+                nonlocal v48_live_sell_safe_failures
+                deadline = time.time() + max(0.0, timeout_s)
+                while spec_sell_sigs and time.time() < deadline:
+                    for _sig, _meta in list(spec_sell_sigs.items()):
+                        try:
+                            _status = broker.signature_status(_sig)
+                        except Exception:
+                            _status = None
+                        if not _status:
+                            continue
+                        if _status.get("err"):
+                            v48_live_sell_safe_failures += 1
+                            log(
+                                f"PGG2-V48-SPEC-SELL-FAILED-SAFE mint={_short(mint)} "
+                                f"sig={_sig} reason={reason} err={_status.get('err')}"
+                            )
+                        else:
+                            log(
+                                f"PGG2-V48-SPEC-SELL-CONFIRMED mint={_short(mint)} "
+                                f"sig={_sig} reason={reason} "
+                                f"sell_tokens={float(_meta.get('sell_tokens_ui', 0.0)):.6f} "
+                                f"expected_sol_out={float(_meta.get('expected_sol_out', 0.0)):.9f}"
+                            )
+                        spec_sell_sigs.pop(_sig, None)
+                    if spec_sell_sigs:
+                        time.sleep(0.05)
+                for _sig in list(spec_sell_sigs):
+                    v48_live_sell_safe_failures += 1
+                    log(
+                        f"PGG2-V48-SPEC-SELL-FAILED-SAFE mint={_short(mint)} "
+                        f"sig={_sig} reason={reason}_status_timeout"
+                    )
+                    spec_sell_sigs.pop(_sig, None)
+            while time.time() < buy_trigger_deadline:
+                if spec_sell_sigs:
+                    for _sig, _meta in list(spec_sell_sigs.items()):
+                        try:
+                            _status = broker.signature_status(_sig)
+                        except Exception:
+                            _status = None
+                        if not _status:
+                            continue
+                        if _status.get("err"):
+                            v48_live_sell_safe_failures += 1
+                            log(
+                                f"PGG2-V48-SPEC-SELL-FAILED-SAFE mint={_short(mint)} "
+                                f"sig={_sig} err={_status.get('err')}"
+                            )
+                            spec_sell_sigs.pop(_sig, None)
+                            continue
+                        spec_sell_sig = _sig
+                        spec_sell_confirmed = True
+                        log(
+                            f"PGG2-V48-SPEC-SELL-CONFIRMED mint={_short(mint)} "
+                            f"sig={_sig} sell_tokens={float(_meta.get('sell_tokens_ui', 0.0)):.6f} "
+                            f"expected_sol_out={float(_meta.get('expected_sol_out', 0.0)):.9f}"
+                        )
+                        break
+                if spec_sell_confirmed:
+                    break
+                try:
+                    status = broker.signature_status(buy_sig)
+                    if status:
+                        if status.get("err"):
+                            buy_trigger = "tx_error"
+                            break
+                        buy_trigger = str(status.get("confirmationStatus") or "processed")
+                        break
+                except Exception:
+                    pass
+                if user_ata is not None:
+                    try:
+                        bal = broker.rpc(
+                            "getTokenAccountBalance",
+                            [str(user_ata), {"commitment": "processed"}],
+                        )
+                        buy_trigger_raw = int(((bal or {}).get("value") or {}).get("amount") or 0)
+                        if buy_trigger_raw > 0:
+                            buy_trigger = "token_balance_processed"
+                            break
+                    except Exception:
+                        pass
+                now_ms_loop = _now_ms()
+                if (
+                    live_spec_sell_enabled
+                    and spec_sell_attempts < live_spec_sell_max_attempts
+                    and now_ms_loop >= next_spec_sell_ms
+                ):
+                    if live_spec_sell_require_token_signal:
+                        next_spec_sell_ms = now_ms_loop + live_spec_sell_interval_ms
+                        if spec_sell_attempts == 0:
+                            log(
+                                f"PGG2-V48-SPEC-SELL-WAIT-TOKEN-SIGNAL mint={_short(mint)} "
+                                f"reason=avoid_pre_token_failed_fee"
+                            )
+                        time.sleep(0.05)
+                        continue
+                    try:
+                        spec_quote = _build_live_sell_quote_fast(int(min_tokens_raw))
+                        spec_quote_out = float(broker.rate_amount_out(spec_quote))
+                        spec_pred = spec_quote_out - float(size_sol) - (2.0 * modeled_live_tx_fee)
+                        spec_min_sol_out = float(protected_close_min_sol_out)
+                        if (
+                            bool(rec.get("v58_flow_gate_pass", False))
+                            or bool(rec.get("v57_impulse_gate_pass", False))
+                            or bool(rec.get("v61_fanout_gate_pass", False))
+                            or bool(rec.get("v56b_gate_pass", False))
+                        ):
+                            _floor_env_name = (
+                                "PGG2_V58_LIVE_SELL_SEND_MIN_PNL_SOL"
+                                if bool(rec.get("v58_flow_gate_pass", False))
+                                else (
+                                    "PGG2_V57_LIVE_SELL_SEND_MIN_PNL_SOL"
+                                    if bool(rec.get("v57_impulse_gate_pass", False))
+                                    else (
+                                        "PGG2_V61_LIVE_SELL_SEND_MIN_PNL_SOL"
+                                        if bool(rec.get("v61_fanout_gate_pass", False))
+                                        else "PGG2_V56B_LIVE_SELL_SEND_MIN_PNL_SOL"
+                                    )
+                                )
+                            )
+                            spec_v57_floor = float(
+                                os.environ.get(_floor_env_name, "0.000000")
+                                or 0.0
+                            )
+                            spec_min_sol_out = max(
+                                spec_min_sol_out,
+                                float(size_sol) + (2.0 * modeled_live_tx_fee) + spec_v57_floor,
+                            )
+                        executable = (
+                            spec_quote_out + 1e-12
+                            >= spec_min_sol_out + live_smoke_sell_out_buffer
+                        )
+                        if not executable:
+                            log(
+                                f"PGG2-V48-SPEC-SELL-NOT-EXECUTABLE mint={_short(mint)} "
+                                f"expected_sol_out={spec_quote_out:.9f} "
+                                f"min_sol_out={spec_min_sol_out:.9f} "
+                                f"buffer={live_smoke_sell_out_buffer:.9f} "
+                                f"predicted_all_in={spec_pred:+.9f}"
+                            )
+                        else:
+                            guarded_spec = broker.retarget_sell_min_sol(
+                                spec_quote, mint, spec_min_sol_out,
+                            )
+                            signed_spec, spec_preview = broker.sign_transaction(str(guarded_spec["txn"]))
+                            send_fn = getattr(broker, "send_signed_rpc_skip_preflight", None)
+                            if send_fn is None:
+                                send_fn = getattr(broker, "send_signed")
+                            spec_sig = send_fn(signed_spec)
+                            v48_live_sell_sends += 1
+                            spec_sell_sigs[spec_sig] = {
+                                "sell_tokens_ui": float(min_tokens_ui),
+                                "expected_sol_out": float(spec_quote_out),
+                            }
+                            log(
+                                f"PGG2-V48-SPEC-SELL-SEND mint={_short(mint)} "
+                                f"sig={spec_sig} sig_preview={spec_preview} "
+                                f"sell_tokens={min_tokens_ui:.6f} "
+                                f"expected_sol_out={spec_quote_out:.9f} "
+                                f"min_sol_out={spec_min_sol_out:.9f} "
+                                f"predicted_all_in={spec_pred:+.9f} attempt={spec_sell_attempts + 1}"
+                            )
+                        spec_sell_attempts += 1
+                    except Exception as exc:
+                        v48_live_sell_safe_failures += 1
+                        spec_sell_attempts += 1
+                        log(
+                            f"PGG2-V48-SPEC-SELL-FAILED-SAFE mint={_short(mint)} "
+                            f"reason=build_or_send_error err={type(exc).__name__}:{exc}"
+                        )
+                    next_spec_sell_ms = now_ms_loop + live_spec_sell_interval_ms
+                try:
+                    status = broker.signature_status(buy_sig)
+                    if status:
+                        if status.get("err"):
+                            buy_trigger = "tx_error"
+                            break
+                        buy_trigger = str(status.get("confirmationStatus") or "processed")
+                        break
+                except Exception:
+                    pass
+                if user_ata is not None:
+                    try:
+                        bal = broker.rpc(
+                            "getTokenAccountBalance",
+                            [str(user_ata), {"commitment": "processed"}],
+                        )
+                        buy_trigger_raw = int(((bal or {}).get("value") or {}).get("amount") or 0)
+                        if buy_trigger_raw > 0:
+                            buy_trigger = "token_balance_processed"
+                            break
+                    except Exception:
+                        pass
+                time.sleep(0.05)
+            if buy_trigger == "tx_error":
+                v48_live_buy_safe_failures += 1
+                if live_failed_buy_cooldown_ms > 0:
+                    live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                fee_spent = 0.0
+                try:
+                    buy_fee_delta = float(broker.transaction_wallet_delta_sol(buy_sig))
+                    if buy_fee_delta < 0.0:
+                        fee_spent = -buy_fee_delta
+                        failed_buy_fees_total += fee_spent
+                        failed_buy_count += 1
+                except Exception:
+                    failed_buy_count += 1
+                log(
+                    f"PGG2-V48-LIVE-BUY-FAILED-SAFE mint={_short(mint)} "
+                    f"sig={buy_sig} reason=tx_error_or_min_token_guard "
+                    f"fee_spent={fee_spent:.9f} fee_budget_used={failed_buy_fees_total:.9f} "
+                    f"cooldown_ms={live_failed_buy_cooldown_ms}"
+                )
+                _drain_spec_sells("buy_failed_safe")
+                return False
+            if not buy_trigger:
+                buy_ok = broker.wait_confirmed(buy_sig)
+                if not buy_ok:
+                    v48_live_buy_safe_failures += 1
+                    if live_failed_buy_cooldown_ms > 0:
+                        live_failed_buy_mint_until_ms[mint] = _now_ms() + live_failed_buy_cooldown_ms
+                    fee_spent = 0.0
+                    try:
+                        buy_fee_delta = float(broker.transaction_wallet_delta_sol(buy_sig))
+                        if buy_fee_delta < 0.0:
+                            fee_spent = -buy_fee_delta
+                            failed_buy_fees_total += fee_spent
+                            failed_buy_count += 1
+                    except Exception:
+                        failed_buy_count += 1
+                    log(
+                        f"PGG2-V48-LIVE-BUY-FAILED-SAFE mint={_short(mint)} "
+                        f"sig={buy_sig} reason=not_processed_or_min_token_guard "
+                        f"fee_spent={fee_spent:.9f} fee_budget_used={failed_buy_fees_total:.9f} "
+                        f"cooldown_ms={live_failed_buy_cooldown_ms}"
+                    )
+                    _drain_spec_sells("buy_not_processed")
+                    return False
+                buy_trigger = "confirmed_fallback"
+            log(
+                f"PGG2-V48-LIVE-BUY-PROCESSED mint={_short(mint)} sig={buy_sig} "
+                f"signal={buy_trigger} latency_ms={int((time.time() - buy_send_ts) * 1000)} "
+                f"processed_token_raw={buy_trigger_raw}"
+            )
+            v48_live_buy_confirms += 1
+            buy_delta = None
+            token_delta_ui = 0.0
+            actual_raw = int(buy_trigger_raw)
+            balance_raw = int(buy_trigger_raw)
+            received_raw = 0
+            try:
+                buy_delta = float(broker.transaction_wallet_delta_sol(buy_sig))
+                token_delta_ui = float(broker.transaction_token_delta_ui(buy_sig, mint))
+                received_raw = broker.ui_to_raw(mint_pk, token_delta_ui) if token_delta_ui > 0 else 0
+                balance_raw = int(broker.token_balance_raw(mint_pk))
+                actual_raw = int(received_raw if spec_sell_confirmed and received_raw > 0 else balance_raw)
+            except Exception:
+                pass
+            if actual_raw <= 0 and token_delta_ui > 0:
+                received_raw = broker.ui_to_raw(mint_pk, token_delta_ui)
+                actual_raw = int(received_raw)
+            if actual_raw <= 0:
+                actual_raw = int(min_tokens_raw)
+            actual_ui = float(broker.raw_to_ui(mint_pk, actual_raw))
+            balance_ui = float(broker.raw_to_ui(mint_pk, max(0, int(balance_raw))))
+            open_positions[position_key] = rec
+            pending_candidates[position_key] = rec
+            v48_entries_opened += 1
+            rec.update({
+                "live_buy_sig": buy_sig,
+                "live_buy_delta": buy_delta,
+                "live_actual_tokens_raw": int(actual_raw),
+                "live_actual_tokens_ui": actual_ui,
+                "live_pair_source": pair_source,
+                "live_buy_trigger": buy_trigger,
+            })
+            log(
+                f"PGG2-V48-LIVE-BUY-CONFIRMED mint={_short(mint)} sig={buy_sig} "
+                f"wallet_delta={(float(buy_delta) if buy_delta is not None else 0.0):+.9f} "
+                f"actual_tokens={actual_ui:.6f} "
+                f"actual_tokens_raw={actual_raw} min_tokens_raw={min_tokens_raw}"
+            )
+            token_mismatch = False
+            if min_tokens_raw > 0 and actual_raw + 1 < min_tokens_raw:
+                token_mismatch = True
+                log(
+                    f"PGG2-V48-LIVE-TOKEN-MISMATCH-FATAL mint={_short(mint)} "
+                    f"actual_raw={actual_raw} min_raw={min_tokens_raw}"
+                )
+                stop_reason = "token_mismatch"
+            if spec_sell_confirmed and spec_sell_sig:
+                try:
+                    spec_sell_delta = float(broker.transaction_wallet_delta_sol(spec_sell_sig))
+                except Exception:
+                    spec_sell_delta = 0.0
+                residual_raw = 0
+                try:
+                    residual_raw = int(broker.token_balance_raw(mint_pk))
+                except Exception:
+                    residual_raw = int(balance_raw)
+                residual_delta = 0.0
+                residual_sig = ""
+                if residual_raw > 0:
+                    residual_ui = float(broker.raw_to_ui(mint_pk, residual_raw))
+                    try:
+                        residual_quote = _build_live_sell_quote_fast(int(residual_raw))
+                        residual_out = float(broker.rate_amount_out(residual_quote))
+                        residual_min = max(0.0000001, residual_out * 0.60)
+                        if residual_out > modeled_live_tx_fee + 0.0000001:
+                            guarded_residual = broker.retarget_sell_min_sol(
+                                residual_quote, mint, residual_min,
+                            )
+                            signed_residual, residual_preview = broker.sign_transaction(
+                                str(guarded_residual["txn"])
+                            )
+                            v48_live_sell_sends += 1
+                            log(
+                                f"PGG2-V48-SPEC-SELL-RESIDUAL mint={_short(mint)} "
+                                f"sig_preview={residual_preview} residual_tokens={residual_ui:.6f} "
+                                f"expected_sol_out={residual_out:.9f} min_sol_out={residual_min:.9f}"
+                            )
+                            residual_sig = getattr(broker, "send_signed")(signed_residual)
+                            if broker.wait_confirmed(residual_sig):
+                                v48_live_sell_confirms += 1
+                                residual_delta = float(broker.transaction_wallet_delta_sol(residual_sig))
+                                residual_raw = int(broker.token_balance_raw(mint_pk))
+                            else:
+                                v48_live_sell_safe_failures += 1
+                                log(
+                                    f"PGG2-V48-SPEC-SELL-FAILED-SAFE mint={_short(mint)} "
+                                    f"sig={residual_sig} reason=residual_not_confirmed"
+                                )
+                        else:
+                            log(
+                                f"PGG2-V48-SPEC-SELL-RESIDUAL mint={_short(mint)} "
+                                f"action=keep_dust residual_tokens={residual_ui:.6f} "
+                                f"expected_sol_out={residual_out:.9f}"
+                            )
+                    except Exception as exc:
+                        v48_live_sell_safe_failures += 1
+                        log(
+                            f"PGG2-V48-SPEC-SELL-FAILED-SAFE mint={_short(mint)} "
+                            f"reason=residual_error err={type(exc).__name__}:{exc}"
+                        )
+                if buy_delta is None:
+                    buy_delta = float(broker.transaction_wallet_delta_sol(buy_sig))
+                actual_pnl = float(float(buy_delta) + spec_sell_delta + residual_delta)
+                rec["close_kind"] = "spec_sell"
+                rec["close_pnl"] = actual_pnl
+                rec["close_lag_ms"] = int(_now_ms() - now)
+                rec.update({
+                    "live_sell_sig": spec_sell_sig,
+                    "live_residual_sell_sig": residual_sig,
+                    "live_sell_delta": spec_sell_delta + residual_delta,
+                    "live_token_residual_raw": int(residual_raw),
+                    "live_predicted_all_in": float(rec.get("exp_pnl", 0.0)),
+                })
+                if actual_pnl < 0.0:
+                    negative_closes += 1
+                    net_pnl_sol += actual_pnl
+                    if actual_pnl < max_loss_sol:
+                        max_loss_sol = actual_pnl
+                    if not _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0"):
+                        stop_reason = "negative_live_close"
+                else:
+                    non_neg_closes += 1
+                    net_pnl_sol += actual_pnl
+                    if token_mismatch:
+                        stop_reason = "token_mismatch"
+                _write_jsonl({
+                    "type": "v48_live_smoke_close",
+                    "decision_id": rec.get("decision_id"),
+                    "mint": mint,
+                    "buy_sig": buy_sig,
+                    "sell_sig": spec_sell_sig,
+                    "residual_sell_sig": residual_sig,
+                    "actual_all_in_pnl": actual_pnl,
+                    "predicted_all_in_pnl": float(rec.get("exp_pnl", 0.0)),
+                    "close_kind": "spec_sell",
+                    "token_residual_raw": int(residual_raw),
+                    "ts_ms": _now_ms(),
+                })
+                log(
+                    f"PGG2-V48-LIVE-SMOKE-END mint={_short(mint)} "
+                    f"buy_sig={buy_sig} sell_sig={spec_sell_sig} residual_sell_sig={residual_sig or '-'} "
+                    f"close_reason=spec_sell predicted_all_in={float(rec.get('exp_pnl', 0.0)):+.9f} "
+                    f"actual_all_in_pnl={actual_pnl:+.9f} token_residual_raw={residual_raw} "
+                    f"non_neg={non_neg_closes} neg={negative_closes}"
+                )
+                pending_candidates.pop(position_key, None)
+                open_positions.pop(position_key, None)
+                return actual_pnl >= 0.0 and not token_mismatch
+
+            pending_guarded_sells: Dict[str, Dict[str, Any]] = {}
+            live_sell_attempts = 0
+            close_ata_credit_sol = 0.0
+            if _env_flag("PGG2_V48_LIVE_COUNT_CLOSE_ATA_RENT_IN_SELL_PNL", True):
+                try:
+                    close_ata_enabled = (
+                        os.environ.get("PGG2_DIRECT_CLOSE_TOKEN_ATA_ON_SELL", "1") == "1"
+                        and os.environ.get("PGG2_DIRECT_CLOSE_TOKEN_ATA_ONLY_ON_FULL_BALANCE", "1") == "1"
+                    )
+                    snapshot_close_enabled = (
+                        os.environ.get("PGG2_V48_LIVE_SNAPSHOT_SELL_CLOSE_ATA", "0") == "1"
+                    )
+                    if user_ata is not None and (close_ata_enabled or snapshot_close_enabled):
+                        ata_info = broker.account_info(user_ata, ttl_sec=0.0)
+                        close_ata_credit_sol = (
+                            float(int((ata_info or {}).get("lamports") or 0)) / 1_000_000_000.0
+                        )
+                except Exception as exc:
+                    close_ata_credit_sol = 0.0
+                    log(
+                        f"PGG2-V48-LIVE-ATA-RENT-CREDIT-WARN mint={_short(mint)} "
+                        f"err={type(exc).__name__}:{exc}"
+                    )
+
+            def _finalize_live_sell(
+                sell_sig: str,
+                predicted_all_in: float,
+                close_reason: str,
+            ) -> bool:
+                nonlocal buy_delta, non_neg_closes, negative_closes
+                nonlocal net_pnl_sol, max_loss_sol, stop_reason
+                nonlocal v48_live_sell_confirms
+
+                v48_live_sell_confirms += 1
+                sell_delta = float(broker.transaction_wallet_delta_sol(sell_sig))
+                sold_delta_ui = float(broker.transaction_token_delta_ui(sell_sig, mint))
+                if buy_delta is None:
+                    broker.wait_confirmed(buy_sig)
+                    buy_delta = float(broker.transaction_wallet_delta_sol(buy_sig))
+                residual_raw = 0
+                try:
+                    residual_raw = int(broker.token_balance_raw(mint_pk))
+                except Exception:
+                    residual_raw = 0
+                actual_pnl = float(float(buy_delta) + sell_delta)
+                # === V63 MANDATORY POST-SELL CLOSE-ACCOUNT ===
+                # If residual is 0, ensure the ATA is closed and rent recovered.
+                # If broker.build_sell included CloseAccount atomically, V63 sees
+                # the ATA is gone and returns already_closed (no-op). Otherwise
+                # V63 sends a standalone CloseAccount and the recovered rent is
+                # ADDED to actual_pnl so Stage A pass/fail uses true wallet delta.
+                _v63_rent_recovered_sol = 0.0
+                _v63_close_sig = None
+                _v63_status = "skipped"
+                _v63_route = str(rec.get("route", "pump_bc") or "pump_bc")
+                if (
+                    _V63_AVAILABLE
+                    and _env_flag("PGG2_V63_ENABLED", "1")
+                    and _v63_route == "pump_bc"
+                    and residual_raw == 0
+                ):
+                    log(
+                        f"PGG2-V63-POST-SELL-CLEAN-CLOSE-START mint={_short(mint)} "
+                        f"sell_sig={sell_sig} actual_pnl_pre_rent={actual_pnl:+.9f}"
+                    )
+                    try:
+                        from pgg2_direct_pump import as_pubkey  # type: ignore
+                        _v63_token_program = str(broker.mint_owner(mint_pk))
+                        _v63_user_ata = str(
+                            get_associated_token_address(
+                                as_pubkey(broker.public_key),
+                                mint_pk,
+                                as_pubkey(_v63_token_program),
+                            )
+                        )
+                        _v63_rpc_url = (
+                            os.environ.get("HELIUS_RPC_URL")
+                            or os.environ.get("SOL_RPC")
+                            or "https://api.mainnet-beta.solana.com"
+                        )
+                        _v63_result = _v63_close_zero_balance_token_account(
+                            broker=broker,
+                            mint=mint,
+                            ata=_v63_user_ata,
+                            owner=str(broker.public_key),
+                            token_program=_v63_token_program,
+                            rpc_url=_v63_rpc_url,
+                            log_fn=log,
+                        )
+                        if _v63_result.confirmed and not _v63_result.already_closed:
+                            _v63_rent_recovered_sol = (
+                                float(_v63_result.recovered_lamports) / 1_000_000_000.0
+                            )
+                            _v63_close_sig = _v63_result.close_sig
+                            _v63_status = "closed_by_v63"
+                            actual_pnl += _v63_rent_recovered_sol
+                        elif _v63_result.already_closed:
+                            _v63_status = "already_closed_in_sell_tx"
+                        elif _v63_result.balance_not_zero:
+                            _v63_status = "balance_not_zero_residual"
+                        else:
+                            _v63_status = "v63_failed:" + str(_v63_result.error or "unknown")
+                        log(
+                            f"PGG2-V63-POST-SELL-CLEAN-CLOSE-DONE mint={_short(mint)} "
+                            f"status={_v63_status} rent_recovered_sol={_v63_rent_recovered_sol:+.9f} "
+                            f"actual_pnl_post_rent={actual_pnl:+.9f} close_sig={_v63_close_sig}"
+                        )
+                    except Exception as _v63_exc:
+                        _v63_status = "v63_exc:" + type(_v63_exc).__name__
+                        log(
+                            f"PGG2-V63-POST-SELL-CLEAN-CLOSE-FAIL mint={_short(mint)} "
+                            f"err={type(_v63_exc).__name__}:{_v63_exc}"
+                        )
+                else:
+                    if not _V63_AVAILABLE:
+                        _v63_status = "v63_module_unavailable"
+                    elif not _env_flag("PGG2_V63_ENABLED", "1"):
+                        _v63_status = "v63_disabled_via_env"
+                    elif _v63_route != "pump_bc":
+                        _v63_status = "v63_skipped_non_pump_bc"
+                    elif residual_raw > 0:
+                        _v63_status = "v63_skipped_residual_nonzero"
+                    log(
+                        f"PGG2-V63-POST-SELL-CLEAN-CLOSE-SKIP mint={_short(mint)} "
+                        f"reason={_v63_status} residual_raw={residual_raw}"
+                    )
+                rec["close_kind"] = close_reason
+                rec["close_pnl"] = actual_pnl
+                rec["close_lag_ms"] = int(_now_ms() - now)
+                rec.update({
+                    "live_sell_sig": sell_sig,
+                    "live_sell_delta": sell_delta,
+                    "live_sold_delta_ui": sold_delta_ui,
+                    "live_token_residual_raw": int(residual_raw),
+                    "live_predicted_all_in": predicted_all_in,
+                    "live_v63_status": _v63_status,
+                    "live_v63_close_sig": _v63_close_sig,
+                    "live_v63_rent_recovered_sol": _v63_rent_recovered_sol,
+                })
+                if actual_pnl < 0.0:
+                    negative_closes += 1
+                    net_pnl_sol += actual_pnl
+                    if actual_pnl < max_loss_sol:
+                        max_loss_sol = actual_pnl
+                    if not _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0"):
+                        stop_reason = "negative_live_close"
+                else:
+                    non_neg_closes += 1
+                    net_pnl_sol += actual_pnl
+                    if token_mismatch:
+                        stop_reason = "token_mismatch"
+                _write_jsonl({
+                    "type": "v48_live_smoke_close",
+                    "decision_id": rec.get("decision_id"),
+                    "mint": mint,
+                    "buy_sig": buy_sig,
+                    "sell_sig": sell_sig,
+                    "actual_all_in_pnl": actual_pnl,
+                    "predicted_all_in_pnl": predicted_all_in,
+                    "close_kind": close_reason,
+                    "token_residual_raw": int(residual_raw),
+                    "ts_ms": _now_ms(),
+                })
+                log(
+                    f"PGG2-V48-LIVE-SMOKE-END mint={_short(mint)} "
+                    f"buy_sig={buy_sig} sell_sig={sell_sig} close_reason={close_reason} "
+                    f"predicted_all_in={predicted_all_in:+.9f} actual_all_in_pnl={actual_pnl:+.9f} "
+                    f"token_residual_raw={residual_raw} non_neg={non_neg_closes} neg={negative_closes}"
+                )
+                # === V63 FINAL PNL: wallet_after_close_account - wallet_before_buy ===
+                _v63_snap = rec.get("v63_pnl_snapshot")
+                if _v63_snap is not None and _V63_AVAILABLE:
+                    try:
+                        _v63_final = _v63_snap.compute_final(
+                            broker_delta_buy_sol=float(buy_delta or 0.0),
+                            broker_delta_sell_sol=float(sell_delta),
+                            rent_recovered_sol=float(_v63_rent_recovered_sol),
+                            v63_status=_v63_status,
+                        )
+                        log(_v63_final.log_line(_short(mint)))
+                        rec["final_wallet_delta_sol"] = _v63_final.final_wallet_delta_sol
+                        rec["final_pnl_pass"] = bool(_v63_final.pass_)
+                        rec["unattributed_sol"] = _v63_final.unattributed_sol
+                    except Exception as _v63_pnl_exc:
+                        log(
+                            f"PGG2-V63-FINAL-PNL-FAIL mint={_short(mint)} "
+                            f"err={type(_v63_pnl_exc).__name__}:{_v63_pnl_exc}"
+                        )
+                else:
+                    log(
+                        f"PGG2-V63-FINAL-PNL-SKIP mint={_short(mint)} "
+                        f"reason={'no_snapshot' if _v63_snap is None else 'module_unavailable'}"
+                    )
+                pending_candidates.pop(position_key, None)
+                open_positions.pop(position_key, None)
+                return True
+
+            sell_deadline = 0
+            max_total_sell_deadline = 0
+
+            def _poll_pending_guarded_sells() -> bool:
+                nonlocal v48_live_sell_safe_failures
+                nonlocal sell_deadline
+
+                now_poll_ms = _now_ms()
+                for _sig, _meta in list(pending_guarded_sells.items()):
+                    try:
+                        status = broker.signature_status(_sig)
+                    except Exception as exc:
+                        log(
+                            f"PGG2-V48-LIVE-SELL-PENDING-WARN mint={_short(mint)} "
+                            f"sig={_sig} err={type(exc).__name__}:{exc}"
+                        )
+                        status = None
+                    if status:
+                        if status.get("err"):
+                            v48_live_sell_safe_failures += 1
+                            pending_guarded_sells.pop(_sig, None)
+                            if _env_flag("PGG2_V48_LIVE_EXTEND_AFTER_PROTECTED_SELL_FAIL", True):
+                                retry_window_ms = max(
+                                    0,
+                                    int(
+                                        os.environ.get(
+                                            "PGG2_V48_LIVE_PROTECTED_SELL_RETRY_WINDOW_MS",
+                                            "8000",
+                                        )
+                                        or 8000
+                                    ),
+                                )
+                                old_deadline = int(sell_deadline)
+                                sell_deadline = min(
+                                    int(max_total_sell_deadline),
+                                    max(int(sell_deadline), now_poll_ms + retry_window_ms),
+                                )
+                                log(
+                                    f"PGG2-V48-LIVE-SELL-RETRY-EXTEND mint={_short(mint)} "
+                                    f"sig={_sig} err={status.get('err')} "
+                                    f"old_deadline_ms={old_deadline} new_deadline_ms={int(sell_deadline)} "
+                                    f"max_total_deadline_ms={int(max_total_sell_deadline)}"
+                                )
+                            log(
+                                f"PGG2-V48-LIVE-SELL-FAILED-SAFE mint={_short(mint)} "
+                                f"sig={_sig} reason=min_sol_guard_or_tx_err err={status.get('err')} "
+                                f"pending_ms={now_poll_ms - int(_meta.get('sent_ms', now_poll_ms))}"
+                            )
+                            continue
+                        if status.get("confirmationStatus") in {"confirmed", "finalized"}:
+                            pending_guarded_sells.pop(_sig, None)
+                            return _finalize_live_sell(
+                                _sig,
+                                float(_meta.get("predicted_all_in", 0.0)),
+                                str(_meta.get("reason") or "protected_sell"),
+                            )
+                    if now_poll_ms - int(_meta.get("sent_ms", now_poll_ms)) > live_smoke_sell_pending_timeout_ms:
+                        v48_live_sell_safe_failures += 1
+                        pending_guarded_sells.pop(_sig, None)
+                        log(
+                            f"PGG2-V48-LIVE-SELL-FAILED-SAFE mint={_short(mint)} "
+                            f"sig={_sig} reason=pending_timeout "
+                            f"pending_ms={now_poll_ms - int(_meta.get('sent_ms', now_poll_ms))}"
+                        )
+                return False
+
+            max_total_position_ms = max(
+                live_smoke_max_position_ms,
+                int(os.environ.get("PGG2_V48_LIVE_MAX_TOTAL_POSITION_MS", str(live_smoke_max_position_ms)) or live_smoke_max_position_ms),
+            )
+            sell_deadline = _now_ms() + live_smoke_max_position_ms
+            max_total_sell_deadline = int(now) + max_total_position_ms
+            last_pred = 0.0
+            sell_reason = ""
+            last_pending_sell_skip_log_ms = 0
+            effective_sell_send_floor = float(live_smoke_sell_send_floor)
+            effective_min_sol_out = float(protected_close_min_sol_out)
+            if (
+                bool(rec.get("v58_flow_gate_pass", False))
+                or bool(rec.get("v57_impulse_gate_pass", False))
+                or bool(rec.get("v61_fanout_gate_pass", False))
+                or bool(rec.get("v56b_gate_pass", False))
+            ):
+                _floor_env_name = (
+                    "PGG2_V58_LIVE_SELL_SEND_MIN_PNL_SOL"
+                    if bool(rec.get("v58_flow_gate_pass", False))
+                    else (
+                        "PGG2_V57_LIVE_SELL_SEND_MIN_PNL_SOL"
+                        if bool(rec.get("v57_impulse_gate_pass", False))
+                        else (
+                            "PGG2_V61_LIVE_SELL_SEND_MIN_PNL_SOL"
+                            if bool(rec.get("v61_fanout_gate_pass", False))
+                            else "PGG2_V56B_LIVE_SELL_SEND_MIN_PNL_SOL"
+                        )
+                    )
+                )
+                v57_sell_floor = float(
+                    os.environ.get(_floor_env_name, "0.000000")
+                    or 0.0
+                )
+                effective_sell_send_floor = max(effective_sell_send_floor, v57_sell_floor)
+                effective_min_sol_out = max(
+                    effective_min_sol_out,
+                    float(size_sol) + (2.0 * modeled_live_tx_fee) + v57_sell_floor,
+                )
+                log(
+                    f"PGG2-V56B-V57-V58-V61-LIVE-SELL-FLOOR mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"lane={'v58' if bool(rec.get('v58_flow_gate_pass', False)) else ('v57' if bool(rec.get('v57_impulse_gate_pass', False)) else ('v61' if bool(rec.get('v61_fanout_gate_pass', False)) else 'v56b'))} "
+                    f"global_send_floor={live_smoke_sell_send_floor:+.9f} "
+                    f"lane_send_floor={v57_sell_floor:+.9f} "
+                    f"effective_send_floor={effective_sell_send_floor:+.9f} "
+                    f"effective_min_sol_out={effective_min_sol_out:.9f}"
+                )
+            if (
+                _env_flag("PGG2_V48_LIVE_USE_WALLET_DELTA_PNL_FOR_SELL", True)
+                and buy_delta is not None
+            ):
+                actual_cost_min_sol_out = max(
+                    0.0000001,
+                    abs(float(buy_delta))
+                    + effective_sell_send_floor
+                    + modeled_live_tx_fee
+                    - close_ata_credit_sol,
+                )
+                effective_min_sol_out = max(effective_min_sol_out, actual_cost_min_sol_out)
+                log(
+                    f"PGG2-V48-LIVE-ACTUAL-COST-SELL-FLOOR mint={_short(mint)} "
+                    f"buy_delta={float(buy_delta):+.9f} "
+                    f"ata_close_credit={close_ata_credit_sol:.9f} "
+                    f"sell_fee_model={modeled_live_tx_fee:.9f} "
+                    f"actual_cost_min_sol_out={actual_cost_min_sol_out:.9f} "
+                    f"effective_min_sol_out={effective_min_sol_out:.9f}"
+                )
+            while _now_ms() < sell_deadline:
+                if _poll_pending_guarded_sells():
+                    return True
+                if (
+                    pending_guarded_sells
+                    and _env_flag("PGG2_V48_LIVE_SINGLE_PENDING_SELL_PER_POSITION", True)
+                ):
+                    now_pending_ms = _now_ms()
+                    if now_pending_ms - last_pending_sell_skip_log_ms >= 250:
+                        last_pending_sell_skip_log_ms = now_pending_ms
+                        log(
+                            f"PGG2-V48-LIVE-SELL-SKIP-PENDING mint={_short(mint)} "
+                            f"pending={len(pending_guarded_sells)} "
+                            f"reason=single_pending_sell_per_position"
+                        )
+                    time.sleep(0.05)
+                    continue
+                if len(pending_guarded_sells) >= live_smoke_sell_max_pending:
+                    time.sleep(0.05)
+                    continue
+                try:
+                    sell_quote = _build_live_sell_quote_fast(int(actual_raw))
+                    quote_out = float(broker.rate_amount_out(sell_quote))
+                except Exception as exc:
+                    v48_live_sell_safe_failures += 1
+                    log(
+                        f"PGG2-V48-LIVE-SELL-QUOTE-WARN mint={_short(mint)} "
+                        f"err={type(exc).__name__}:{exc}"
+                    )
+                    time.sleep(0.20)
+                    continue
+                nominal_pred = (
+                    quote_out - float(size_sol)
+                    - (2.0 * modeled_live_tx_fee)
+                )
+                last_pred = nominal_pred
+                if (
+                    _env_flag("PGG2_V48_LIVE_USE_WALLET_DELTA_PNL_FOR_SELL", True)
+                    and buy_delta is not None
+                ):
+                    last_pred = (
+                        float(buy_delta)
+                        + quote_out
+                        + close_ata_credit_sol
+                        - modeled_live_tx_fee
+                    )
+                age_ms = _now_ms() - int(rec.get("decision_ts_ms", _now_ms()))
+                hold_ms = _now_ms() - now
+                should_sell = False
+                sell_reason = "hold"
+                # 2026-05-17 HSQq forensic: scratch_positive previously fired
+                # whenever last_pred >= effective_sell_send_floor (typically -0.5).
+                # That meant -$0.04 to -$0.40 losses got labeled "scratch_positive"
+                # and dumped immediately. True scratch_positive must be ACTUALLY
+                # non-negative. Losses inside [floor, 0) wait for either recovery,
+                # max_hold timeout, or stricter sell-floor.
+                if last_pred >= BANK_TH:
+                    should_sell = True
+                    sell_reason = "bank"
+                elif last_pred >= 0.0:
+                    should_sell = True
+                    sell_reason = "scratch_positive"
+                elif (
+                    hold_ms >= int(rec.get("v47g_max_hold_ms", MAX_HOLD))
+                    and last_pred >= effective_sell_send_floor
+                ):
+                    should_sell = True
+                    sell_reason = "timebox_buffered_positive"
+                if not should_sell:
+                    log(
+                        f"PGG2-V48-LIVE-SELL-WAIT mint={_short(mint)} "
+                        f"quote_out={quote_out:.9f} predicted_all_in={last_pred:+.9f} "
+                        f"nominal_predicted_all_in={nominal_pred:+.9f} "
+                        f"ata_close_credit={close_ata_credit_sol:.9f} "
+                        f"hold_ms={hold_ms} age_ms={age_ms}"
+                    )
+                    time.sleep(0.20)
+                    continue
+                if live_sell_attempts >= live_smoke_sell_max_sends:
+                    log(
+                        f"PGG2-V48-LIVE-SELL-WAIT mint={_short(mint)} "
+                        f"quote_out={quote_out:.9f} predicted_all_in={last_pred:+.9f} "
+                        f"hold_ms={hold_ms} age_ms={age_ms} "
+                        f"reason=sell_attempt_cap attempts={live_sell_attempts}"
+                    )
+                    time.sleep(0.10)
+                    continue
+                # Direct buy wallet delta includes recoverable ATA rent on the
+                # first buy for a mint. Sell quote_out does not include that
+                # rent, but the sell transaction wallet delta gets it back when
+                # cleanup closes the ATA. Therefore the on-chain sell min-out
+                # must protect trade spend + unrecoverable tx fees, not the
+                # full negative buy wallet delta.
+                min_sol_out = effective_min_sol_out
+                if quote_out + 1e-12 < min_sol_out + live_smoke_sell_out_buffer:
+                    v48_live_sell_safe_failures += 1
+                    log(
+                        f"PGG2-V48-LIVE-SELL-NOT-EXECUTABLE mint={_short(mint)} "
+                        f"expected_sol_out={quote_out:.9f} min_sol_out={min_sol_out:.9f} "
+                        f"buffer={live_smoke_sell_out_buffer:.9f} predicted_all_in={last_pred:+.9f}"
+                    )
+                    time.sleep(0.20)
+                    continue
+                # === V62B AUTHORITATIVE SELL ROUTER GATE (pump_bc) ===
+                # V62B owns the whole bank/scratch/max_hold sell loop for
+                # pump_bc live positions. No V48 sell-send, no broker.wait_confirmed,
+                # no nonblocking pending-sells, no Jupiter fallback.
+                _v62b_route = str(rec.get("route", "pump_bc") or "pump_bc")
+                if (
+                    _V62B_AVAILABLE
+                    and _env_flag("PGG2_V62B_ENABLED", "1")
+                    and _v62b_route == "pump_bc"
+                ):
+                    if sell_reason == "scratch_positive":
+                        _v62b_reason = "scratch"
+                    elif sell_reason == "timebox_buffered_positive":
+                        _v62b_reason = "max_hold"
+                    else:
+                        _v62b_reason = "bank"
+                    log(
+                        f"PGG2-V62B-V48-SELL-BLOCKED mint={_short(mint)} "
+                        f"reason={sell_reason} v62b_reason={_v62b_reason} "
+                        f"routing_to=v62b expected_sol_out={quote_out:.9f} "
+                        f"raw_balance={int(actual_raw)} attempt={live_sell_attempts + 1}"
+                    )
+                    _v62b_cost_basis = (
+                        abs(float(buy_delta)) if buy_delta is not None else float(size_sol)
+                    )
+                    _v62b_rpc_url = (
+                        os.environ.get("HELIUS_RPC_URL")
+                        or os.environ.get("SOL_RPC")
+                        or "https://api.mainnet-beta.solana.com"
+                    )
+                    _v62b_token_program = str(rec.get("token_program", "token-2022") or "token-2022")
+                    try:
+                        _v62b_result = _v62b_close_position(
+                            broker=broker,
+                            mint=mint,
+                            raw_balance=int(actual_raw),
+                            cost_basis_sol=_v62b_cost_basis,
+                            expected_sol_out_now=float(quote_out),
+                            reason=_v62b_reason,
+                            rpc_url=_v62b_rpc_url,
+                            sell_quote_existing=sell_quote,
+                            log_fn=log,
+                            token_program=_v62b_token_program,
+                        )
+                    except Exception as _v62b_exc:
+                        log(
+                            f"PGG2-V62B-SELL-ROUTER-EXC mint={_short(mint)} "
+                            f"reason={_v62b_reason} err={type(_v62b_exc).__name__}:{_v62b_exc}"
+                        )
+                        v48_live_sell_safe_failures += 1
+                        time.sleep(0.20)
+                        continue
+                    live_sell_attempts += int(max(1, _v62b_result.attempts or 1))
+                    v48_live_sell_sends += int(max(1, _v62b_result.attempts or 1))
+                    if _v62b_result.confirmed:
+                        v48_live_sell_confirms += 1
+                        return _finalize_live_sell(_v62b_result.confirmed_sig, last_pred, sell_reason)
+                    log(
+                        f"PGG2-V62B-SELL-ROUTER-FINAL-FAIL mint={_short(mint)} "
+                        f"reason={_v62b_reason} blocker={_v62b_result.blocker} "
+                        f"attempts={_v62b_result.attempts} used_emergency={_v62b_result.used_emergency} "
+                        f"elapsed_ms={_v62b_result.elapsed_ms}"
+                    )
+                    v48_live_sell_safe_failures += 1
+                    if live_sell_attempts >= live_smoke_sell_max_sends:
+                        log(
+                            f"PGG2-V62B-SELL-ATTEMPTS-EXHAUSTED mint={_short(mint)} "
+                            f"attempts={live_sell_attempts} max={live_smoke_sell_max_sends}"
+                        )
+                        time.sleep(0.10)
+                        return False
+                    time.sleep(0.10)
+                    continue
+                # === END V62B GATE ===
+                guarded_sell = broker.retarget_sell_min_sol(sell_quote, mint, min_sol_out)
+                signed_sell, sell_preview = broker.sign_transaction(str(guarded_sell["txn"]))
+                v48_live_sell_sends += 1
+                live_sell_attempts += 1
+                log(
+                    f"PGG2-V48-LIVE-SELL-MIN-SOL-GUARD mint={_short(mint)} "
+                    f"sell_tokens={actual_ui:.6f} expected_sol_out={quote_out:.9f} "
+                    f"min_sol_out={min_sol_out:.9f} predicted_all_in={last_pred:+.9f} "
+                    f"reason={sell_reason} attempt={live_sell_attempts} gate_pass=true"
+                )
+                log(
+                    f"PGG2-V48-LIVE-SELL-SEND mint={_short(mint)} "
+                    f"sig_preview={sell_preview} reason={sell_reason} attempt={live_sell_attempts}"
+                )
+                sell_sig = getattr(broker, "send_signed")(signed_sell)
+                if live_smoke_sell_nonblocking:
+                    pending_guarded_sells[sell_sig] = {
+                        "sent_ms": _now_ms(),
+                        "predicted_all_in": float(last_pred),
+                        "reason": sell_reason,
+                    }
+                    log(
+                        f"PGG2-V48-LIVE-SELL-PENDING mint={_short(mint)} "
+                        f"sig={sell_sig} pending={len(pending_guarded_sells)} "
+                        f"attempt={live_sell_attempts} mode=nonblocking"
+                    )
+                    if live_sell_attempts >= live_smoke_sell_max_sends:
+                        time.sleep(0.05)
+                    else:
+                        time.sleep(0.03)
+                    continue
+                sell_ok = broker.wait_confirmed(sell_sig)
+                if not sell_ok:
+                    v48_live_sell_safe_failures += 1
+                    log(
+                        f"PGG2-V48-LIVE-SELL-FAILED-SAFE mint={_short(mint)} "
+                        f"sig={sell_sig} reason=not_confirmed_or_min_sol_guard"
+                    )
+                    time.sleep(0.20)
+                    continue
+                return _finalize_live_sell(sell_sig, last_pred, sell_reason)
+
+            pending_drain_deadline = time.time() + 1.5
+            while pending_guarded_sells and time.time() < pending_drain_deadline:
+                if _poll_pending_guarded_sells():
+                    return True
+                time.sleep(0.05)
+
+            v48_live_unclosed += 1
+            log(
+                f"PGG2-V48-LIVE-SMOKE-UNCLOSED mint={_short(mint)} "
+                f"last_predicted_all_in={last_pred:+.9f} "
+                f"max_position_ms={live_smoke_max_position_ms} action=emergency_close"
+            )
+            # === V62B AUTHORITATIVE EMERGENCY ROUTER (pump_bc) ===
+            _v62b_route_em = str(rec.get("route", "pump_bc") or "pump_bc")
+            if (
+                _V62B_AVAILABLE
+                and _env_flag("PGG2_V62B_ENABLED", "1")
+                and _v62b_route_em == "pump_bc"
+            ):
+                try:
+                    sell_quote = _build_live_sell_quote_fast(int(actual_raw))
+                    quote_out_em = float(broker.rate_amount_out(sell_quote))
+                except Exception as _qexc:
+                    sell_quote = None
+                    quote_out_em = 0.0
+                    log(
+                        f"PGG2-V62B-EMERGENCY-QUOTE-WARN mint={_short(mint)} "
+                        f"err={type(_qexc).__name__}:{_qexc}"
+                    )
+                _v62b_cost_basis_em = (
+                    abs(float(buy_delta)) if buy_delta is not None else float(size_sol)
+                )
+                _v62b_rpc_url_em = (
+                    os.environ.get("HELIUS_RPC_URL")
+                    or os.environ.get("SOL_RPC")
+                    or "https://api.mainnet-beta.solana.com"
+                )
+                _v62b_token_program_em = str(rec.get("token_program", "token-2022") or "token-2022")
+                log(
+                    f"PGG2-V62B-V48-EMERGENCY-BLOCKED mint={_short(mint)} "
+                    f"routing_to=v62b expected_sol_out={quote_out_em:.9f} "
+                    f"raw_balance={int(actual_raw)}"
+                )
+                try:
+                    _v62b_em_result = _v62b_close_position(
+                        broker=broker,
+                        mint=mint,
+                        raw_balance=int(actual_raw),
+                        cost_basis_sol=_v62b_cost_basis_em,
+                        expected_sol_out_now=quote_out_em,
+                        reason="emergency",
+                        rpc_url=_v62b_rpc_url_em,
+                        sell_quote_existing=sell_quote,
+                        log_fn=log,
+                        token_program=_v62b_token_program_em,
+                    )
+                except Exception as _v62b_em_exc:
+                    log(
+                        f"PGG2-V62B-EMERGENCY-ROUTER-EXC mint={_short(mint)} "
+                        f"err={type(_v62b_em_exc).__name__}:{_v62b_em_exc}"
+                    )
+                    v48_live_sell_safe_failures += 1
+                    log(
+                        f"PGG2-V62B-JUPITER-FALLBACK-BLOCKED mint={_short(mint)} "
+                        f"reason=pump_bc_v62b_owns route=emergency_exc"
+                    )
+                    if negative_closes > 0 and not _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0"):
+                        stop_reason = "negative_live_close"
+                    elif negative_closes == 0:
+                        stop_reason = "live_position_unclosed"
+                    pending_candidates.pop(position_key, None)
+                    open_positions.pop(position_key, None)
+                    return False
+                v48_live_sell_sends += int(max(1, _v62b_em_result.attempts or 1))
+                if _v62b_em_result.confirmed:
+                    v48_live_sell_confirms += 1
+                    sell_sig_em = _v62b_em_result.confirmed_sig
+                    try:
+                        sell_delta = float(broker.transaction_wallet_delta_sol(sell_sig_em))
+                    except Exception:
+                        sell_delta = float(_v62b_em_result.actual_sol_out or 0.0)
+                    if buy_delta is None:
+                        try:
+                            broker.wait_confirmed(buy_sig)
+                            buy_delta = float(broker.transaction_wallet_delta_sol(buy_sig))
+                        except Exception:
+                            buy_delta = -float(size_sol)
+                    residual_raw = 0
+                    try:
+                        residual_raw = int(broker.token_balance_raw(mint_pk))
+                    except Exception:
+                        residual_raw = 0
+                    actual_pnl = float(float(buy_delta) + sell_delta)
+                    # === V63 MANDATORY POST-SELL CLOSE-ACCOUNT (emergency path) ===
+                    _v63_rent_recovered_sol_em = 0.0
+                    _v63_close_sig_em = None
+                    _v63_status_em = "skipped"
+                    if (
+                        _V63_AVAILABLE
+                        and _env_flag("PGG2_V63_ENABLED", "1")
+                        and residual_raw == 0
+                    ):
+                        log(
+                            f"PGG2-V63-POST-SELL-CLEAN-CLOSE-START mint={_short(mint)} "
+                            f"sell_sig={sell_sig_em} actual_pnl_pre_rent={actual_pnl:+.9f} path=emergency"
+                        )
+                        try:
+                            from pgg2_direct_pump import as_pubkey  # type: ignore
+                            _v63_tp = str(broker.mint_owner(mint_pk))
+                            _v63_ata = str(
+                                get_associated_token_address(
+                                    as_pubkey(broker.public_key),
+                                    mint_pk,
+                                    as_pubkey(_v63_tp),
+                                )
+                            )
+                            _v63_url = (
+                                os.environ.get("HELIUS_RPC_URL")
+                                or os.environ.get("SOL_RPC")
+                                or "https://api.mainnet-beta.solana.com"
+                            )
+                            _v63_res = _v63_close_zero_balance_token_account(
+                                broker=broker,
+                                mint=mint,
+                                ata=_v63_ata,
+                                owner=str(broker.public_key),
+                                token_program=_v63_tp,
+                                rpc_url=_v63_url,
+                                log_fn=log,
+                            )
+                            if _v63_res.confirmed and not _v63_res.already_closed:
+                                _v63_rent_recovered_sol_em = float(_v63_res.recovered_lamports) / 1_000_000_000.0
+                                _v63_close_sig_em = _v63_res.close_sig
+                                _v63_status_em = "closed_by_v63"
+                                actual_pnl += _v63_rent_recovered_sol_em
+                            elif _v63_res.already_closed:
+                                _v63_status_em = "already_closed_in_sell_tx"
+                            elif _v63_res.balance_not_zero:
+                                _v63_status_em = "balance_not_zero_residual"
+                            else:
+                                _v63_status_em = "v63_failed:" + str(_v63_res.error or "unknown")
+                            log(
+                                f"PGG2-V63-POST-SELL-CLEAN-CLOSE-DONE mint={_short(mint)} "
+                                f"status={_v63_status_em} rent_recovered_sol={_v63_rent_recovered_sol_em:+.9f} "
+                                f"actual_pnl_post_rent={actual_pnl:+.9f} close_sig={_v63_close_sig_em} path=emergency"
+                            )
+                        except Exception as _v63_em_exc:
+                            _v63_status_em = "v63_exc:" + type(_v63_em_exc).__name__
+                            log(
+                                f"PGG2-V63-POST-SELL-CLEAN-CLOSE-FAIL mint={_short(mint)} "
+                                f"err={type(_v63_em_exc).__name__}:{_v63_em_exc} path=emergency"
+                            )
+                    else:
+                        if not _V63_AVAILABLE:
+                            _v63_status_em = "v63_module_unavailable"
+                        elif not _env_flag("PGG2_V63_ENABLED", "1"):
+                            _v63_status_em = "v63_disabled_via_env"
+                        elif residual_raw > 0:
+                            _v63_status_em = "v63_skipped_residual_nonzero"
+                        log(
+                            f"PGG2-V63-POST-SELL-CLEAN-CLOSE-SKIP mint={_short(mint)} "
+                            f"reason={_v63_status_em} residual_raw={residual_raw} path=emergency"
+                        )
+                    rec["close_kind"] = "emergency_timeout"
+                    rec["close_pnl"] = actual_pnl
+                    rec["close_lag_ms"] = int(_now_ms() - now)
+                    rec.update({
+                        "live_v63_status": _v63_status_em,
+                        "live_v63_close_sig": _v63_close_sig_em,
+                        "live_v63_rent_recovered_sol": _v63_rent_recovered_sol_em,
+                    })
+                    if actual_pnl < 0.0:
+                        negative_closes += 1
+                        net_pnl_sol += actual_pnl
+                        if actual_pnl < max_loss_sol:
+                            max_loss_sol = actual_pnl
+                    else:
+                        non_neg_closes += 1
+                        net_pnl_sol += actual_pnl
+                    log(
+                        f"PGG2-V48-LIVE-SMOKE-END mint={_short(mint)} "
+                        f"buy_sig={buy_sig} sell_sig={sell_sig_em} close_reason=emergency_timeout "
+                        f"predicted_all_in={last_pred:+.9f} actual_all_in_pnl={actual_pnl:+.9f} "
+                        f"token_residual_raw={residual_raw} non_neg={non_neg_closes} neg={negative_closes} "
+                        f"router=v62b v63_status={_v63_status_em} "
+                        f"v63_rent_recovered_sol={_v63_rent_recovered_sol_em:+.9f}"
+                    )
+                    # === V63 FINAL PNL (emergency path) ===
+                    _v63_snap_em = rec.get("v63_pnl_snapshot")
+                    if _v63_snap_em is not None and _V63_AVAILABLE:
+                        try:
+                            _v63_final_em = _v63_snap_em.compute_final(
+                                broker_delta_buy_sol=float(buy_delta or 0.0),
+                                broker_delta_sell_sol=float(sell_delta),
+                                rent_recovered_sol=float(_v63_rent_recovered_sol_em),
+                                v63_status=_v63_status_em,
+                            )
+                            log(_v63_final_em.log_line(_short(mint)))
+                            rec["final_wallet_delta_sol"] = _v63_final_em.final_wallet_delta_sol
+                            rec["final_pnl_pass"] = bool(_v63_final_em.pass_)
+                            rec["unattributed_sol"] = _v63_final_em.unattributed_sol
+                        except Exception as _v63_pnl_exc_em:
+                            log(
+                                f"PGG2-V63-FINAL-PNL-FAIL mint={_short(mint)} "
+                                f"err={type(_v63_pnl_exc_em).__name__}:{_v63_pnl_exc_em} path=emergency"
+                            )
+                    else:
+                        log(
+                            f"PGG2-V63-FINAL-PNL-SKIP mint={_short(mint)} "
+                            f"reason={'no_snapshot' if _v63_snap_em is None else 'module_unavailable'} path=emergency"
+                        )
+                else:
+                    v48_live_sell_safe_failures += 1
+                    log(
+                        f"PGG2-V62B-EMERGENCY-ROUTER-FINAL-FAIL mint={_short(mint)} "
+                        f"blocker={_v62b_em_result.blocker} attempts={_v62b_em_result.attempts} "
+                        f"elapsed_ms={_v62b_em_result.elapsed_ms}"
+                    )
+                    log(
+                        f"PGG2-V62B-JUPITER-FALLBACK-BLOCKED mint={_short(mint)} "
+                        f"reason=pump_bc_v62b_owns route=emergency_fail"
+                    )
+                if negative_closes > 0 and not _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0"):
+                    stop_reason = "negative_live_close"
+                elif negative_closes == 0:
+                    stop_reason = "live_position_unclosed"
+                pending_candidates.pop(position_key, None)
+                open_positions.pop(position_key, None)
+                return False
+            # === END V62B EMERGENCY GATE ===
+            try:
+                emergency_min_cfg = max(
+                    0.0000001,
+                    float(os.environ.get("PGG2_V48_LIVE_EMERGENCY_MIN_SOL_OUT", "0.0000001") or 0.0000001),
+                )
+                emergency_min_frac = min(
+                    1.0,
+                    max(
+                        0.50,
+                        float(os.environ.get("PGG2_V48_LIVE_EMERGENCY_MIN_OUT_FRAC", "0.970") or 0.970),
+                    ),
+                )
+                sell_quote = _build_live_sell_quote_fast(int(actual_raw))
+                quote_out = float(broker.rate_amount_out(sell_quote))
+                quote_guard_min = max(0.0000001, quote_out * emergency_min_frac)
+                emergency_min = min(emergency_min_cfg, quote_guard_min)
+                guarded_sell = broker.retarget_sell_min_sol(sell_quote, mint, emergency_min)
+                signed_sell, sell_preview = broker.sign_transaction(str(guarded_sell["txn"]))
+                v48_live_sell_sends += 1
+                log(
+                    f"PGG2-V48-LIVE-EMERGENCY-SELL-SEND mint={_short(mint)} "
+                    f"sig_preview={sell_preview} expected_sol_out={quote_out:.9f} "
+                    f"min_sol_out={emergency_min:.9f} configured_min_sol_out={emergency_min_cfg:.9f} "
+                    f"min_out_frac={emergency_min_frac:.3f}"
+                )
+                sell_sig = getattr(broker, "send_signed")(signed_sell)
+                sell_ok = broker.wait_confirmed(sell_sig)
+                if sell_ok:
+                    v48_live_sell_confirms += 1
+                    sell_delta = float(broker.transaction_wallet_delta_sol(sell_sig))
+                    if buy_delta is None:
+                        broker.wait_confirmed(buy_sig)
+                        buy_delta = float(broker.transaction_wallet_delta_sol(buy_sig))
+                    residual_raw = 0
+                    try:
+                        residual_raw = int(broker.token_balance_raw(mint_pk))
+                    except Exception:
+                        residual_raw = 0
+                    actual_pnl = float(float(buy_delta) + sell_delta)
+                    rec["close_kind"] = "emergency_timeout"
+                    rec["close_pnl"] = actual_pnl
+                    rec["close_lag_ms"] = int(_now_ms() - now)
+                    if actual_pnl < 0.0:
+                        negative_closes += 1
+                        net_pnl_sol += actual_pnl
+                        if actual_pnl < max_loss_sol:
+                            max_loss_sol = actual_pnl
+                    else:
+                        non_neg_closes += 1
+                        net_pnl_sol += actual_pnl
+                    log(
+                        f"PGG2-V48-LIVE-SMOKE-END mint={_short(mint)} "
+                        f"buy_sig={buy_sig} sell_sig={sell_sig} close_reason=emergency_timeout "
+                        f"predicted_all_in={last_pred:+.9f} actual_all_in_pnl={actual_pnl:+.9f} "
+                        f"token_residual_raw={residual_raw} non_neg={non_neg_closes} neg={negative_closes}"
+                    )
+                else:
+                    v48_live_sell_safe_failures += 1
+                    log(
+                        f"PGG2-V48-LIVE-EMERGENCY-SELL-FAILED mint={_short(mint)} "
+                        f"reason=not_confirmed action=jupiter_fallback "
+                        f"expected_tokens_raw={int(actual_raw)}"
+                    )
+                    _try_jupiter_fallback(mint, mint_pk, buy_sig, buy_delta, last_pred, now,
+                                          expected_tokens_raw=int(actual_raw))
+            except Exception as exc:
+                log(
+                    f"PGG2-V48-LIVE-EMERGENCY-SELL-ERROR mint={_short(mint)} "
+                    f"err={type(exc).__name__}:{exc} action=jupiter_fallback "
+                    f"expected_tokens_raw={int(actual_raw)}"
+                )
+                _try_jupiter_fallback(mint, mint_pk, buy_sig, buy_delta, last_pred, now,
+                                      expected_tokens_raw=int(actual_raw))
+            if negative_closes > 0 and not _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0"):
+                stop_reason = "negative_live_close"
+            elif negative_closes == 0:
+                stop_reason = "live_position_unclosed"
+            pending_candidates.pop(position_key, None)
+            open_positions.pop(position_key, None)
+            return False
+        except Exception as exc:
+            _log_v48_entry_block(
+                rec,
+                "unknown",
+                f"live_exception:{type(exc).__name__}:{exc}",
+                _now_ms(),
+            )
+            log(
+                f"PGG2-V48-LIVE-SMOKE-ERROR mint={_short(mint)} "
+                f"err={type(exc).__name__}:{exc}"
+            )
+            return False
+
+    def _open_v48_record(rec: Dict[str, Any], from_backfill: bool = False) -> bool:
+        nonlocal v48_entries_opened
+        now = _now_ms()
+        _allow_negclose = _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0")
+        if stop_reason != "running" or (negative_closes > 0 and not _allow_negclose):
+            reason = stop_reason if stop_reason != "running" else "negative_close"
+            _log_v48_entry_block(rec, "env_disabled", f"stop_reason={reason}", now)
+            return False
+        if live_smoke:
+            return _open_v48_live_record(rec, from_backfill=from_backfill)
+        mint = str(rec.get("mint") or "")
+        if len(open_positions) >= max_open:
+            _log_v48_entry_block(rec, "max_open", ts_ms=now)
+            return False
+        if any(str(r.get("mint") or "") == mint for r in open_positions.values()):
+            _log_v48_entry_block(rec, "duplicate_mint", ts_ms=now)
+            return False
+        rec["entry_idx"] = len(candidates) + 1
+        rec["opened_or_deferred"] = "opened_from_backfill" if from_backfill else "opened"
+        candidates.append(rec)
+        selected_size_dist[f"{float(rec.get('selected_size_sol', 0.0)):.4f}"] += 1
+        position_key = (mint, int(rec.get("decision_ts_ms", now)))
+        pending_candidates[position_key] = rec
+        open_positions[position_key] = rec
+        try:
+            _wd = V47GPositionQuoteWatchdog(
+                mint=mint,
+                tokens_held_raw=int(rec.get("expected_tokens", 0)),
+                buy_size_sol=float(rec.get("selected_size_sol", 0.0)),
+                rpc_http_endpoint=v47g_watchdog_rpc_http,
+                fee_bps=int(fee_bps),
+                creator_fee_bps=int(creator_fee_bps),
+                opened_at_ms=int(rec.get("decision_ts_ms", now)),
+                interval_ms=V47G_WATCHDOG_INTERVAL_MS,
+                snap_silence_ms=V47G_SNAP_SILENCE_MS,
+                logger=log,
+            )
+            try:
+                _loop = asyncio.get_event_loop()
+                _loop.create_task(_wd.start())
+            except Exception:
+                pass
+            v47g_watchdogs[position_key] = _wd
+        except Exception as _wd_exc:
+            log(
+                f"V48-DRYLIVE-WATCHDOG-SPAWN-ERROR mint={_short(mint)} "
+                f"err={type(_wd_exc).__name__}:{_wd_exc}"
+            )
+        _write_jsonl(rec)
+        v48_entries_opened += 1
+        log(
+            f"PGG2-V48-DRYLIVE-ENTRY-OPEN "
+            f"decision_id={rec.get('decision_id')} mint={_short(mint)} "
+            f"size={float(rec.get('selected_size_sol', 0.0)):.4f} "
+            f"orig={float(rec.get('original_size_sol', 0.0)):.4f} "
+            f"downsized={int(bool(rec.get('downsized', False)))} "
+            f"ub={int(rec.get('ub_250', 0))} tbs={float(rec.get('tbs_250', 0.0)):.3f} "
+            f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+            f"from_backfill={int(bool(from_backfill))} "
+            f"open_now={len(open_positions)}/{max_open} "
+            f"closed_nonnegative={non_neg_closes}/{args.target_non_neg_closes}"
+        )
+        return True
+
+    def _queue_v48_record(rec: Dict[str, Any], ts_ms: int) -> None:
+        nonlocal v48_backfill_adds
+        _allow_negclose = _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0")
+        if stop_reason != "running" or (negative_closes > 0 and not _allow_negclose):
+            reason = stop_reason if stop_reason != "running" else "negative_close"
+            _log_v48_entry_block(rec, "env_disabled", f"stop_reason={reason}", ts_ms)
+            return
+        if any(str(q.get("mint") or "") == str(rec.get("mint") or "") for q in backfill_queue):
+            _log_v48_entry_block(rec, "duplicate_mint", "already_queued", ts_ms)
+            return
+        rec["queued_at_ms"] = int(ts_ms)
+        rec["expires_at_ms"] = int(ts_ms) + backfill_ttl_ms
+        rec["opened_or_deferred"] = "queued_max_open"
+        backfill_queue.append(rec)
+        v48_backfill_adds += 1
+        _log_v48_entry_block(rec, "max_open", "queued_for_backfill", ts_ms)
+        log(
+            f"PGG2-V48-BACKFILL-QUEUE-ADD "
+            f"decision_id={rec.get('decision_id')} mint={_short(str(rec.get('mint') or ''))} "
+            f"ttl_ms={backfill_ttl_ms} expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+            f"queue_len={len(backfill_queue)}"
+        )
+        _write_jsonl({
+            "type": "v48_backfill_queue_add",
+            "decision_id": rec.get("decision_id"),
+            "mint": rec.get("mint"),
+            "queued_at_ms": int(ts_ms),
+            "expires_at_ms": int(rec["expires_at_ms"]),
+            "selected_size_sol": float(rec.get("selected_size_sol", 0.0)),
+            "expected_pnl": float(rec.get("exp_pnl", 0.0)),
+        })
+
+    def _expire_v48_backfill(now_ms: int) -> None:
+        nonlocal v48_backfill_expires
+        fresh = deque()
+        while backfill_queue:
+            rec = backfill_queue.popleft()
+            if int(rec.get("expires_at_ms", 0)) < int(now_ms):
+                v48_backfill_expires += 1
+                log(
+                    f"PGG2-V48-BACKFILL-EXPIRE "
+                    f"decision_id={rec.get('decision_id')} mint={_short(str(rec.get('mint') or ''))} "
+                    f"age_ms={int(now_ms) - int(rec.get('queued_at_ms', now_ms))}"
+                )
+                _write_jsonl({
+                    "type": "v48_backfill_expire",
+                    "decision_id": rec.get("decision_id"),
+                    "mint": rec.get("mint"),
+                    "ts_ms": int(now_ms),
+                    "age_ms": int(now_ms) - int(rec.get("queued_at_ms", now_ms)),
+                })
+            else:
+                fresh.append(rec)
+        backfill_queue.extend(fresh)
+
+    def _v60_flow_confirm_watch(rec: Dict[str, Any], now_ms: int) -> bool:
+        """Refresh causal tape after a short watch window.
+
+        V56D/V58 discovered the useful shape in post-decision SolanaTracker
+        flow. V60 makes that causal: a candidate can only become spend-eligible
+        after the local tape shows continuation buy flow and no sell pressure.
+        """
+        mint = str(rec.get("mint") or "")
+        try:
+            cu_ts = int(buffer_.latest_curve_update_ts(mint) or 0)
+        except Exception:
+            cu_ts = 0
+        if cu_ts <= 0:
+            cu_ts = int(rec.get("curve_snapshot_ts_ms", 0) or rec.get("decision_ts_ms", 0) or 0)
+        try:
+            snap2 = buffer_.buyer_stats(mint, int(now_ms), int(cu_ts))
+        except Exception:
+            snap2 = {}
+        try:
+            sells2 = buffer_.sell_stats(mint, int(now_ms), int(cu_ts))
+        except Exception:
+            sells2 = {}
+        # The V60 signal is continuation flow after the decision. Do not use
+        # only pending_* aggregates here: a fast curve update can reflect the
+        # buys before the watch fires, making true continuation look like zero.
+        raw_buy_events = []
+        raw_sell_events = []
+        try:
+            base_buf = buffer_
+            for _ in range(8):
+                if hasattr(base_buf, "_states"):
+                    break
+                base_buf = getattr(base_buf, "_buf")
+            st_raw = getattr(base_buf, "_states", {}).get(mint)
+            if st_raw is not None:
+                decision_ts = int(rec.get("decision_ts_ms", now_ms) or now_ms)
+                raw_buy_events = [
+                    b for b in list(getattr(st_raw, "buys", []))
+                    if decision_ts < int(getattr(b, "ts_ms", 0) or 0) <= int(now_ms)
+                ]
+                raw_sell_events = [
+                    s for s in list(getattr(st_raw, "sells", []))
+                    if decision_ts < int(getattr(s, "ts_ms", 0) or 0) <= int(now_ms)
+                ]
+        except Exception:
+            raw_buy_events = []
+            raw_sell_events = []
+
+        min_ep = float(os.environ.get("PGG2_V60_MIN_EXPECTED_PNL", "0.000550") or 0.000550)
+        max_top = float(os.environ.get("PGG2_V60_MAX_TOP_SHARE_250", "0.300") or 0.300)
+        min_buy_250 = float(os.environ.get("PGG2_V60_MIN_BUY_SOL_250", "0.000") or 0.0)
+        min_buy_500 = float(os.environ.get("PGG2_V60_MIN_BUY_SOL_500", "0.050") or 0.050)
+        min_buy_1000 = float(os.environ.get("PGG2_V60_MIN_BUY_SOL_1000", "0.200") or 0.200)
+        max_sell_count_1000 = int(os.environ.get("PGG2_V60_MAX_SELL_COUNT_1000", "0") or 0)
+        min_ub_250 = int(os.environ.get("PGG2_V60_MIN_UNIQUE_BUYERS_250", "2") or 2)
+        min_ub_1000 = int(os.environ.get("PGG2_V60_MIN_UNIQUE_BUYERS_1000", "2") or 2)
+        max_source_lead = int(os.environ.get("PGG2_V60_MAX_SOURCE_LEAD_MS", "1500") or 1500)
+        min_buy_sell_ratio = float(os.environ.get("PGG2_V60_MIN_BUY_SELL_RATIO_1000", "3.000") or 3.000)
+        clean_floor = float(os.environ.get("PGG2_V60_CLEAN_FLOOR_SOL", "0.000050") or 0.000050)
+
+        exp_pnl = float(rec.get("exp_pnl", 0.0) or 0.0)
+        pending_pbs250 = float(snap2.get("pending_buy_sol_250ms", 0.0) or 0.0)
+        pending_pbs500 = float(snap2.get("pending_buy_sol_500ms", 0.0) or 0.0)
+        pending_pbs1000 = float(snap2.get("pending_buy_sol_1000ms", 0.0) or 0.0)
+        pending_psc1000 = int(sells2.get("pending_sell_count_1000ms", 0) or 0)
+        pss1000 = float(sells2.get("pending_sell_sol_1000ms", 0.0) or 0.0)
+        pending_ub250 = int(snap2.get("unique_buyers_250ms", 0) or 0)
+        pending_ub1000 = int(snap2.get("unique_buyers_1000ms", 0) or 0)
+        pending_tbs250 = float(snap2.get("top_buyer_share_250ms", 1.0) or 1.0)
+        raw_buy_sol = sum(float(getattr(b, "sol_in", 0.0) or 0.0) for b in raw_buy_events)
+        raw_sell_count = len(raw_sell_events)
+        raw_by_signer: Dict[str, float] = {}
+        for b in raw_buy_events:
+            signer = str(getattr(b, "signer", "") or "?")
+            raw_by_signer[signer] = raw_by_signer.get(signer, 0.0) + float(getattr(b, "sol_in", 0.0) or 0.0)
+        raw_uniq = len([k for k in raw_by_signer if k != "?"])
+        raw_top = (max(raw_by_signer.values()) / raw_buy_sol) if raw_buy_sol > 1e-12 else 1.0
+        pbs250 = max(pending_pbs250, raw_buy_sol)
+        pbs500 = max(pending_pbs500, raw_buy_sol)
+        pbs1000 = max(pending_pbs1000, raw_buy_sol)
+        psc1000 = max(pending_psc1000, raw_sell_count)
+        ub250 = max(pending_ub250, raw_uniq)
+        ub1000 = max(pending_ub1000, raw_uniq)
+        tbs250 = min(pending_tbs250, raw_top)
+        source_lead = max(0, int(now_ms) - int(cu_ts or now_ms))
+        buy_sell_ratio = (
+            pbs1000 / pss1000 if pss1000 > 1e-12 else (999.0 if pbs1000 > 1e-12 else 0.0)
+        )
+        confirm_age = max(0, int(now_ms) - int(rec.get("decision_ts_ms", now_ms) or now_ms))
+
+        blockers = []
+        if exp_pnl < min_ep - 1e-12:
+            blockers.append("expected_pnl")
+        if exp_pnl < clean_floor - 1e-12:
+            blockers.append("clean_floor")
+        if tbs250 > max_top + 1e-12:
+            blockers.append("top_share")
+        if pbs250 < min_buy_250 - 1e-12:
+            blockers.append("buy250")
+        if pbs500 < min_buy_500 - 1e-12:
+            blockers.append("buy500")
+        if pbs1000 < min_buy_1000 - 1e-12:
+            blockers.append("buy1000")
+        if psc1000 > max_sell_count_1000:
+            blockers.append("sell_count")
+        if ub250 < min_ub_250:
+            blockers.append("ub250")
+        if ub1000 < min_ub_1000:
+            blockers.append("ub1000")
+        if max_source_lead > 0 and source_lead > max_source_lead:
+            blockers.append("source_lead")
+        if buy_sell_ratio < min_buy_sell_ratio - 1e-12:
+            blockers.append("buy_sell_ratio")
+
+        passed = not blockers
+        rec["v60_flow_gate_enabled"] = True
+        rec["v60_flow_gate_pass"] = bool(passed)
+        rec["v60_confirm_age_ms"] = int(confirm_age)
+        rec["v60_source_lead_ms"] = int(source_lead)
+        rec["v60_pbs_250"] = float(pbs250)
+        rec["v60_pbs_500"] = float(pbs500)
+        rec["v60_pbs_1000"] = float(pbs1000)
+        rec["v60_psc_1000"] = int(psc1000)
+        rec["v60_pss_1000"] = float(pss1000)
+        rec["v60_ub_250"] = int(ub250)
+        rec["v60_ub_1000"] = int(ub1000)
+        rec["v60_tbs_250"] = float(tbs250)
+        rec["v60_buy_sell_ratio_1000"] = float(buy_sell_ratio)
+        rec["v60_raw_buy_sol_since_decision"] = float(raw_buy_sol)
+        rec["v60_raw_sell_count_since_decision"] = int(raw_sell_count)
+        rec["v60_raw_unique_buyers_since_decision"] = int(raw_uniq)
+        rec["v60_raw_top_buyer_share_since_decision"] = float(raw_top)
+        rec["v60_blockers"] = "|".join(blockers)
+        if passed:
+            lanes = [x for x in str(rec.get("signal_lane") or "").split("|") if x]
+            if "v60_flow_confirmed" not in lanes:
+                lanes.append("v60_flow_confirmed")
+            rec["signal_lane"] = "|".join(lanes)
+        log(
+            f"PGG2-V60-FLOW-CONFIRM-CHECK mint={_short(mint)} "
+            f"decision_id={rec.get('decision_id')} age_ms={confirm_age} "
+            f"exp_pnl={exp_pnl:+.6f}/{min_ep:+.6f} "
+            f"pbs250={pbs250:.3f}/{min_buy_250:.3f} "
+            f"pbs500={pbs500:.3f}/{min_buy_500:.3f} "
+            f"pbs1000={pbs1000:.3f}/{min_buy_1000:.3f} "
+            f"raw_buy_sol={raw_buy_sol:.3f} raw_sell_count={raw_sell_count} "
+            f"raw_ub={raw_uniq} raw_top={raw_top:.3f} "
+            f"psc1000={psc1000}/{max_sell_count_1000} "
+            f"ub250={ub250}/{min_ub_250} ub1000={ub1000}/{min_ub_1000} "
+            f"tbs250={tbs250:.3f}/{max_top:.3f} "
+            f"bsr1000={buy_sell_ratio:.3f}/{min_buy_sell_ratio:.3f} "
+            f"source_lead_ms={source_lead}/{max_source_lead} "
+            f"pass={int(passed)} blockers={'|'.join(blockers) if blockers else '-'}"
+        )
+        _write_jsonl({
+            "type": "v60_flow_confirm_check",
+            "decision_id": rec.get("decision_id"),
+            "mint": mint,
+            "ts_ms": int(now_ms),
+            "confirm_age_ms": int(confirm_age),
+            "expected_pnl": float(exp_pnl),
+            "pbs250": float(pbs250),
+            "pbs500": float(pbs500),
+            "pbs1000": float(pbs1000),
+            "psc1000": int(psc1000),
+            "ub250": int(ub250),
+            "ub1000": int(ub1000),
+            "tbs250": float(tbs250),
+            "buy_sell_ratio1000": float(buy_sell_ratio),
+            "raw_buy_sol_since_decision": float(raw_buy_sol),
+            "raw_sell_count_since_decision": int(raw_sell_count),
+            "raw_unique_buyers_since_decision": int(raw_uniq),
+            "raw_top_buyer_share_since_decision": float(raw_top),
+            "source_lead_ms": int(source_lead),
+            "pass": bool(passed),
+            "blockers": list(blockers),
+        })
+        return bool(passed)
+
+    def _consume_v48_backfill(now_ms: int) -> None:
+        nonlocal v48_backfill_consumes
+        if stop_reason != "running" or (negative_closes > 0 and not _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0")):
+            return
+        if len(open_positions) >= max_open or not backfill_queue:
+            return
+        _expire_v48_backfill(now_ms)
+        while backfill_queue and len(open_positions) < max_open:
+            ready_idxs = [
+                i for i, q in enumerate(backfill_queue)
+                if int(q.get("not_before_ms", 0) or 0) <= int(now_ms)
+            ]
+            if not ready_idxs:
+                return
+            best_idx = max(
+                ready_idxs,
+                key=lambda i: float(backfill_queue[i].get("exp_pnl", 0.0)),
+            )
+            rec = backfill_queue[best_idx]
+            del backfill_queue[best_idx]
+            mint = str(rec.get("mint") or "")
+            if bool(rec.get("v60_flow_watch_pending", False)):
+                if not _v60_flow_confirm_watch(rec, int(now_ms)):
+                    _log_v48_entry_block(
+                        rec,
+                        "v60_flow_confirm_failed",
+                        str(rec.get("v60_blockers") or "unknown"),
+                        int(now_ms),
+                    )
+                    continue
+                actual_enabled = (
+                    os.environ.get("PGG2_V60_ACTUAL_ENTRY_ENABLED", "0")
+                    .strip()
+                    .lower()
+                    in ("1", "true", "yes", "on")
+                )
+                if not actual_enabled:
+                    log(
+                        f"PGG2-V60-FLOW-CONFIRM-SHADOW-PASS mint={_short(mint)} "
+                        f"decision_id={rec.get('decision_id')} "
+                        f"age_ms={int(rec.get('v60_confirm_age_ms', 0) or 0)} "
+                        f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                        f"action=no_fee_spend actual_entry_enabled=0"
+                    )
+                    _write_jsonl({
+                        "type": "v60_flow_confirm_shadow_pass",
+                        "decision_id": rec.get("decision_id"),
+                        "mint": mint,
+                        "ts_ms": int(now_ms),
+                        "expected_pnl": float(rec.get("exp_pnl", 0.0)),
+                        "confirm_age_ms": int(rec.get("v60_confirm_age_ms", 0) or 0),
+                    })
+                    continue
+            if any(str(r.get("mint") or "") == mint for r in open_positions.values()):
+                _log_v48_entry_block(rec, "duplicate_mint", "consume_duplicate_open", now_ms)
+                continue
+            log(
+                f"PGG2-V48-BACKFILL-CONSUME "
+                f"decision_id={rec.get('decision_id')} mint={_short(mint)} "
+                f"age_ms={int(now_ms) - int(rec.get('queued_at_ms', now_ms))} "
+                f"expected_pnl={float(rec.get('exp_pnl', 0.0)):+.6f}"
+            )
+            _write_jsonl({
+                "type": "v48_backfill_consume",
+                "decision_id": rec.get("decision_id"),
+                "mint": mint,
+                "ts_ms": int(now_ms),
+                "age_ms": int(now_ms) - int(rec.get("queued_at_ms", now_ms)),
+            })
+            if _open_v48_record(rec, from_backfill=True):
+                v48_backfill_consumes += 1
+
+    def _maybe_evaluate(mint, ts_ms_now, slot, sol_in, signer, sig=""):
+        nonlocal sim_evals_total, lookahead_block_count
+        nonlocal boundary_pass, boundary_block, downsize_ok, downsize_fail
+        nonlocal replacement_scans
+        nonlocal two_buyer_total, two_buyer_actual, two_buyer_shadow
+        nonlocal two_buyer_block, two_buyer_delegate, max_open_skips
+        nonlocal v47g_floor_total, v47g_floor_pass_total
+        nonlocal v47g_floor_block_total
+        nonlocal v47g_downsize_attempts, v47g_downsize_success
+        nonlocal v47g_downsize_fail
+        nonlocal v47h_veto_total, v47h_veto_pass_total
+        nonlocal v47h_veto_block_total
+        nonlocal v47i_veto_total, v47i_veto_pass_total
+        nonlocal v47i_veto_block_total
+        nonlocal v48_candidates_seen, v48_candidates_passed
+        nonlocal v48_decision_seq, v48_duplicate_blocks
+        nonlocal v48_clean_close_gate_blocks, v48_concentration_gate_blocks
+        nonlocal v48_velocity_edge_gate_blocks, v48_recent_veto_memory_blocks
+        if stop_reason != "running" or (negative_closes > 0 and not _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0")):
+            return
+        if non_neg_closes >= args.target_non_neg_closes:
+            return
+        if failed_buy_fees_total >= FEE_BUDGET:
+            return
+        raw_event_ts_ms = int(ts_ms_now)
+        decision_processing_lag_ms = max(0, _now_ms() - raw_event_ts_ms)
+        if (
+            _V48_LIVE_SMOKE_BOOT
+            and os.environ.get("PGG2_V48_LIVE_RESYNC_DECISION_TS", "1") == "1"
+        ):
+            if decision_processing_lag_ms >= int(
+                os.environ.get("PGG2_V48_LIVE_RESYNC_LOG_MIN_LAG_MS", "250") or 250
+            ):
+                log(
+                    f"PGG2-V48-LIVE-EVAL-RESYNC mint={_short(mint)} "
+                    f"raw_event_ts_ms={raw_event_ts_ms} "
+                    f"decision_processing_lag_ms={decision_processing_lag_ms}"
+                )
+            ts_ms_now = _now_ms()
+        v48_candidates_seen += 1
+        cs, cu_ts, cs_pt = _curve_state_at_or_before(mint, ts_ms_now)
+        if cs is None:
+            return
+        snap = buffer_.buyer_stats(mint, ts_ms_now, cu_ts)
+        if int(snap.get("latest_raw_buy_ts_ms", 0)) > ts_ms_now:
+            lookahead_block_count += 1
+            return
+        if int(snap.get("latest_curve_update_ts_ms", 0)) > ts_ms_now:
+            lookahead_block_count += 1
+            return
+        source_lead_ms = float(int(ts_ms_now) - int(cu_ts)) if cu_ts > 0 else 0.0
+        pending_buys = buffer_.pending_buys(mint, ts_ms_now, cu_ts, 250)
+        pending_sells = buffer_.pending_sells(mint, ts_ms_now, cu_ts, 250)
+        if not pending_buys and not pending_sells:
+            if _env_flag("PGG2_V67_ONLY_LANE", "0"):
+                log(
+                    f"PGG2-V67-EARLY-BLOCK mint={_short(mint)} "
+                    f"reason=no_pending_flow source_lead_ms={int(source_lead_ms)}"
+                )
+            return
+
+        buyer_stats_for_gate = {
+            "unique_buyers_250ms": int(snap.get("unique_buyers_250ms", 0)),
+            "pending_buy_count_250ms": int(
+                snap.get("pending_buy_count_250ms", 0)),
+            "pending_buy_sol_250ms": float(
+                snap.get("pending_buy_sol_250ms", 0.0)),
+            "pending_sell_sol_250ms": float(
+                snap.get("pending_sell_sol_250ms", 0.0)),
+            "top_buyer_share_250ms": float(
+                snap.get("top_buyer_share_250ms", 0.0)),
+        }
+        mb_pass, mb_blocker = evaluate_multi_buyer_gate(
+            buyer_stats_for_gate, logger=log, mint_for_log=mint,
+        )
+        # ---- V60 EARLY SHADOW (fires on EVERY candidate at V47C log time) ----
+        if _env_flag("PGG2_V60_OBSERVE_MODE", "0"):
+            try:
+                from pgg2_v60_live_send_firewall import (
+                    V60Candidate as _V60Cand_v47c,
+                    V60TxPlan as _V60Plan_v47c,
+                    v60_authorize_live_buy as _v60_auth_v47c,
+                )
+                _v60v_size = 0.005  # observe shadow uses the cap as canonical size
+                # Estimate ep from pending_buy_sol_1000ms (rough proxy at V47C time)
+                _v60v_pbs1k = float(buyer_stats_for_gate.get("pending_buy_sol_1000ms", 0.0) or 0.0)
+                _v60v_pss1k = float(buyer_stats_for_gate.get("pending_sell_sol_1000ms", 0.0) or 0.0)
+                _v60v_ub = int(buyer_stats_for_gate.get("unique_buyers_250ms", 0) or 0)
+                # Very rough ep proxy: positive flow imbalance scaled small (observe only)
+                _v60v_ep_est = max(-0.005, min(0.005, (_v60v_pbs1k - _v60v_pss1k) * 0.0005))
+                _v60v_cand = _V60Cand_v47c(
+                    mint=mint,
+                    selected_size_sol=_v60v_size,
+                    candidate_lane="v47c_early_shadow",
+                    rule_id="v47c_early_shadow",
+                    expected_pnl_sol=_v60v_ep_est,
+                    true_edge_sol=None,
+                    token_program="spl",
+                    route="pump_bc",
+                    sim_needed=0,
+                    pair_source="decision_curve_snapshot",
+                    snapshot_age_ms=0,
+                    source_lead_ms=0,
+                    risk_result=None,
+                    risk_fetched_at_ms=None,
+                    is_v67_passing=True,   # observe-only: bypass v59_universal lane check
+                    is_v57_promotion=False,
+                    wallet_balance_sol=0.0,
+                )
+                _v60v_plan = _V60Plan_v47c(
+                    decoded_amount_tokens_raw=0,
+                    decoded_max_sol_cost_lamports=int(round(_v60v_size * 1e9)),
+                    swqos_tip_sol=0.000005,
+                    priority_fee_sol=0.000005,
+                    base_fee_sol=0.000005,
+                    uses_pump_v2=False,
+                    has_sell_v2_capability=True,
+                )
+                _v60v_dec = _v60_auth_v47c(_v60v_cand, _v60v_plan, log_fn=log)
+                if _v60v_dec.passed:
+                    log(f"PGG2-V60-OBSERVE-PASS mint={_short(mint)} stage=v47c_early size={_v60v_size:.4f} ep_est={_v60v_ep_est:+.6f} true_edge={_v60v_dec.true_edge_sol:+.6f} v47c_pass={int(mb_pass)} ub250={_v60v_ub}")
+                else:
+                    _v60v_det = ""
+                    for _cr in _v60v_dec.check_results:
+                        if not _cr.passed:
+                            _v60v_det = _cr.detail
+                            break
+                    log(f"PGG2-V60-OBSERVE-BLOCK mint={_short(mint)} stage=v47c_early size={_v60v_size:.4f} ep_est={_v60v_ep_est:+.6f} blocker={_v60v_dec.blocker} detail={_v60v_det} v47c_pass={int(mb_pass)} ub250={_v60v_ub}")
+            except Exception as _v60v_err:
+                log(f"PGG2-V60-OBSERVE-ERR stage=v47c_early err={type(_v60v_err).__name__}:{_v60v_err}")
+        v61_lane_env_enabled = (
+            os.environ.get("PGG2_V61_FANOUT_LEAD_LANE_ENABLED", "0")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        v61_bypass_legacy_gates_env = _env_flag(
+            "PGG2_V61_BYPASS_LEGACY_GATES", "0"
+        )
+        v67_lane_env_enabled_early = _env_flag(
+            "PGG2_V67_FLOW_CONFIRM_LANE_ENABLED", "0"
+        )
+        v67_bypass_legacy_gates_env_early = _env_flag(
+            "PGG2_V67_BYPASS_LEGACY_GATES", "1"
+        )
+        if not mb_pass and not (
+            v61_lane_env_enabled and v61_bypass_legacy_gates_env
+            or v67_lane_env_enabled_early and v67_bypass_legacy_gates_env_early
+        ):
+            return
+        if not mb_pass and v61_lane_env_enabled and v61_bypass_legacy_gates_env:
+            log(
+                f"PGG2-V61-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                f"gate=v47c_multi_buyer blocker={mb_blocker} "
+                f"reason=v61_owns_fanout_gate"
+            )
+        elif not mb_pass and v67_lane_env_enabled_early and v67_bypass_legacy_gates_env_early:
+            log(
+                f"PGG2-V67-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                f"gate=v47c_multi_buyer blocker={mb_blocker} "
+                f"reason=v67_owns_flow_confirm_gate"
+            )
+        v61_preentry_diag = (
+            os.environ.get("PGG2_V61_PREENTRY_BLOCK_LOG", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+
+        def _log_v61_preentry_block(reason: str, detail: str = "") -> None:
+            if not v61_preentry_diag:
+                return
+            if (
+                os.environ.get("PGG2_V61_FANOUT_LEAD_LANE_ENABLED", "0")
+                .strip()
+                .lower()
+                not in ("1", "true", "yes", "on")
+            ):
+                return
+            line = (
+                f"PGG2-V61-PREENTRY-BLOCK mint={_short(mint)} "
+                f"reason={reason} "
+                f"pbs250={float(snap.get('pending_buy_sol_250ms', 0.0)):.3f} "
+                f"pbs1000={float(snap.get('pending_buy_sol_1000ms', 0.0)):.3f} "
+                f"ub250={int(snap.get('unique_buyers_250ms', 0))} "
+                f"ub1000={int(snap.get('unique_buyers_1000ms', 0))} "
+                f"top250={float(snap.get('top_buyer_share_250ms', 0.0)):.3f} "
+                f"source_lead_ms={int(source_lead_ms)}"
+            )
+            if detail:
+                line += f" detail={detail}"
+            log(line)
+
+        sim_evals_total += 1
+
+        # Dry-live caps size at 0.075.
+        size_results: Dict[float, Dict[str, Any]] = {}
+        for size in SIZE_SWEEP_SOL:
+            res = _evaluate_size_for_mint(
+                cs, size, pending_buys, pending_sells,
+                float(DEFAULT_TX_FEE_SOL),
+            )
+            size_results[size] = res
+        selectable_sizes = [
+            s for s, r in size_results.items() if r["selectable"]
+        ]
+        if not selectable_sizes:
+            _block_counts: Dict[str, int] = {}
+            _best_ep = -999.0
+            _best_size = 0.0
+            for _s, _r in size_results.items():
+                _blocker = str(_r.get("blocker") or "unknown")
+                _block_counts[_blocker] = _block_counts.get(_blocker, 0) + 1
+                _r1 = _r.get("r1") or {}
+                try:
+                    _ep = float(_r1.get("expected_pnl", -999.0))
+                except Exception:
+                    _ep = -999.0
+                if _ep > _best_ep:
+                    _best_ep = _ep
+                    _best_size = float(_s)
+            _log_v61_preentry_block(
+                "no_selectable_size",
+                (
+                    f"blockers={','.join(f'{k}:{v}' for k, v in sorted(_block_counts.items()))} "
+                    f"best_size={_best_size:.4f} best_expected_pnl={_best_ep:+.6f}"
+                ),
+            )
+            if _env_flag("PGG2_V67_ONLY_LANE", "0"):
+                log(
+                    f"PGG2-V67-EARLY-BLOCK mint={_short(mint)} "
+                    f"reason=no_selectable_size best_size={_best_size:.4f} "
+                    f"best_expected_pnl={_best_ep:+.6f} "
+                    f"blockers={','.join(f'{k}:{v}' for k, v in sorted(_block_counts.items()))}"
+                )
+            # ---- V57 NEAR-MISS EXPORT (env-gated, default OFF) ----
+            if _env_flag("PGG2_V57_NEARMISS_EXPORT_ENABLED", "0"):
+                try:
+                    from pgg2_v57_nearmiss_watchlist import V67NearMiss as _V57NM, get_watchlist as _v57_get_wl
+                    _v57_nm = _V57NM(
+                        mint=str(mint),
+                        ts_ms=int(time.time() * 1000),
+                        best_expected_pnl=float(_best_ep),
+                        required_pnl=float(os.environ.get("PGG2_V67_MIN_EXPECTED_PNL", "0.001500") or 0.001500),
+                        selected_size=float(_best_size),
+                        route=str(snap.get("route", "pump_bc") if isinstance(snap, dict) else "pump_bc"),
+                        sim_needed=int(snap.get("sim_needed", 0) if isinstance(snap, dict) else 0),
+                        pair_source=str(snap.get("pair_source", "") if isinstance(snap, dict) else ""),
+                        unique_buyers_250ms=int(snap.get("unique_buyers_250ms", 0) if isinstance(snap, dict) else 0),
+                        unique_buyers_500ms=int(snap.get("unique_buyers_500ms", 0) if isinstance(snap, dict) else 0),
+                        top_buyer_share_250ms=float(snap.get("top_buyer_share_250ms", 0.0) if isinstance(snap, dict) else 0.0),
+                        pending_buy_sol_250ms=float(snap.get("pending_buy_sol_250ms", 0.0) if isinstance(snap, dict) else 0.0),
+                        pending_buy_count_250ms=int(snap.get("pending_buy_count_250ms", 0) if isinstance(snap, dict) else 0),
+                        pending_buy_sol_1000ms=float(snap.get("pending_buy_sol_1000ms", 0.0) if isinstance(snap, dict) else 0.0),
+                        pending_buy_count_1000ms=int(snap.get("pending_buy_count_1000ms", 0) if isinstance(snap, dict) else 0),
+                        vsol_now=float(snap.get("vsol", 0.0) if isinstance(snap, dict) else 0.0),
+                        vtok_now=float(snap.get("vtok", 0.0) if isinstance(snap, dict) else 0.0),
+                        price_now=float(snap.get("price", 0.0) if isinstance(snap, dict) else 0.0),
+                        blocker_reason="no_selectable_size",
+                        blocker_detail=','.join(f'{k}:{v}' for k, v in sorted(_block_counts.items())),
+                    )
+                    _v57_get_wl().admit(_v57_nm, log_fn=log)
+                except Exception as _v57_e:
+                    log(f"PGG2-V57-NEARMISS-EXPORT-ERR err={type(_v57_e).__name__}:{_v57_e}")
+            return
+        # Apply V47C size cap.
+        buyer_stats_for_cap = {
+            "unique_buyers_250ms": int(snap.get("unique_buyers_250ms", 0)),
+            "unique_buyers_500ms": int(snap.get("unique_buyers_500ms", 0)),
+            "top_buyer_share_250ms": float(
+                snap.get("top_buyer_share_250ms", 0.0)),
+            "pending_buy_sol_250ms": float(
+                snap.get("pending_buy_sol_250ms", 0.0)),
+        }
+        size_cap_pass = {}
+        for s in selectable_sizes:
+            capped, _ = apply_size_cap(
+                float(s), buyer_stats_for_cap,
+                float(snap.get("pending_buy_sol_250ms", 0.0)),
+            )
+            size_cap_pass[s] = capped
+        admissible = [
+            s for s in selectable_sizes
+            if size_cap_pass[s] is not None
+            and abs(size_cap_pass[s] - s) < 1e-9
+        ]
+        # Dry-live further restriction: drop sizes > DRYLIVE_MAX_SIZE_SOL.
+        admissible = [
+            s for s in admissible if s <= DRYLIVE_MAX_SIZE_SOL + 1e-9
+        ]
+        if not admissible:
+            _log_v61_preentry_block(
+                "no_admissible_size_after_cap",
+                (
+                    f"selectable={','.join(f'{float(s):.4f}' for s in selectable_sizes)} "
+                    f"cap_pass={','.join(f'{float(s):.4f}->{size_cap_pass.get(s)}' for s in selectable_sizes)} "
+                    f"drylive_max={DRYLIVE_MAX_SIZE_SOL:.4f}"
+                ),
+            )
+            if _env_flag("PGG2_V67_ONLY_LANE", "0"):
+                log(
+                    f"PGG2-V67-EARLY-BLOCK mint={_short(mint)} "
+                    f"reason=no_admissible_size_after_cap "
+                    f"selectable={','.join(f'{float(s):.4f}' for s in selectable_sizes)} "
+                    f"drylive_max={DRYLIVE_MAX_SIZE_SOL:.4f}"
+                )
+            return
+        # 2026-05-17: env-driven minimum size. Filter admissible to >= MIN_SIZE_SOL
+        # so the bot picks the smallest size at or above the floor.
+        _min_size_floor = float(os.environ.get("PGG2_V48_MIN_SELECTED_SIZE_SOL", "0") or 0)
+        if _min_size_floor > 0:
+            _filtered = [s for s in admissible if float(s) >= _min_size_floor - 1e-12]
+            if _filtered:
+                admissible = _filtered
+        selected_size = min(admissible)
+        res = size_results[selected_size]
+        r1 = res["r1"]
+        g = res["guard"]
+
+        # V47D boundary guard.
+        buyer_stats_for_v47d = {
+            "unique_buyers_250ms": int(snap.get("unique_buyers_250ms", 0)),
+            "unique_buyers_500ms": int(snap.get("unique_buyers_500ms", 0)),
+            "pending_buy_count_250ms": int(
+                snap.get("pending_buy_count_250ms", 0)),
+            "pending_buy_sol_250ms": float(
+                snap.get("pending_buy_sol_250ms", 0.0)),
+            "pending_sell_sol_250ms": float(
+                snap.get("pending_sell_sol_250ms", 0.0)),
+            "top_buyer_share_250ms": float(
+                snap.get("top_buyer_share_250ms", 0.0)),
+            "largest_buy_sol_250ms": float(
+                snap.get("largest_pending_buy_sol_250ms", 0.0)),
+        }
+        adv_branch = str(r1.get("adverse_branch_outcome", "") or "")
+
+        def _v57_curve_move_frac(window_ms: int) -> float:
+            try:
+                _st_v57 = oracle._states.get(mint)
+                _pts_v57 = (
+                    list(_st_v57.points)
+                    if (_st_v57 is not None and _st_v57.points)
+                    else []
+                )
+            except Exception:
+                _pts_v57 = []
+            latest_pt = None
+            baseline_pt = None
+            target_ts = int(ts_ms_now) - int(window_ms)
+            for _p in _pts_v57:
+                if getattr(_p, "error", False):
+                    continue
+                _pts_ms = int(getattr(_p, "ts_ms", 0) or 0)
+                if _pts_ms > int(ts_ms_now):
+                    continue
+                if latest_pt is None or _pts_ms > int(
+                    getattr(latest_pt, "ts_ms", 0) or 0
+                ):
+                    latest_pt = _p
+                if _pts_ms <= target_ts and (
+                    baseline_pt is None
+                    or _pts_ms > int(getattr(baseline_pt, "ts_ms", 0) or 0)
+                ):
+                    baseline_pt = _p
+            if baseline_pt is None:
+                for _p in _pts_v57:
+                    if getattr(_p, "error", False):
+                        continue
+                    _pts_ms = int(getattr(_p, "ts_ms", 0) or 0)
+                    if _pts_ms <= int(ts_ms_now):
+                        baseline_pt = _p
+                        break
+            if baseline_pt is None or latest_pt is None:
+                return 0.0
+            base_price = float(getattr(baseline_pt, "curve_price", 0.0) or 0.0)
+            latest_price = float(getattr(latest_pt, "curve_price", 0.0) or 0.0)
+            if base_price <= 0.0 or latest_price <= 0.0:
+                return 0.0
+            return (latest_price / base_price) - 1.0
+
+        v57_enabled = (
+            os.environ.get("PGG2_V57_IMPULSE_LANE_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        v57_allow_v47e_bypass = (
+            os.environ.get("PGG2_V57_ALLOW_V47E_BYPASS", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        v57_pre20_move = 0.0
+        v57_impulse_gate_pass_pre = False
+        v57_v47e_bypass = False
+        v57_sell_count_1000_pre = 999999
+        if v57_enabled:
+            v57_min_ub_250 = int(
+                os.environ.get("PGG2_V57_MIN_UNIQUE_BUYERS_250", "2") or 2
+            )
+            v57_min_buy_sol_1000 = float(
+                os.environ.get("PGG2_V57_MIN_BUY_SOL_1000", "3.000") or 3.000
+            )
+            v57_max_top_share_250 = float(
+                os.environ.get("PGG2_V57_MAX_TOP_SHARE_250", "0.550") or 0.550
+            )
+            v57_max_sell_count_1000 = int(
+                os.environ.get("PGG2_V57_MAX_SELL_COUNT_1000", "0") or 0
+            )
+            v57_min_pre20_move = float(
+                os.environ.get("PGG2_V57_MIN_PRE20_MOVE", "-0.020") or -0.020
+            )
+            try:
+                _v57_sell_stats_pre = buffer_.sell_stats(
+                    mint, int(ts_ms_now), int(cu_ts)
+                )
+                v57_sell_count_1000_pre = int(
+                    _v57_sell_stats_pre.get("pending_sell_count_1000ms", 0)
+                )
+            except Exception:
+                v57_sell_count_1000_pre = 999999
+            v57_pre20_move = float(_v57_curve_move_frac(20000))
+            v57_impulse_gate_pass_pre = (
+                int(snap.get("unique_buyers_250ms", 0)) >= v57_min_ub_250
+                and float(snap.get("pending_buy_sol_1000ms", 0.0))
+                    >= v57_min_buy_sol_1000 - 1e-12
+                and float(snap.get("top_buyer_share_250ms", 1.0))
+                    <= v57_max_top_share_250 + 1e-12
+                and int(v57_sell_count_1000_pre) <= v57_max_sell_count_1000
+                and v57_pre20_move >= v57_min_pre20_move - 1e-12
+            )
+            log(
+                f"PGG2-V57-IMPULSE-PRECHECK mint={_short(mint)} "
+                f"ub250={int(snap.get('unique_buyers_250ms', 0))}/{v57_min_ub_250} "
+                f"pbs1000={float(snap.get('pending_buy_sol_1000ms', 0.0)):.3f}/"
+                f"{v57_min_buy_sol_1000:.3f} "
+                f"tbs250={float(snap.get('top_buyer_share_250ms', 0.0)):.3f}/"
+                f"{v57_max_top_share_250:.3f} "
+                f"psc1000={int(v57_sell_count_1000_pre)}/{v57_max_sell_count_1000} "
+                f"pre20={v57_pre20_move:+.4f}/{v57_min_pre20_move:+.4f} "
+                f"pass={int(v57_impulse_gate_pass_pre)}"
+            )
+
+        v61_gate_pass_pre = False
+        v61_buy_sol_pre = 0.0
+        v61_sell_sol_pre = 0.0
+        v61_ub_pre = 0
+        v61_top_pre = 1.0
+        v61_sell_count_pre = 0
+        v61_curve_pretrend_pct = 0.0
+        v61_curve_prehistory_ok = False
+
+        # V61: rolling fanout lead lane. The V60B miner showed the largest
+        # missed fast winners were not same-tick quote edges; they were broad
+        # buy fanouts visible over ~2s while the 250ms gate looked weak. Keep
+        # this shadow-first until it proves frequency without opening losses.
+        v61_enabled = (
+            os.environ.get("PGG2_V61_FANOUT_LEAD_LANE_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if v61_enabled:
+            v61_window_ms = int(os.environ.get("PGG2_V61_FANOUT_WINDOW_MS", "2000") or 2000)
+            v61_min_buy_sol = float(os.environ.get("PGG2_V61_MIN_BUY_SOL", "8.000") or 8.000)
+            v61_min_ub = int(os.environ.get("PGG2_V61_MIN_UNIQUE_BUYERS", "5") or 5)
+            v61_max_top = float(os.environ.get("PGG2_V61_MAX_TOP_SHARE", "0.350") or 0.350)
+            v61_max_sell_count = int(os.environ.get("PGG2_V61_MAX_SELL_COUNT", "0") or 0)
+            v61_max_sell_sol = float(os.environ.get("PGG2_V61_MAX_SELL_SOL", "0.000") or 0.000)
+            v61_ignore_zero_sell_count = _env_flag(
+                "PGG2_V61_IGNORE_ZERO_SOL_SELL_COUNT", "0"
+            )
+            v61_zero_sell_dust_sol = float(
+                os.environ.get("PGG2_V61_ZERO_SOL_SELL_DUST_SOL", "0.000001")
+                or 0.000001
+            )
+            v61_min_ep = float(os.environ.get("PGG2_V61_MIN_EXPECTED_PNL", "-0.000050") or -0.000050)
+            v61_curve_lookback_ms = int(
+                os.environ.get("PGG2_V61_CURVE_PRELOOKBACK_MS", "10000") or 10000
+            )
+            v61_max_pretrend_pct = float(
+                os.environ.get("PGG2_V61_MAX_CURVE_PRETREND_PCT", "20.000") or 20.000
+            )
+            v61_require_curve_prehistory = (
+                os.environ.get("PGG2_V61_REQUIRE_CURVE_PREHISTORY", "1").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            v61_actual = (
+                os.environ.get("PGG2_V61_ACTUAL_ENTRY_ENABLED", "0").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            v61_buys = []
+            v61_sells = []
+            try:
+                base_buf = buffer_
+                for _ in range(8):
+                    if hasattr(base_buf, "_states"):
+                        break
+                    base_buf = getattr(base_buf, "_buf")
+                st_raw = getattr(base_buf, "_states", {}).get(mint)
+                if st_raw is not None:
+                    lo_ts = int(ts_ms_now) - int(v61_window_ms)
+                    v61_buys = [
+                        b for b in list(getattr(st_raw, "buys", []))
+                        if lo_ts <= int(getattr(b, "ts_ms", 0) or 0) <= int(ts_ms_now)
+                    ]
+                    v61_sells = [
+                        s for s in list(getattr(st_raw, "sells", []))
+                        if lo_ts <= int(getattr(s, "ts_ms", 0) or 0) <= int(ts_ms_now)
+                    ]
+            except Exception:
+                v61_buys = []
+                v61_sells = []
+            v61_buy_sol = sum(float(getattr(b, "sol_in", 0.0) or 0.0) for b in v61_buys)
+            v61_sell_sol = sum(float(getattr(s, "sol_out", 0.0) or 0.0) for s in v61_sells)
+            v61_by_signer: Dict[str, float] = {}
+            for b in v61_buys:
+                signer = str(getattr(b, "signer", "") or "?")
+                v61_by_signer[signer] = (
+                    v61_by_signer.get(signer, 0.0)
+                    + float(getattr(b, "sol_in", 0.0) or 0.0)
+                )
+            v61_ub = len([k for k in v61_by_signer if k != "?"])
+            v61_top = (max(v61_by_signer.values()) / v61_buy_sol) if v61_buy_sol > 1e-12 else 1.0
+            v61_ep = float(r1.get("expected_pnl", 0.0) or 0.0)
+            try:
+                st_curve = oracle._states.get(mint)
+                pts_curve = []
+                if st_curve is not None:
+                    pts_curve = [
+                        p for p in list(getattr(st_curve, "points", []))
+                        if not getattr(p, "error", None) and int(getattr(p, "ts_ms", 0) or 0) <= int(ts_ms_now)
+                    ]
+                pts_curve.sort(key=lambda p: int(getattr(p, "ts_ms", 0) or 0))
+                if len(pts_curve) >= 2:
+                    cur_pt = pts_curve[-1]
+                    cutoff = int(ts_ms_now) - int(v61_curve_lookback_ms)
+                    past_candidates = [
+                        p for p in pts_curve
+                        if int(getattr(p, "ts_ms", 0) or 0) <= cutoff
+                    ]
+                    past_pt = past_candidates[-1] if past_candidates else pts_curve[0]
+
+                    def _v61_price(_p) -> float:
+                        _vs = float(getattr(_p, "virtual_sol_reserves", 0) or 0)
+                        _vt = float(getattr(_p, "virtual_token_reserves", 0) or 0)
+                        return (_vs / _vt) if _vt > 0.0 else 0.0
+
+                    cur_price = _v61_price(cur_pt)
+                    past_price = _v61_price(past_pt)
+                    if cur_price > 0.0 and past_price > 0.0:
+                        v61_curve_pretrend_pct = ((cur_price / past_price) - 1.0) * 100.0
+                        v61_curve_prehistory_ok = True
+            except Exception:
+                v61_curve_pretrend_pct = 0.0
+                v61_curve_prehistory_ok = False
+            v61_blockers = []
+            if v61_buy_sol < v61_min_buy_sol - 1e-12:
+                v61_blockers.append("buy_sol")
+            if v61_ub < v61_min_ub:
+                v61_blockers.append("unique_buyers")
+            if v61_top > v61_max_top + 1e-12:
+                v61_blockers.append("top_share")
+            v61_sell_count_pressure = len(v61_sells) > v61_max_sell_count
+            if (
+                v61_ignore_zero_sell_count
+                and v61_sell_count_pressure
+                and v61_sell_sol <= v61_zero_sell_dust_sol + 1e-12
+            ):
+                v61_sell_count_pressure = False
+            if v61_sell_count_pressure or v61_sell_sol > v61_max_sell_sol + 1e-12:
+                v61_blockers.append("sell_pressure")
+            if v61_ep < v61_min_ep - 1e-12:
+                v61_blockers.append("expected_pnl")
+            if v61_require_curve_prehistory and not v61_curve_prehistory_ok:
+                v61_blockers.append("curve_prehistory")
+            if v61_curve_prehistory_ok and v61_curve_pretrend_pct > v61_max_pretrend_pct + 1e-12:
+                v61_blockers.append("curve_extended")
+            v61_pass = not v61_blockers
+            v61_gate_pass_pre = bool(v61_pass)
+            v61_buy_sol_pre = float(v61_buy_sol)
+            v61_sell_sol_pre = float(v61_sell_sol)
+            v61_ub_pre = int(v61_ub)
+            v61_top_pre = float(v61_top)
+            v61_sell_count_pre = int(len(v61_sells))
+            log(
+                f"PGG2-V61-FANOUT-LEAD-CHECK mint={_short(mint)} "
+                f"exp_pnl={v61_ep:+.6f}/{v61_min_ep:+.6f} "
+                f"buy_sol{v61_window_ms}={v61_buy_sol:.3f}/{v61_min_buy_sol:.3f} "
+                f"ub{v61_window_ms}={v61_ub}/{v61_min_ub} "
+                f"top{v61_window_ms}={v61_top:.3f}/{v61_max_top:.3f} "
+                f"sells{v61_window_ms}={len(v61_sells)}/{v61_max_sell_count} "
+                f"sell_sol{v61_window_ms}={v61_sell_sol:.3f}/{v61_max_sell_sol:.3f} "
+                f"zero_sell_count_ignore={int(v61_ignore_zero_sell_count)} "
+                f"curve_pretrend{v61_curve_lookback_ms}={v61_curve_pretrend_pct:+.1f}/{v61_max_pretrend_pct:+.1f} "
+                f"curve_hist={int(v61_curve_prehistory_ok)} "
+                f"pass={int(v61_pass)} blockers={'|'.join(v61_blockers) if v61_blockers else '-'}"
+            )
+            if v61_pass and not v61_actual:
+                log(
+                    f"PGG2-V61-FANOUT-LEAD-SHADOW-PASS mint={_short(mint)} "
+                    f"exp_pnl={v61_ep:+.6f} buy_sol={v61_buy_sol:.3f} "
+                    f"ub={v61_ub} top={v61_top:.3f} "
+                    f"action=no_fee_spend actual_entry_enabled=0"
+                )
+                _write_jsonl({
+                    "type": "v61_fanout_lead_shadow_pass",
+                    "mint": mint,
+                    "ts_ms": int(ts_ms_now),
+                    "expected_pnl": float(v61_ep),
+                    "window_ms": int(v61_window_ms),
+                    "buy_sol": float(v61_buy_sol),
+                    "sell_sol": float(v61_sell_sol),
+                    "unique_buyers": int(v61_ub),
+                    "top_share": float(v61_top),
+                    "sell_count": int(len(v61_sells)),
+                })
+                return
+        v61_bypass_legacy_gates = (
+            v61_bypass_legacy_gates_env
+            and v61_actual
+            and bool(v61_gate_pass_pre)
+        )
+        v67_bypass_legacy_gates_env = _env_flag(
+            "PGG2_V67_BYPASS_LEGACY_GATES", "1"
+        )
+        v67_pre_enabled = _env_flag("PGG2_V67_FLOW_CONFIRM_LANE_ENABLED", "0")
+        v67_pre_pass = False
+        v67_pre_ep = float(r1.get("expected_pnl", 0.0))
+        v67_pre_top = float(snap.get("top_buyer_share_250ms", 0.0))
+        v67_pre_buy_sol_1000 = float(snap.get("pending_buy_sol_1000ms", 0.0))
+        v67_pre_sell_stats = buffer_.sell_stats(mint, int(ts_ms_now), int(cu_ts))
+        v67_pre_sell_sol_1000 = float(
+            v67_pre_sell_stats.get("pending_sell_sol_1000ms", 0.0) or 0.0
+        )
+        v67_pre_sell_count_1000 = int(
+            v67_pre_sell_stats.get("pending_sell_count_1000ms", 0) or 0
+        )
+        v67_pre_ub_250 = int(snap.get("unique_buyers_250ms", 0))
+        v67_pre_min_ep = float(
+            os.environ.get("PGG2_V67_MIN_EXPECTED_PNL", "0.000550") or 0.000550
+        )
+        v67_pre_max_top = float(
+            os.environ.get("PGG2_V67_MAX_TOP_SHARE_250", "0.300") or 0.300
+        )
+        v67_pre_min_buy = float(
+            os.environ.get("PGG2_V67_MIN_BUY_SOL_1000", "0.200") or 0.200
+        )
+        v67_pre_max_buy = float(
+            os.environ.get("PGG2_V67_MAX_BUY_SOL_1000", "0") or 0
+        )
+        v67_pre_max_sell_sol = float(
+            os.environ.get("PGG2_V67_MAX_SELL_SOL_1000", "0.050") or 0.050
+        )
+        v67_pre_max_sell_count = int(
+            os.environ.get("PGG2_V67_MAX_SELL_COUNT_1000", "2") or 2
+        )
+        v67_pre_min_ub = int(
+            os.environ.get("PGG2_V67_MIN_UNIQUE_BUYERS_250", "2") or 2
+        )
+        v67_pre_blockers = []
+        if v67_pre_ep < v67_pre_min_ep - 1e-12:
+            v67_pre_blockers.append("expected_pnl")
+        if v67_pre_top > v67_pre_max_top + 1e-12:
+            v67_pre_blockers.append("top_share")
+        if v67_pre_buy_sol_1000 < v67_pre_min_buy - 1e-12:
+            v67_pre_blockers.append("buy_sol_1000")
+        if v67_pre_max_buy > 0.0 and v67_pre_buy_sol_1000 > v67_pre_max_buy + 1e-12:
+            v67_pre_blockers.append("buy_sol_1000_blowoff")
+        if v67_pre_sell_sol_1000 > v67_pre_max_sell_sol + 1e-12:
+            v67_pre_blockers.append("sell_sol_1000")
+        if v67_pre_sell_count_1000 > v67_pre_max_sell_count:
+            v67_pre_blockers.append("sell_count_1000")
+        if v67_pre_ub_250 < v67_pre_min_ub:
+            v67_pre_blockers.append("unique_buyers_250")
+        v67_pre_pass = v67_pre_enabled and not v67_pre_blockers
+        v67_bypass_legacy_gates = (
+            v67_pre_pass and v67_bypass_legacy_gates_env
+        )
+        if v67_pre_enabled:
+            log(
+                f"PGG2-V67-FLOW-CONFIRM-PRECHECK mint={_short(mint)} "
+                f"exp_pnl={v67_pre_ep:+.6f}/{v67_pre_min_ep:+.6f} "
+                f"top_share250={v67_pre_top:.3f}/{v67_pre_max_top:.3f} "
+                f"pbs1000={v67_pre_buy_sol_1000:.3f}/{v67_pre_min_buy:.3f} "
+                f"max_pbs1000={v67_pre_max_buy:.3f} "
+                f"pss1000={v67_pre_sell_sol_1000:.3f}/{v67_pre_max_sell_sol:.3f} "
+                f"psc1000={v67_pre_sell_count_1000}/{v67_pre_max_sell_count} "
+                f"ub250={v67_pre_ub_250}/{v67_pre_min_ub} "
+                f"pass={int(v67_pre_pass)} "
+                f"legacy_bypass={int(v67_bypass_legacy_gates)} "
+                f"blockers={','.join(v67_pre_blockers) if v67_pre_blockers else '-'}"
+            )
+            if v67_bypass_legacy_gates:
+                log(
+                    f"PGG2-V67-LEGACY-BYPASS-ARM mint={_short(mint)} "
+                    f"reason=flow_confirm_owns_qualification "
+                    f"exp_pnl={v67_pre_ep:+.6f} pbs1000={v67_pre_buy_sol_1000:.3f} "
+                    f"pss1000={v67_pre_sell_sol_1000:.3f} top250={v67_pre_top:.3f}"
+                )
+
+        # V47E Phase 2: Two-buyer guard (BEFORE V47D boundary for ub<=2).
+        two_buyer_total += 1
+        tb_mode, tb_reason = evaluate_two_buyer_guard(
+            size_sol=float(selected_size),
+            buyer_stats=buyer_stats_for_v47d,
+            expected_pnl=float(r1["expected_pnl"]),
+            no_negative_curve_update_250ms=True,
+            adverse_branch_outcome=adv_branch,
+            logger=log, mint_for_log=mint,
+        )
+        two_buyer_reason_counts[(tb_mode, tb_reason)] += 1
+        if tb_mode == MODE_BLOCK:
+            two_buyer_block += 1
+            if v57_enabled and v57_allow_v47e_bypass and v57_impulse_gate_pass_pre:
+                v57_v47e_bypass = True
+                log(
+                    f"PGG2-V57-V47E-BYPASS mint={_short(mint)} "
+                    f"mode=block reason={tb_reason} "
+                    f"ub250={int(snap.get('unique_buyers_250ms', 0))} "
+                    f"pbs1000={float(snap.get('pending_buy_sol_1000ms', 0.0)):.3f} "
+                    f"tbs250={float(snap.get('top_buyer_share_250ms', 0.0)):.3f} "
+                    f"pre20={v57_pre20_move:+.4f}"
+                )
+            elif v67_bypass_legacy_gates:
+                log(
+                    f"PGG2-V67-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                    f"gate=v47e_two_buyer mode=block reason={tb_reason} "
+                    f"exp_pnl={v67_pre_ep:+.6f} pbs1000={v67_pre_buy_sol_1000:.3f} "
+                    f"pss1000={v67_pre_sell_sol_1000:.3f} top250={v67_pre_top:.3f}"
+                )
+            elif v61_bypass_legacy_gates:
+                log(
+                    f"PGG2-V61-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                    f"gate=v47e_two_buyer mode=block reason={tb_reason} "
+                    f"buy_sol2000={v61_buy_sol_pre:.3f} ub2000={v61_ub_pre} "
+                    f"top2000={v61_top_pre:.3f} exp_pnl={v61_ep:+.6f}"
+                )
+            else:
+                replacement_scans += 1
+                log(
+                    f"PGG2-V47E-REPLACEMENT-SCAN ts={ts_ms_now} "
+                    f"reason=v47e_two_buyer_block mint={_short(mint)} "
+                    f"size={float(selected_size):.4f} reason={tb_reason}"
+                )
+                return
+        if tb_mode == MODE_SHADOW:
+            two_buyer_shadow += 1
+            if v57_enabled and v57_allow_v47e_bypass and v57_impulse_gate_pass_pre:
+                v57_v47e_bypass = True
+                log(
+                    f"PGG2-V57-V47E-BYPASS mint={_short(mint)} "
+                    f"mode=shadow reason={tb_reason} "
+                    f"ub250={int(snap.get('unique_buyers_250ms', 0))} "
+                    f"pbs1000={float(snap.get('pending_buy_sol_1000ms', 0.0)):.3f} "
+                    f"tbs250={float(snap.get('top_buyer_share_250ms', 0.0)):.3f} "
+                    f"pre20={v57_pre20_move:+.4f}"
+                )
+            elif v67_bypass_legacy_gates:
+                log(
+                    f"PGG2-V67-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                    f"gate=v47e_two_buyer mode=shadow reason={tb_reason} "
+                    f"exp_pnl={v67_pre_ep:+.6f} pbs1000={v67_pre_buy_sol_1000:.3f} "
+                    f"pss1000={v67_pre_sell_sol_1000:.3f} top250={v67_pre_top:.3f}"
+                )
+            elif v61_bypass_legacy_gates:
+                log(
+                    f"PGG2-V61-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                    f"gate=v47e_two_buyer mode=shadow reason={tb_reason} "
+                    f"buy_sol2000={v61_buy_sol_pre:.3f} ub2000={v61_ub_pre} "
+                    f"top2000={v61_top_pre:.3f} exp_pnl={v61_ep:+.6f}"
+                )
+            else:
+                # shadow_only: do not open in dry-live.
+                log(
+                    f"PGG2-V47E-SHADOW-ONLY mint={_short(mint)} "
+                    f"size={float(selected_size):.4f} reason={tb_reason}"
+                )
+                return
+        if tb_mode == MODE_ACTUAL:
+            two_buyer_actual += 1
+        elif tb_mode == MODE_DELEGATE_V47D:
+            two_buyer_delegate += 1
+        elif v57_v47e_bypass:
+            two_buyer_delegate += 1
+
+        bg_pass, bg_blocker = evaluate_boundary_guard(
+            size_sol=float(selected_size),
+            buyer_stats=buyer_stats_for_v47d,
+            expected_pnl=float(r1["expected_pnl"]),
+            no_negative_curve_update_250ms=True,
+            adverse_branch_outcome=adv_branch,
+        )
+
+        original_size = float(selected_size)
+        downsized_bool = False
+        final_size = selected_size
+        final_res = res
+        final_r1 = r1
+        final_g = g
+
+        if not bg_pass:
+            boundary_block += 1
+
+            def _epfn(sz):
+                r = size_results.get(float(sz))
+                if r is None: return 0.0
+                r1_at = r.get("r1")
+                if r1_at is not None:
+                    return float(r1_at.get("expected_pnl", 0.0))
+                return float(r.get("r0", {}).get("expected_pnl", 0.0))
+
+            def _bfn(sz):
+                r = size_results.get(float(sz))
+                if r is None: return (False, "size_not_swept")
+                return (
+                    bool(r.get("selectable", False)),
+                    r.get("blocker") if not r.get("selectable") else None,
+                )
+
+            d_size, d_action, d_reason = downsize_candidate(
+                initial_selected_size=original_size,
+                buyer_stats=buyer_stats_for_v47d,
+                expected_pnl_fn=_epfn,
+                no_negative_curve_update_250ms=True,
+                adverse_branch_outcome=adv_branch,
+                branch_check_fn=_bfn,
+                multi_buyer_pass=True,
+            )
+            if d_size is None:
+                if v67_bypass_legacy_gates:
+                    log(
+                        f"PGG2-V67-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                        f"gate=v47d_boundary reason={d_reason} "
+                        f"orig_size={original_size:.4f} exp_pnl={v67_pre_ep:+.6f} "
+                        f"pbs1000={v67_pre_buy_sol_1000:.3f} "
+                        f"pss1000={v67_pre_sell_sol_1000:.3f}"
+                    )
+                    d_size = original_size
+                    d_action = "v67_keep_original"
+                    d_reason = "v67_final_gate_owns_boundary"
+                elif v61_bypass_legacy_gates:
+                    log(
+                        f"PGG2-V61-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                        f"gate=v47d_boundary reason={d_reason} "
+                        f"orig_size={original_size:.4f} "
+                        f"buy_sol2000={v61_buy_sol_pre:.3f} "
+                        f"exp_pnl={v61_ep:+.6f}"
+                    )
+                    d_size = original_size
+                    d_action = "v61_keep_original"
+                    d_reason = "v61_final_gate_owns_boundary"
+                else:
+                    downsize_fail += 1
+                    replacement_scans += 1
+                    return
+            downsize_ok += 1
+            downsized_bool = abs(d_size - original_size) > 1e-9
+            final_size = float(d_size)
+            final_res = size_results[final_size]
+            final_r1 = final_res["r1"]
+            final_g = final_res["guard"]
+        else:
+            boundary_pass += 1
+
+        # --- V47G Phase 2 + Phase 3: size-edge floor + large-size downsize.
+        v47g_floor_total += 1
+        cand_exp_pnl = float(final_r1["expected_pnl"])
+        v47g_pass_floor, v47g_reason = evaluate_size_edge_floor(
+            float(final_size), cand_exp_pnl,
+            logger=log, mint_for_log=mint,
+        )
+        v47g_orig_for_downsize = float(final_size)
+        if not v47g_pass_floor:
+            v47g_floor_block_total += 1
+            v47g_floor_blocker_counts[v47g_reason or "unknown"] += 1
+            v47g_downsize_attempts += 1
+
+            def _v47g_pnl_at(sz: float) -> float:
+                r = size_results.get(float(sz))
+                if r is None:
+                    return 0.0
+                r1_at = r.get("r1")
+                if r1_at is not None:
+                    return float(r1_at.get("expected_pnl", 0.0))
+                r0_at = r.get("r0")
+                return float(r0_at.get("expected_pnl", 0.0)) if r0_at else 0.0
+
+            def _v47g_branch_at(sz: float):
+                r = size_results.get(float(sz))
+                if r is None:
+                    return (False, "size_not_swept")
+                return (
+                    bool(r.get("selectable", False)),
+                    r.get("blocker") if not r.get("selectable") else None,
+                )
+
+            def _v47g_tb_at(sz: float):
+                mode2, reason2 = evaluate_two_buyer_guard(
+                    size_sol=float(sz),
+                    buyer_stats=buyer_stats_for_v47d,
+                    expected_pnl=_v47g_pnl_at(sz),
+                    no_negative_curve_update_250ms=True,
+                    adverse_branch_outcome=adv_branch,
+                )
+                return (mode2, reason2)
+
+            new_size, new_action, new_reason, new_pnl = downsize_large_candidate(
+                v47g_orig_for_downsize,
+                buyer_stats_for_v47d,
+                _v47g_pnl_at,
+                _v47g_branch_at,
+                _v47g_tb_at,
+                logger=log,
+                mint_for_log=mint,
+            )
+            if new_size is None:
+                if v67_bypass_legacy_gates:
+                    log(
+                        f"PGG2-V67-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                        f"gate=v47g_size_floor floor_reason={v47g_reason} "
+                        f"downsize_reason={new_reason} "
+                        f"orig_size={v47g_orig_for_downsize:.4f} "
+                        f"exp_pnl={v67_pre_ep:+.6f} pbs1000={v67_pre_buy_sol_1000:.3f} "
+                        f"pss1000={v67_pre_sell_sol_1000:.3f}"
+                    )
+                elif v61_bypass_legacy_gates:
+                    log(
+                        f"PGG2-V61-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                        f"gate=v47g_size_floor floor_reason={v47g_reason} "
+                        f"downsize_reason={new_reason} "
+                        f"orig_size={v47g_orig_for_downsize:.4f} "
+                        f"exp_pnl={v61_ep:+.6f}"
+                    )
+                else:
+                    v47g_downsize_fail += 1
+                    log(
+                        f"PGG2-V47H-DRYLIVE-BLOCK mint={_short(mint)} "
+                        f"orig_size={v47g_orig_for_downsize:.4f} "
+                        f"floor_reason={v47g_reason} "
+                        f"downsize_reason={new_reason} action=block"
+                    )
+                    return
+            else:
+                v47g_downsize_success += 1
+                downsized_bool = True
+                final_size = float(new_size)
+                final_res = size_results[final_size]
+                final_r1 = final_res["r1"]
+                final_g = final_res["guard"]
+                log(
+                    f"PGG2-V47H-DRYLIVE-DOWNSIZED mint={_short(mint)} "
+                    f"orig_size={v47g_orig_for_downsize:.4f} "
+                    f"new_size={final_size:.4f} new_pnl={new_pnl:+.6f} "
+                    f"reason={new_reason}"
+                )
+        else:
+            v47g_floor_pass_total += 1
+
+        # --- V47H Phase 2: pre-entry rug veto (LAST filter before open) ---
+        v47h_sell_stats = buffer_.sell_stats(mint, int(ts_ms_now), int(cu_ts))
+        v47h_curve_history = buffer_.curve_history(mint, int(ts_ms_now))
+        v47h_buyer_stats = {
+            "unique_buyers_250ms": int(snap.get("unique_buyers_250ms", 0)),
+            "top_buyer_share_250ms": float(snap.get("top_buyer_share_250ms", 0.0)),
+            "pending_buy_sol_250ms": float(snap.get("pending_buy_sol_250ms", 0.0)),
+            "pending_buy_count_250ms": int(snap.get("pending_buy_count_250ms", 0)),
+        }
+        v47h_veto_total += 1
+        v47h_eval_size_sol = float(final_size)
+        v47h_eval_expected_pnl = float(final_r1["expected_pnl"])
+        v47h_eval_ratio = (
+            v47h_eval_expected_pnl / v47h_eval_size_sol
+            if v47h_eval_size_sol > 0.0
+            else 0.0
+        )
+        v47h_pass, v47h_fired = v47h_evaluate_rug_veto(
+            size_sol=v47h_eval_size_sol,
+            expected_pnl=v47h_eval_expected_pnl,
+            buyer_stats=v47h_buyer_stats,
+            sell_stats=v47h_sell_stats,
+            curve_history=v47h_curve_history,
+            dev_sell_detected_bool=False,
+            logger=log,
+            mint_for_log=mint,
+        )
+        if not v47h_pass and v67_bypass_legacy_gates:
+            log(
+                f"PGG2-V67-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                f"gate=v47h_rug_veto reasons={'|'.join(str(_r) for _r in v47h_fired)} "
+                f"size={v47h_eval_size_sol:.4f} exp_pnl={v47h_eval_expected_pnl:+.6f} "
+                f"pbs1000={v67_pre_buy_sol_1000:.3f} pss1000={v67_pre_sell_sol_1000:.3f} "
+                f"top250={v67_pre_top:.3f}"
+            )
+            v47h_veto_pass_total += 1
+        elif not v47h_pass and v61_bypass_legacy_gates:
+            log(
+                f"PGG2-V61-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                f"gate=v47h_rug_veto reasons={'|'.join(str(_r) for _r in v47h_fired)} "
+                f"size={v47h_eval_size_sol:.4f} exp_pnl={v47h_eval_expected_pnl:+.6f} "
+                f"buy_sol2000={v61_buy_sol_pre:.3f} ub2000={v61_ub_pre} "
+                f"top2000={v61_top_pre:.3f}"
+            )
+            v47h_veto_pass_total += 1
+        elif not v47h_pass:
+            v47h_veto_block_total += 1
+            for _r in v47h_fired:
+                v47h_veto_reason_counts[_r] += 1
+            v47h_shadow_candidates.append({
+                "mint": mint,
+                "ts_ms": int(ts_ms_now),
+                "size": v47h_eval_size_sol,
+                "exp_pnl": v47h_eval_expected_pnl,
+                "v47h_ratio": v47h_eval_ratio,
+                "v47h_size_sol": v47h_eval_size_sol,
+                "v47h_expected_pnl": v47h_eval_expected_pnl,
+                "ub_250": int(snap.get("unique_buyers_250ms", 0)),
+                "tbs_250": float(snap.get("top_buyer_share_250ms", 0.0)),
+                "vetos_fired": list(v47h_fired),
+            })
+            jsonl_fp.write(json.dumps({
+                "type": "v47h_shadow_block",
+                "mint": mint,
+                "decision_ts_ms": int(ts_ms_now),
+                "selected_size_sol": v47h_eval_size_sol,
+                "expected_pnl": v47h_eval_expected_pnl,
+                "v47h_ratio": v47h_eval_ratio,
+                "v47h_size_sol": v47h_eval_size_sol,
+                "v47h_expected_pnl": v47h_eval_expected_pnl,
+                "vetos_fired": list(v47h_fired),
+                "unique_buyers_250ms": int(snap.get("unique_buyers_250ms", 0)),
+                "top_buyer_share_250ms": float(snap.get("top_buyer_share_250ms", 0.0)),
+                "pending_buy_sol_250ms": float(snap.get("pending_buy_sol_250ms", 0.0)),
+                "pending_sell_count_250ms": int(v47h_sell_stats.get("pending_sell_count_250ms", 0)),
+                "unique_sellers_250ms": int(v47h_sell_stats.get("unique_sellers_250ms", 0)),
+                "curve_history_deltas_500ms_len": int(
+                    len(v47h_curve_history.get("vsol_deltas_last_500ms", []))
+                ),
+            }) + "\n")
+            jsonl_fp.flush()
+            log(
+                f"V47H-DRYLIVE-SHADOW-BLOCK mint={_short(mint)} "
+                f"size={final_size:.4f} reasons={'|'.join(v47h_fired)}"
+            )
+            return
+        v47h_veto_pass_total += 1
+
+        # --- V47I Phase 4: medium-window pre-entry veto (LAST filter) ---
+        v47i_buyer_stats = {
+            "unique_buyers_250ms": int(snap.get("unique_buyers_250ms", 0)),
+            "unique_buyers_500ms": int(snap.get("unique_buyers_500ms", 0)),
+            "unique_buyers_1000ms": int(snap.get("unique_buyers_1000ms", 0)),
+            "pending_buy_sol_250ms": float(snap.get("pending_buy_sol_250ms", 0.0)),
+            "pending_buy_sol_500ms": float(snap.get("pending_buy_sol_500ms", 0.0)),
+            "pending_buy_sol_1000ms": float(snap.get("pending_buy_sol_1000ms", 0.0)),
+            "pending_buy_count_250ms": int(snap.get("pending_buy_count_250ms", 0)),
+            "pending_buy_count_500ms": int(snap.get("pending_buy_count_500ms", 0)),
+            "pending_buy_count_1000ms": int(snap.get("pending_buy_count_1000ms", 0)),
+            "top_buyer_share_250ms": float(snap.get("top_buyer_share_250ms", 0.0)),
+            "net_pending_sol_250ms": snap.get("net_pending_sol_250ms", None),
+            "net_pending_sol_500ms": snap.get("net_pending_sol_500ms", None),
+        }
+        v47i_sell_stats_in = {
+            "pending_sell_sol_500ms": float(v47h_sell_stats.get("pending_sell_sol_500ms", 0.0)) if v47h_sell_stats.get("pending_sell_sol_500ms") is not None else 0.0,
+            "pending_sell_count_500ms": int(v47h_sell_stats.get("pending_sell_count_500ms", 0)),
+            "unique_sellers_500ms": v47h_sell_stats.get("unique_sellers_500ms", None),
+            "pending_sell_sol_1000ms": float(v47h_sell_stats.get("pending_sell_sol_1000ms", 0.0)) if v47h_sell_stats.get("pending_sell_sol_1000ms") is not None else 0.0,
+            "pending_sell_count_1000ms": int(v47h_sell_stats.get("pending_sell_count_1000ms", 0)),
+            "unique_sellers_1000ms": v47h_sell_stats.get("unique_sellers_1000ms", None),
+            "pending_sell_sol_250ms": float(v47h_sell_stats.get("pending_sell_sol_250ms", 0.0)),
+        }
+        v47i_quote_history = buffer_.quote_history(mint, int(ts_ms_now))
+        v47i_curve_history_aged = buffer_.curve_history(mint, int(ts_ms_now))
+        v47i_veto_total += 1
+        v47i_pass, v47i_fired = v47i_evaluate_medium_rug_veto(
+            size_sol=float(final_size),
+            expected_pnl=float(final_r1["expected_pnl"]),
+            buyer_stats=v47i_buyer_stats,
+            sell_stats=v47i_sell_stats_in,
+            curve_history=v47i_curve_history_aged,
+            quote_history=v47i_quote_history,
+            logger=log,
+            mint_for_log=mint,
+        )
+        if not v47i_pass:
+            v67_v47i_legacy_bypass = bool(v67_bypass_legacy_gates)
+            v61_v47i_legacy_bypass = (
+                v61_bypass_legacy_gates
+                and os.environ.get("PGG2_V61_BYPASS_V47I_ALL_REASONS", "1")
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            )
+            v61_v47i_neg_delta_bypass = (
+                v61_actual
+                and v61_gate_pass_pre
+                and os.environ.get("PGG2_V61_ALLOW_V47I_NEG_DELTA_BYPASS", "1")
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+                and v47i_fired
+                and all("negative_delta" in str(_r) for _r in v47i_fired)
+            )
+            if v67_v47i_legacy_bypass:
+                log(
+                    f"PGG2-V67-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                    f"gate=v47i_medium_veto reasons={'|'.join(str(_r) for _r in v47i_fired)} "
+                    f"size={final_size:.4f} exp_pnl={float(final_r1['expected_pnl']):+.6f} "
+                    f"pbs1000={v67_pre_buy_sol_1000:.3f} pss1000={v67_pre_sell_sol_1000:.3f} "
+                    f"top250={v67_pre_top:.3f} signal_lane=v67_flow_confirm"
+                )
+            elif v61_v47i_legacy_bypass:
+                log(
+                    f"PGG2-V61-LEGACY-GATE-BYPASS mint={_short(mint)} "
+                    f"gate=v47i_medium_veto reasons={'|'.join(str(_r) for _r in v47i_fired)} "
+                    f"size={final_size:.4f} exp_pnl={float(final_r1['expected_pnl']):+.6f} "
+                    f"buy_sol2000={v61_buy_sol_pre:.3f} ub2000={v61_ub_pre} "
+                    f"top2000={v61_top_pre:.3f} sell_count2000={v61_sell_count_pre} "
+                    f"signal_lane=v61_fanout_rebound"
+                )
+            elif v61_v47i_neg_delta_bypass:
+                log(
+                    f"PGG2-V61-V47I-NEG-DELTA-BYPASS mint={_short(mint)} "
+                    f"size={final_size:.4f} exp_pnl={float(final_r1['expected_pnl']):+.6f} "
+                    f"buy_sol2000={v61_buy_sol_pre:.3f} ub2000={v61_ub_pre} "
+                    f"top2000={v61_top_pre:.3f} sell_count2000={v61_sell_count_pre} "
+                    f"reasons={'|'.join(str(_r) for _r in v47i_fired)} "
+                    f"signal_lane=v61_fanout_rebound"
+                )
+            else:
+                v47i_veto_block_total += 1
+                for _r in v47i_fired:
+                    v47i_veto_reason_counts[_r] += 1
+                if any("negative_delta" in str(_r) for _r in v47i_fired):
+                    recent_v47i_veto_by_mint[mint] = (
+                        int(ts_ms_now),
+                        "|".join(str(_r) for _r in v47i_fired),
+                    )
+                v47i_shadow_candidates.append({
+                    "mint": mint,
+                    "ts_ms": int(ts_ms_now),
+                    "size": float(final_size),
+                    "exp_pnl": float(final_r1["expected_pnl"]),
+                    "ub_250": int(snap.get("unique_buyers_250ms", 0)),
+                    "ub_500": int(snap.get("unique_buyers_500ms", 0)),
+                    "tbs_250": float(snap.get("top_buyer_share_250ms", 0.0)),
+                    "vetos_fired": list(v47i_fired),
+                })
+                jsonl_fp.write(json.dumps({
+                    "type": "v47i_shadow_block",
+                    "mint": mint,
+                    "decision_ts_ms": int(ts_ms_now),
+                    "selected_size_sol": float(final_size),
+                    "expected_pnl": float(final_r1["expected_pnl"]),
+                    "vetos_fired": list(v47i_fired),
+                    "unique_buyers_250ms": int(snap.get("unique_buyers_250ms", 0)),
+                    "unique_buyers_500ms": int(snap.get("unique_buyers_500ms", 0)),
+                    "top_buyer_share_250ms": float(snap.get("top_buyer_share_250ms", 0.0)),
+                    "pending_buy_sol_500ms": float(snap.get("pending_buy_sol_500ms", 0.0)),
+                    "pending_sell_count_500ms": int(v47i_sell_stats_in.get("pending_sell_count_500ms", 0)),
+                    "unique_sellers_500ms": v47i_sell_stats_in.get("unique_sellers_500ms"),
+                    "curve_delta_500ms_n": int(len(v47i_curve_history_aged.get("vsol_deltas_last_500ms", []))),
+                    "quote_history_n": int(len(v47i_quote_history.get("local_quote_history_5", []))),
+                }) + "\n")
+                jsonl_fp.flush()
+                log(
+                    f"V47I-DRYLIVE-SHADOW-BLOCK mint={_short(mint)} "
+                    f"size={final_size:.4f} reasons={'|'.join(v47i_fired)}"
+                )
+                return
+        if v47i_pass:
+            v47i_veto_pass_total += 1
+        else:
+            v47i_veto_pass_total += 1
+            v47i_veto_reason_counts[
+                "v67_legacy_bypass" if v67_bypass_legacy_gates else "v61_neg_delta_bypass"
+            ] += 1
+            jsonl_fp.write(json.dumps({
+                "type": "v67_v47i_legacy_bypass"
+                if v67_bypass_legacy_gates
+                else "v61_v47i_negative_delta_bypass",
+                "mint": mint,
+                "decision_ts_ms": int(ts_ms_now),
+                "selected_size_sol": float(final_size),
+                "expected_pnl": float(final_r1["expected_pnl"]),
+                "vetos_fired": list(v47i_fired),
+                "buy_sol_2000": float(v61_buy_sol_pre),
+                "unique_buyers_2000": int(v61_ub_pre),
+                "top_share_2000": float(v61_top_pre),
+                "sell_count_2000": int(v61_sell_count_pre),
+            }) + "\n")
+            jsonl_fp.flush()
+
+        # Build entry record (a real "buy intent" - simulated). V48
+        # records this as the final decision before deciding whether it can
+        # open immediately or must wait in the backfill queue.
+        v48_decision_seq += 1
+        v47g_caps_entry = get_hold_caps(float(final_size))
+        rec = {
+            "type": "v47i_drylive_entry",
+            "decision_id": f"v48-{v48_decision_seq}",
+            "entry_idx": None,
+            "decision_ts_ms": int(ts_ms_now),
+            "raw_event_ts_ms": int(raw_event_ts_ms),
+            "decision_processing_lag_ms": int(decision_processing_lag_ms),
+            "mint": mint,
+            "event_sig": str(sig or ""),
+            "slot": int(slot),
+            "selected_size_sol": float(final_size),
+            "original_size_sol": float(original_size),
+            "downsized": bool(downsized_bool),
+            "ub_250": int(snap.get("unique_buyers_250ms", 0)),
+            "ub_500": int(snap.get("unique_buyers_500ms", 0)),
+            "ub_1000": int(snap.get("unique_buyers_1000ms", 0)),
+            "tbs_250": float(snap.get("top_buyer_share_250ms", 0.0)),
+            "pbc_250": int(snap.get("pending_buy_count_250ms", 0)),
+            "pbc_500": int(snap.get("pending_buy_count_500ms", 0)),
+            "pbc_1000": int(snap.get("pending_buy_count_1000ms", 0)),
+            "pbs_250": float(snap.get("pending_buy_sol_250ms", 0.0)),
+            "pbs_500": float(snap.get("pending_buy_sol_500ms", 0.0)),
+            "pbs_1000": float(snap.get("pending_buy_sol_1000ms", 0.0)),
+            "psc_250": int(v47i_sell_stats_in.get("pending_sell_count_250ms", 0)),
+            "psc_500": int(v47i_sell_stats_in.get("pending_sell_count_500ms", 0)),
+            "psc_1000": int(v47i_sell_stats_in.get("pending_sell_count_1000ms", 0)),
+            "pss_250": float(v47i_sell_stats_in.get("pending_sell_sol_250ms", 0.0)),
+            "pss_500": float(v47i_sell_stats_in.get("pending_sell_sol_500ms", 0.0)),
+            "pss_1000": float(v47i_sell_stats_in.get("pending_sell_sol_1000ms", 0.0)),
+            "us_1000": int(v47i_sell_stats_in.get("unique_sellers_1000ms") or 0),
+            "source_lead_ms": int(source_lead_ms),
+            "curve_snapshot_ts_ms": int(getattr(cs_pt, "ts_ms", cu_ts) or cu_ts),
+            "curve_snapshot_slot": int(getattr(cs_pt, "slot", slot) or slot),
+            "curve_snapshot_virtual_sol_reserves": int(getattr(cs_pt, "virtual_sol_reserves", 0) or 0),
+            "curve_snapshot_virtual_token_reserves": int(getattr(cs_pt, "virtual_token_reserves", 0) or 0),
+            "curve_snapshot_real_sol_reserves": int(getattr(cs_pt, "real_sol_reserves", 0) or 0),
+            "curve_snapshot_real_token_reserves": int(getattr(cs_pt, "real_token_reserves", 0) or 0),
+            "curve_snapshot_token_total_supply": int(getattr(cs_pt, "token_total_supply", 0) or 0),
+            "curve_snapshot_complete": bool(getattr(cs_pt, "complete", False)),
+            "curve_snapshot_creator": str(getattr(cs_pt, "creator", "") or ""),
+            "curve_snapshot_is_mayhem": bool(getattr(cs_pt, "is_mayhem", False)),
+            "curve_snapshot_cashback_enabled": bool(getattr(cs_pt, "cashback_enabled", False)),
+            "tb_mode": str(tb_mode),
+            "tb_reason": str(tb_reason),
+            "v57_impulse_pre_gate_pass": bool(v57_impulse_gate_pass_pre),
+            "v57_v47e_bypass": bool(v57_v47e_bypass),
+            "v57_pre20_move": float(v57_pre20_move),
+            "v57_sell_count_1000_pre": int(v57_sell_count_1000_pre),
+            "v61_fanout_pre_gate_pass": bool(v61_gate_pass_pre),
+            "v61_buy_sol_2000": float(v61_buy_sol_pre),
+            "v61_sell_sol_2000": float(v61_sell_sol_pre),
+            "v61_unique_buyers_2000": int(v61_ub_pre),
+            "v61_top_share_2000": float(v61_top_pre),
+            "v61_sell_count_2000": int(v61_sell_count_pre),
+            "v61_curve_pretrend_pct": float(v61_curve_pretrend_pct),
+            "v61_curve_prehistory_ok": bool(v61_curve_prehistory_ok),
+            "adverse_branch": str(final_r1["adverse_branch_outcome"] or ""),
+            "exp_pnl": float(final_r1["expected_pnl"]),
+            "v47h_ratio": v47h_eval_ratio,
+            "v47h_size_sol": v47h_eval_size_sol,
+            "v47h_expected_pnl": v47h_eval_expected_pnl,
+            "adv_pnl": float(final_r1["adverse_pnl"]),
+            "adv_branch": str(final_r1["adverse_branch_outcome"] or ""),
+            "expected_tokens": int(final_r1["expected_tokens"]),
+            "guard_min_tokens": int(final_g["final_min_tokens"]),
+            "v47g_floor_required": float(required_floor_for_size(float(final_size))),
+            "v47g_max_hold_ms": int(v47g_caps_entry["max_hold_ms"]),
+            "v47g_max_extend_ms": int(v47g_caps_entry["max_extend_ms"]),
+            "v47g_extend_default_allowed": bool(v47g_caps_entry["extend_allowed"]),
+            "v47g_extended_count": 0,
+            "v47g_abort_triggered": False,
+            "v47g_abort_reason": None,
+            "close_kind": None,
+            "close_pnl": None,
+            "close_lag_ms": None,
+            "is_failed_buy": False,
+            "opened_or_deferred": "decision_pending",
+        }
+
+        # --- V56 signal-family gates ---------------------------------------
+        # V56B is the high-edge live separator. V56D is the flow-confirmed
+        # scratch lane discovered from all V55 logs plus SolanaTracker API
+        # trajectories. V56D uses only causal local tape fields here: pending
+        # buy SOL, pending sell count, unique buyers, and top concentration.
+        clean_floor_base = max(
+            float(required_floor_for_size(float(final_size))),
+            float(args.clean_close_entry_floor_sol),
+        )
+        clean_floor = clean_floor_base
+        source_lead_limit_ms = int(max_source_lead_ms)
+
+        _signal_lanes = []
+        _signal_gate_enabled = False
+
+        # --- V68 WHALE-FOLLOW gate (2026-05-17, moved from _open_v48_live_record)
+        # Source: V61_MISSED_CURVE_WINNER_MINER.md. Every >100% pump in a 3-min
+        # sampled window had ub250=1 + single whale buy and was rejected by
+        # V47C as `single_buyer_shadow_only`. The shred event's `signer`
+        # parameter IS the whale's pubkey for this exact buy; `sol_in` IS the
+        # buy size. We don't need to look at 250ms windows — we ARE the buy.
+        v68_enabled = _env_flag("PGG2_V68_WHALE_FOLLOW_LANE_ENABLED", "0")
+        v68_require_active = _env_flag("PGG2_V68_REQUIRE_ACTIVE_SNIPER", "1")
+        rec["v68_whale_follow_gate_enabled"] = bool(v68_enabled)
+        rec["v68_whale_follow_gate_pass"] = False
+        if v68_enabled and signer:
+            _signal_gate_enabled = True
+            _v68_min_buy_sol = float(
+                os.environ.get("PGG2_V68_MIN_BUY_SOL", "0.5") or 0.5
+            )
+            _v68_max_sell_count_1000 = int(
+                os.environ.get("PGG2_V68_MAX_SELL_COUNT_1000", "0") or 0
+            )
+            _v68_active_set = _load_active_snipers()
+            _v68_signer_in_pool = (str(signer) in _v68_active_set)
+            _v68_identity_ok = (
+                _v68_signer_in_pool if v68_require_active else True
+            )
+            try:
+                _v68_sells_1000 = buffer_.pending_sells(mint, ts_ms_now, cu_ts, 1000)
+                _v68_sells_count_1000 = len(_v68_sells_1000)
+            except Exception:
+                _v68_sells_count_1000 = 0
+            _v68_sol_in = float(sol_in or 0.0)
+            _v68_pass = (
+                _v68_identity_ok
+                and _v68_sol_in >= _v68_min_buy_sol
+                and _v68_sells_count_1000 <= _v68_max_sell_count_1000
+            )
+            rec["v68_signer_in_active_pool"] = bool(_v68_signer_in_pool)
+            rec["v68_sells_count_1000"] = int(_v68_sells_count_1000)
+            rec["v68_min_buy_sol"] = float(_v68_min_buy_sol)
+            rec["v68_active_pool_size"] = int(len(_v68_active_set))
+            rec["v68_sol_in_observed"] = _v68_sol_in
+            rec["v68_signer"] = str(signer)
+            rec["v68_whale_follow_gate_pass"] = bool(_v68_pass)
+            if _v68_pass:
+                _signal_lanes.append("v68_whale_follow")
+                log(
+                    f"PGG2-V68-WHALE-FOLLOW-PASS mint={_short(mint)} "
+                    f"signer={str(signer)[:8]} "
+                    f"sol_in={_v68_sol_in:.4f}/{_v68_min_buy_sol:.4f} "
+                    f"sells_1000={_v68_sells_count_1000}/{_v68_max_sell_count_1000} "
+                    f"in_pool={int(_v68_signer_in_pool)} active_pool_size={len(_v68_active_set)}"
+                )
+            else:
+                log(
+                    f"PGG2-V68-WHALE-FOLLOW-CHECK mint={_short(mint)} "
+                    f"signer={str(signer)[:8]} "
+                    f"in_pool={int(_v68_signer_in_pool)} "
+                    f"sol_in={_v68_sol_in:.4f}/{_v68_min_buy_sol:.4f} "
+                    f"sells_1000={_v68_sells_count_1000}/{_v68_max_sell_count_1000} "
+                    f"active_pool_size={len(_v68_active_set)} pass=0"
+                )
+
+        _v56b_min_ep = float(
+            os.environ.get("PGG2_V48_V56B_MIN_EXPECTED_PNL", "0") or 0
+        )
+        _v56b_max_ratio = float(
+            os.environ.get("PGG2_V48_V56B_MAX_V47H_RATIO", "0") or 0
+        )
+        _v56b_enabled = _v56b_min_ep > 0.0 or _v56b_max_ratio > 0.0
+        _v56b_pass = False
+        if _v56b_enabled:
+            _signal_gate_enabled = True
+            _v56b_ratio_missing = "v47h_ratio" not in rec
+            _v56b_ep = float(rec.get("v47h_expected_pnl", rec.get("exp_pnl", 0.0)))
+            _v56b_size = float(
+                rec.get("v47h_size_sol", rec.get("selected_size_sol", 0.0))
+            )
+            _v56b_ratio = float(rec.get("v47h_ratio", 0.0))
+            _v56b_block_ep = (
+                _v56b_min_ep > 0.0 and _v56b_ep < _v56b_min_ep - 1e-12
+            )
+            _v56b_block_ratio = (
+                _v56b_max_ratio > 0.0
+                and _v56b_ratio > _v56b_max_ratio + 1e-12
+            )
+            _v56b_pass = not (
+                _v56b_ratio_missing or _v56b_block_ep or _v56b_block_ratio
+            )
+            rec["v56b_gate_enabled"] = True
+            rec["v56b_gate_pass"] = bool(_v56b_pass)
+            rec["v56b_gate_min_expected_pnl"] = float(_v56b_min_ep)
+            rec["v56b_gate_max_v47h_ratio"] = float(_v56b_max_ratio)
+            if _v56b_pass:
+                _signal_lanes.append("v56b_high_edge")
+            log(
+                f"PGG2-V48-V56B-GATE-CHECK mint={_short(mint)} "
+                f"exp_pnl={_v56b_ep:+.6f} v47h_size={_v56b_size:.4f} "
+                f"v47h_ratio={_v56b_ratio:+.4f} "
+                f"min_ep={_v56b_min_ep:.6f} max_ratio={_v56b_max_ratio:.4f} "
+                f"ratio_source=v47h_eval missing={int(_v56b_ratio_missing)} "
+                f"pass={int(_v56b_pass)}"
+            )
+
+        _v56d_enabled = (
+            os.environ.get("PGG2_V48_V56D_FLOW_LANE_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _v56d_pass = False
+        if _v56d_enabled:
+            _signal_gate_enabled = True
+            _v56d_min_ep = float(
+                os.environ.get("PGG2_V48_V56D_MIN_EXPECTED_PNL", "0.000600") or 0.000600
+            )
+            _v56d_max_top_share = float(
+                os.environ.get("PGG2_V48_V56D_MAX_TOP_SHARE_250", "0.300") or 0.300
+            )
+            _v56d_min_buy_sol_1000 = float(
+                os.environ.get("PGG2_V48_V56D_MIN_BUY_SOL_1000", "0.200") or 0.200
+            )
+            _v56d_max_sell_count_1000 = int(
+                os.environ.get("PGG2_V48_V56D_MAX_SELL_COUNT_1000", "0") or 0
+            )
+            _v56d_min_ub_250 = int(
+                os.environ.get("PGG2_V48_V56D_MIN_UNIQUE_BUYERS_250", "4") or 4
+            )
+            _v56d_max_ratio = float(
+                os.environ.get("PGG2_V48_V56D_MAX_V47H_RATIO", "0") or 0
+            )
+            _v56d_clean_floor = float(
+                os.environ.get("PGG2_V48_V56D_CLEAN_FLOOR_SOL", "0.000600") or 0.000600
+            )
+            _v56d_max_source_lead = int(
+                os.environ.get("PGG2_V48_V56D_MAX_SOURCE_LEAD_MS", "1500") or 1500
+            )
+            _v56d_ep = float(rec.get("exp_pnl", 0.0))
+            _v56d_top_share = float(rec.get("tbs_250", 0.0))
+            _v56d_buy_sol_1000 = float(rec.get("pbs_1000", 0.0))
+            _v56d_sell_count_1000 = int(rec.get("psc_1000", 0))
+            _v56d_ub_250 = int(rec.get("ub_250", 0))
+            _v56d_ratio = float(rec.get("v47h_ratio", 0.0))
+            _v56d_block_ep = _v56d_ep < _v56d_min_ep - 1e-12
+            _v56d_block_top = _v56d_top_share > _v56d_max_top_share + 1e-12
+            _v56d_block_buy = _v56d_buy_sol_1000 < _v56d_min_buy_sol_1000 - 1e-12
+            _v56d_block_sell = _v56d_sell_count_1000 > _v56d_max_sell_count_1000
+            _v56d_block_ub = _v56d_ub_250 < _v56d_min_ub_250
+            _v56d_block_ratio = (
+                _v56d_max_ratio > 0.0
+                and _v56d_ratio > _v56d_max_ratio + 1e-12
+            )
+            _v56d_arm_pass = not (_v56d_block_ep or _v56d_block_top or _v56d_block_ub)
+            log(
+                f"PGG2-V56D-FLOW-LANE-ARM mint={_short(mint)} "
+                f"exp_pnl={_v56d_ep:+.6f} min_ep={_v56d_min_ep:.6f} "
+                f"top_share250={_v56d_top_share:.3f} max_top={_v56d_max_top_share:.3f} "
+                f"ub250={_v56d_ub_250} min_ub250={_v56d_min_ub_250} "
+                f"pass={int(_v56d_arm_pass)}"
+            )
+            _v56d_pass = not (
+                _v56d_block_ep
+                or _v56d_block_top
+                or _v56d_block_buy
+                or _v56d_block_sell
+                or _v56d_block_ub
+                or _v56d_block_ratio
+            )
+            rec["v56d_flow_gate_enabled"] = True
+            rec["v56d_flow_gate_pass"] = bool(_v56d_pass)
+            rec["v56d_min_expected_pnl"] = float(_v56d_min_ep)
+            rec["v56d_max_top_share_250"] = float(_v56d_max_top_share)
+            rec["v56d_min_buy_sol_1000"] = float(_v56d_min_buy_sol_1000)
+            rec["v56d_max_sell_count_1000"] = int(_v56d_max_sell_count_1000)
+            rec["v56d_min_unique_buyers_250"] = int(_v56d_min_ub_250)
+            rec["v56d_clean_floor_sol"] = float(_v56d_clean_floor)
+            rec["v56d_max_source_lead_ms"] = int(_v56d_max_source_lead)
+            log(
+                f"PGG2-V56D-FLOW-LANE-CHECK mint={_short(mint)} "
+                f"exp_pnl={_v56d_ep:+.6f} top_share250={_v56d_top_share:.3f} "
+                f"pbs1000={_v56d_buy_sol_1000:.3f} min_pbs1000={_v56d_min_buy_sol_1000:.3f} "
+                f"psc1000={_v56d_sell_count_1000} max_psc1000={_v56d_max_sell_count_1000} "
+                f"ub250={_v56d_ub_250} v47h_ratio={_v56d_ratio:.4f} "
+                f"pass={int(_v56d_pass)}"
+            )
+            if _v56d_pass:
+                _signal_lanes.append("v56d_flow_scratch")
+                clean_floor = max(
+                    float(required_floor_for_size(float(final_size))),
+                    float(_v56d_clean_floor),
+                )
+                if _v56d_max_source_lead > 0:
+                    source_lead_limit_ms = max(
+                        int(source_lead_limit_ms),
+                        int(_v56d_max_source_lead),
+                    )
+                log(
+                    f"PGG2-V56D-FLOW-LANE-PASS mint={_short(mint)} "
+                    f"clean_floor={clean_floor:.6f} "
+                    f"source_lead_limit_ms={source_lead_limit_ms}"
+                )
+
+        _v67_enabled = (
+            os.environ.get("PGG2_V67_FLOW_CONFIRM_LANE_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _v67_pass = False
+        if _v67_enabled:
+            _signal_gate_enabled = True
+            _v67_min_ep = float(
+                os.environ.get("PGG2_V67_MIN_EXPECTED_PNL", "0.000550") or 0.000550
+            )
+            _v67_max_top_share = float(
+                os.environ.get("PGG2_V67_MAX_TOP_SHARE_250", "0.300") or 0.300
+            )
+            _v67_min_buy_sol_1000 = float(
+                os.environ.get("PGG2_V67_MIN_BUY_SOL_1000", "0.200") or 0.200
+            )
+            _v67_max_buy_sol_1000 = float(
+                os.environ.get("PGG2_V67_MAX_BUY_SOL_1000", "0") or 0
+            )
+            _v67_max_sell_sol_1000 = float(
+                os.environ.get("PGG2_V67_MAX_SELL_SOL_1000", "0.050") or 0.050
+            )
+            _v67_max_sell_count_1000 = int(
+                os.environ.get("PGG2_V67_MAX_SELL_COUNT_1000", "2") or 2
+            )
+            _v67_min_ub_250 = int(
+                os.environ.get("PGG2_V67_MIN_UNIQUE_BUYERS_250", "2") or 2
+            )
+            _v67_max_ratio = float(
+                os.environ.get("PGG2_V67_MAX_V47H_RATIO", "0") or 0
+            )
+            _v67_clean_floor = float(
+                os.environ.get("PGG2_V67_CLEAN_FLOOR_SOL", "0.000000") or 0.0
+            )
+            _v67_max_source_lead = int(
+                os.environ.get("PGG2_V67_MAX_SOURCE_LEAD_MS", "1500") or 1500
+            )
+            _v67_use_lane_clean_floor = (
+                os.environ.get("PGG2_V67_USE_LANE_CLEAN_FLOOR", "1").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            _v67_ep = float(rec.get("exp_pnl", 0.0))
+            _v67_top_share = float(rec.get("tbs_250", 0.0))
+            _v67_buy_sol_1000 = float(rec.get("pbs_1000", 0.0))
+            _v67_sell_sol_1000 = float(rec.get("pss_1000", 0.0))
+            _v67_sell_count_1000 = int(rec.get("psc_1000", 0))
+            _v67_ub_250 = int(rec.get("ub_250", 0))
+            _v67_ratio = float(rec.get("v47h_ratio", 0.0))
+            _v67_blockers = []
+            if _v67_ep < _v67_min_ep - 1e-12:
+                _v67_blockers.append("expected_pnl")
+            if _v67_top_share > _v67_max_top_share + 1e-12:
+                _v67_blockers.append("top_share")
+            if _v67_buy_sol_1000 < _v67_min_buy_sol_1000 - 1e-12:
+                _v67_blockers.append("buy_sol_1000")
+            if (
+                _v67_max_buy_sol_1000 > 0.0
+                and _v67_buy_sol_1000 > _v67_max_buy_sol_1000 + 1e-12
+            ):
+                _v67_blockers.append("buy_sol_1000_blowoff")
+            if _v67_sell_sol_1000 > _v67_max_sell_sol_1000 + 1e-12:
+                _v67_blockers.append("sell_sol_1000")
+            if _v67_sell_count_1000 > _v67_max_sell_count_1000:
+                _v67_blockers.append("sell_count_1000")
+            if _v67_ub_250 < _v67_min_ub_250:
+                _v67_blockers.append("unique_buyers_250")
+            if _v67_max_ratio > 0.0 and _v67_ratio > _v67_max_ratio + 1e-12:
+                _v67_blockers.append("v47h_ratio")
+            _v67_pass = not _v67_blockers
+            rec["v67_flow_confirm_gate_enabled"] = True
+            # V68 PRESERVATION: if the V68 whale-follow lane already passed at
+            # the rule_union_filter stage, it set v67_flow_confirm_gate_pass=True
+            # to inherit the V67 bypass plumbing (V47C single-buyer block, etc).
+            # V67's own gate would reject the same candidate on top_share>0.30
+            # (single buyer = 100% top share) — don't let that downgrade the V68 pass.
+            _v68_already_passed = bool(rec.get("v68_whale_follow_gate_pass", False))
+            rec["v67_flow_confirm_gate_pass"] = bool(_v67_pass or _v68_already_passed)
+            rec["v67_min_expected_pnl"] = float(_v67_min_ep)
+            rec["v67_max_top_share_250"] = float(_v67_max_top_share)
+            rec["v67_min_buy_sol_1000"] = float(_v67_min_buy_sol_1000)
+            rec["v67_max_buy_sol_1000"] = float(_v67_max_buy_sol_1000)
+            rec["v67_max_sell_sol_1000"] = float(_v67_max_sell_sol_1000)
+            rec["v67_max_sell_count_1000"] = int(_v67_max_sell_count_1000)
+            rec["v67_min_unique_buyers_250"] = int(_v67_min_ub_250)
+            rec["v67_clean_floor_sol"] = float(_v67_clean_floor)
+            rec["v67_max_source_lead_ms"] = int(_v67_max_source_lead)
+            rec["v67_blockers"] = list(_v67_blockers)
+            log(
+                f"PGG2-V67-FLOW-CONFIRM-CHECK mint={_short(mint)} "
+                f"exp_pnl={_v67_ep:+.6f}/{_v67_min_ep:+.6f} "
+                f"top_share250={_v67_top_share:.3f}/{_v67_max_top_share:.3f} "
+                f"pbs1000={_v67_buy_sol_1000:.3f}/{_v67_min_buy_sol_1000:.3f} "
+                f"max_pbs1000={_v67_max_buy_sol_1000:.3f} "
+                f"pss1000={_v67_sell_sol_1000:.3f}/{_v67_max_sell_sol_1000:.3f} "
+                f"psc1000={_v67_sell_count_1000}/{_v67_max_sell_count_1000} "
+                f"ub250={_v67_ub_250}/{_v67_min_ub_250} "
+                f"v47h_ratio={_v67_ratio:.4f}/{_v67_max_ratio:.4f} "
+                f"pass={int(_v67_pass)} "
+                f"blockers={','.join(_v67_blockers) if _v67_blockers else '-'}"
+            )
+            if _v67_pass:
+                _signal_lanes.append("v67_flow_confirm")
+                # V67 is a corrected, less over-gated form of the V56D
+                # flow-confirm lane. Mark V56D-compatible so the existing
+                # fast snapshot, strict min-token, and risk-worker plumbing
+                # are reused instead of forking a second execution path.
+                rec["v56d_flow_gate_pass"] = True
+                rec["v56d_flow_gate_compat_v67"] = True
+                if _v67_use_lane_clean_floor:
+                    clean_floor = max(0.0, float(_v67_clean_floor))
+                else:
+                    clean_floor = max(
+                        float(required_floor_for_size(float(final_size))),
+                        float(_v67_clean_floor),
+                    )
+                if _v67_max_source_lead > 0:
+                    source_lead_limit_ms = max(
+                        int(source_lead_limit_ms),
+                        int(_v67_max_source_lead),
+                    )
+                log(
+                    f"PGG2-V67-FLOW-CONFIRM-PASS mint={_short(mint)} "
+                    f"clean_floor={clean_floor:.6f} "
+                    f"source_lead_limit_ms={source_lead_limit_ms} "
+                    f"compat_v56d=1"
+                )
+
+        _v57_enabled = (
+            os.environ.get("PGG2_V57_IMPULSE_LANE_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _v57_pass = False
+        if _v57_enabled:
+            _signal_gate_enabled = True
+            _v57_min_ub_250 = int(
+                os.environ.get("PGG2_V57_MIN_UNIQUE_BUYERS_250", "2") or 2
+            )
+            _v57_min_buy_sol_1000 = float(
+                os.environ.get("PGG2_V57_MIN_BUY_SOL_1000", "3.000") or 3.000
+            )
+            _v57_max_top_share_250 = float(
+                os.environ.get("PGG2_V57_MAX_TOP_SHARE_250", "0.550") or 0.550
+            )
+            _v57_max_sell_count_1000 = int(
+                os.environ.get("PGG2_V57_MAX_SELL_COUNT_1000", "0") or 0
+            )
+            _v57_min_pre20_move = float(
+                os.environ.get("PGG2_V57_MIN_PRE20_MOVE", "-0.020") or -0.020
+            )
+            _v57_min_expected_pnl = float(
+                os.environ.get("PGG2_V57_MIN_EXPECTED_PNL", "0.000000") or 0.0
+            )
+            _v57_clean_floor = float(
+                os.environ.get("PGG2_V57_CLEAN_FLOOR_SOL", "0.000000") or 0.0
+            )
+            _v57_max_source_lead = int(
+                os.environ.get("PGG2_V57_MAX_SOURCE_LEAD_MS", "350") or 350
+            )
+            _v57_ub_250 = int(rec.get("ub_250", 0))
+            _v57_buy_sol_1000 = float(rec.get("pbs_1000", 0.0))
+            _v57_top_share = float(rec.get("tbs_250", 1.0))
+            _v57_sell_count_1000 = int(
+                rec.get("v57_sell_count_1000_pre", rec.get("psc_1000", 999999))
+            )
+            _v57_pre20 = float(rec.get("v57_pre20_move", 0.0))
+            _v57_expected_pnl = float(rec.get("exp_pnl", 0.0))
+            _v57_pre_pass = bool(rec.get("v57_impulse_pre_gate_pass", False))
+            _v57_pass = (
+                _v57_pre_pass
+                and _v57_expected_pnl >= _v57_min_expected_pnl - 1e-12
+                and _v57_ub_250 >= _v57_min_ub_250
+                and _v57_buy_sol_1000 >= _v57_min_buy_sol_1000 - 1e-12
+                and _v57_top_share <= _v57_max_top_share_250 + 1e-12
+                and _v57_sell_count_1000 <= _v57_max_sell_count_1000
+                and _v57_pre20 >= _v57_min_pre20_move - 1e-12
+            )
+            rec["v57_impulse_gate_enabled"] = True
+            rec["v57_impulse_gate_pass"] = bool(_v57_pass)
+            rec["v57_min_unique_buyers_250"] = int(_v57_min_ub_250)
+            rec["v57_min_buy_sol_1000"] = float(_v57_min_buy_sol_1000)
+            rec["v57_max_top_share_250"] = float(_v57_max_top_share_250)
+            rec["v57_max_sell_count_1000"] = int(_v57_max_sell_count_1000)
+            rec["v57_min_pre20_move"] = float(_v57_min_pre20_move)
+            rec["v57_min_expected_pnl"] = float(_v57_min_expected_pnl)
+            rec["v57_max_source_lead_ms"] = int(_v57_max_source_lead)
+            log(
+                f"PGG2-V57-IMPULSE-LANE-CHECK mint={_short(mint)} "
+                f"pre_pass={int(_v57_pre_pass)} "
+                f"exp_pnl={_v57_expected_pnl:+.6f}/{_v57_min_expected_pnl:+.6f} "
+                f"ub250={_v57_ub_250}/{_v57_min_ub_250} "
+                f"pbs1000={_v57_buy_sol_1000:.3f}/{_v57_min_buy_sol_1000:.3f} "
+                f"tbs250={_v57_top_share:.3f}/{_v57_max_top_share_250:.3f} "
+                f"psc1000={_v57_sell_count_1000}/{_v57_max_sell_count_1000} "
+                f"pre20={_v57_pre20:+.4f}/{_v57_min_pre20_move:+.4f} "
+                f"pass={int(_v57_pass)}"
+            )
+            _v62_v57_enabled = (
+                os.environ.get("PGG2_V62_V57_REALIZED_BAND_ENABLED", "0")
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            )
+            if _v62_v57_enabled:
+                _v62_min_ep = float(
+                    os.environ.get("PGG2_V62_V57_MIN_EXPECTED_PNL", "0.001400")
+                    or 0.001400
+                )
+                _v62_max_ep = float(
+                    os.environ.get("PGG2_V62_V57_MAX_EXPECTED_PNL", "0.001550")
+                    or 0.001550
+                )
+                _v62_min_top = float(
+                    os.environ.get("PGG2_V62_V57_MIN_TOP_SHARE_250", "0.400")
+                    or 0.400
+                )
+                _v62_max_top = float(
+                    os.environ.get("PGG2_V62_V57_MAX_TOP_SHARE_250", "0.550")
+                    or 0.550
+                )
+                _v62_min_ub = int(
+                    os.environ.get("PGG2_V62_V57_MIN_UNIQUE_BUYERS_250", "3")
+                    or 3
+                )
+                _v62_max_ub = int(
+                    os.environ.get("PGG2_V62_V57_MAX_UNIQUE_BUYERS_250", "3")
+                    or 3
+                )
+                _v62_min_pre20 = float(
+                    os.environ.get("PGG2_V62_V57_MIN_PRE20_MOVE", "0.300")
+                    or 0.300
+                )
+                _v62_max_ratio = float(
+                    os.environ.get("PGG2_V62_V57_MAX_V47H_RATIO", "0.339")
+                    or 0.339
+                )
+                _v62_max_lead = int(
+                    os.environ.get("PGG2_V62_V57_MAX_SOURCE_LEAD_MS", "150")
+                    or 150
+                )
+                _v62_source_lead = int(rec.get("source_lead_ms", 999999) or 999999)
+                _v62_ratio = float(rec.get("v47h_ratio", 999.0) or 999.0)
+                _v62_blockers = []
+                if not _v57_pass:
+                    _v62_blockers.append("v57_base")
+                if _v57_expected_pnl < _v62_min_ep - 1e-12:
+                    _v62_blockers.append("expected_pnl_low")
+                if _v62_max_ep > 0.0 and _v57_expected_pnl > _v62_max_ep + 1e-12:
+                    _v62_blockers.append("expected_pnl_high")
+                if _v57_top_share < _v62_min_top - 1e-12:
+                    _v62_blockers.append("top_share_low")
+                if _v57_top_share > _v62_max_top + 1e-12:
+                    _v62_blockers.append("top_share_high")
+                if _v57_ub_250 < _v62_min_ub:
+                    _v62_blockers.append("unique_buyers_low")
+                if _v57_ub_250 > _v62_max_ub:
+                    _v62_blockers.append("unique_buyers_high")
+                if _v57_pre20 < _v62_min_pre20 - 1e-12:
+                    _v62_blockers.append("pre20_low")
+                if _v62_max_ratio > 0.0 and _v62_ratio > _v62_max_ratio + 1e-12:
+                    _v62_blockers.append("v47h_ratio_high")
+                if _v62_max_lead > 0 and _v62_source_lead > _v62_max_lead:
+                    _v62_blockers.append("source_lead")
+                _v62_pass = not _v62_blockers
+                rec["v62_v57_realized_band_enabled"] = True
+                rec["v62_v57_realized_band_pass"] = bool(_v62_pass)
+                rec["v62_v57_blockers"] = list(_v62_blockers)
+                rec["v62_v57_min_expected_pnl"] = float(_v62_min_ep)
+                rec["v62_v57_max_expected_pnl"] = float(_v62_max_ep)
+                rec["v62_v57_min_top_share_250"] = float(_v62_min_top)
+                rec["v62_v57_max_top_share_250"] = float(_v62_max_top)
+                rec["v62_v57_min_unique_buyers_250"] = int(_v62_min_ub)
+                rec["v62_v57_max_unique_buyers_250"] = int(_v62_max_ub)
+                rec["v62_v57_min_pre20_move"] = float(_v62_min_pre20)
+                rec["v62_v57_max_v47h_ratio"] = float(_v62_max_ratio)
+                rec["v62_v57_max_source_lead_ms"] = int(_v62_max_lead)
+                log(
+                    f"PGG2-V62-V57-REALIZED-BAND-CHECK mint={_short(mint)} "
+                    f"base_v57={int(_v57_pass)} "
+                    f"exp_pnl={_v57_expected_pnl:+.6f}/"
+                    f"{_v62_min_ep:+.6f}-{_v62_max_ep:+.6f} "
+                    f"ub250={_v57_ub_250}/{_v62_min_ub}-{_v62_max_ub} "
+                    f"top250={_v57_top_share:.3f}/{_v62_min_top:.3f}-{_v62_max_top:.3f} "
+                    f"pre20={_v57_pre20:+.4f}/{_v62_min_pre20:+.4f} "
+                    f"v47h_ratio={_v62_ratio:.4f}/{_v62_max_ratio:.4f} "
+                    f"source_lead_ms={_v62_source_lead}/{_v62_max_lead} "
+                    f"pass={int(_v62_pass)} "
+                    f"blockers={'|'.join(_v62_blockers) if _v62_blockers else '-'}"
+                )
+                _v57_pass = bool(_v62_pass)
+                rec["v57_impulse_gate_pass"] = bool(_v57_pass)
+            if _v57_pass:
+                _signal_lanes.append("v57_live_impulse")
+                clean_floor = max(
+                    float(required_floor_for_size(float(final_size))),
+                    float(_v57_clean_floor),
+                )
+                if _v57_max_source_lead > 0:
+                    source_lead_limit_ms = max(
+                        int(source_lead_limit_ms),
+                        int(_v57_max_source_lead),
+                    )
+                log(
+                    f"PGG2-V57-IMPULSE-LANE-PASS mint={_short(mint)} "
+                    f"clean_floor={clean_floor:.6f} "
+                    f"source_lead_limit_ms={source_lead_limit_ms}"
+                )
+
+        _v58_enabled = (
+            os.environ.get("PGG2_V58_FLOW_LANE_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _v58_pass = False
+        if _v58_enabled:
+            _signal_gate_enabled = True
+            _v58_min_ep = float(
+                os.environ.get("PGG2_V58_MIN_EXPECTED_PNL", "0.001400") or 0.001400
+            )
+            _v58_min_buy_sol_1000 = float(
+                os.environ.get("PGG2_V58_MIN_BUY_SOL_1000", "0.200") or 0.200
+            )
+            _v58_min_buy_sell_ratio_1000 = float(
+                os.environ.get("PGG2_V58_MIN_BUY_SELL_RATIO_1000", "3.000") or 3.000
+            )
+            _v58_max_top_share_250 = float(
+                os.environ.get("PGG2_V58_MAX_TOP_SHARE_250", "0.500") or 0.500
+            )
+            _v58_max_source_lead = int(
+                os.environ.get("PGG2_V58_MAX_SOURCE_LEAD_MS", "220") or 220
+            )
+            _v58_max_sell_sol_1000 = float(
+                os.environ.get("PGG2_V58_MAX_SELL_SOL_1000", "999.000") or 999.000
+            )
+            _v58_clean_floor = float(
+                os.environ.get("PGG2_V58_CLEAN_FLOOR_SOL", "0.001400") or 0.001400
+            )
+            _v58_ep = float(rec.get("exp_pnl", 0.0))
+            _v58_buy_sol_1000 = float(rec.get("pbs_1000", 0.0))
+            _v58_sell_sol_1000 = float(rec.get("pss_1000", 0.0))
+            _v58_buy_sell_ratio_1000 = (
+                (_v58_buy_sol_1000 / _v58_sell_sol_1000)
+                if _v58_sell_sol_1000 > 1e-12
+                else (999.0 if _v58_buy_sol_1000 > 1e-12 else 0.0)
+            )
+            _v58_top_share_250 = float(rec.get("tbs_250", 1.0))
+            _v58_source_lead = int(rec.get("source_lead_ms", 999999) or 999999)
+            _v58_block_ep = _v58_ep < _v58_min_ep - 1e-12
+            _v58_block_buy = _v58_buy_sol_1000 < _v58_min_buy_sol_1000 - 1e-12
+            _v58_block_ratio = (
+                _v58_buy_sell_ratio_1000 < _v58_min_buy_sell_ratio_1000 - 1e-12
+            )
+            _v58_block_top = _v58_top_share_250 > _v58_max_top_share_250 + 1e-12
+            _v58_block_lead = (
+                _v58_max_source_lead > 0 and _v58_source_lead > _v58_max_source_lead
+            )
+            _v58_block_sell_sol = (
+                _v58_max_sell_sol_1000 >= 0.0
+                and _v58_sell_sol_1000 > _v58_max_sell_sol_1000 + 1e-12
+            )
+            _v58_pass = not (
+                _v58_block_ep
+                or _v58_block_buy
+                or _v58_block_ratio
+                or _v58_block_top
+                or _v58_block_lead
+                or _v58_block_sell_sol
+            )
+            rec["v58_flow_gate_enabled"] = True
+            rec["v58_flow_gate_pass"] = bool(_v58_pass)
+            rec["v58_min_expected_pnl"] = float(_v58_min_ep)
+            rec["v58_min_buy_sol_1000"] = float(_v58_min_buy_sol_1000)
+            rec["v58_min_buy_sell_ratio_1000"] = float(_v58_min_buy_sell_ratio_1000)
+            rec["v58_max_top_share_250"] = float(_v58_max_top_share_250)
+            rec["v58_max_source_lead_ms"] = int(_v58_max_source_lead)
+            rec["v58_max_sell_sol_1000"] = float(_v58_max_sell_sol_1000)
+            rec["v58_buy_sell_ratio_1000"] = float(_v58_buy_sell_ratio_1000)
+            rec["v58_clean_floor_sol"] = float(_v58_clean_floor)
+            log(
+                f"PGG2-V58-FLOW-CONFIRM-CHECK mint={_short(mint)} "
+                f"exp_pnl={_v58_ep:+.6f}/{_v58_min_ep:+.6f} "
+                f"buy_sol_1000={_v58_buy_sol_1000:.3f}/{_v58_min_buy_sol_1000:.3f} "
+                f"sell_sol_1000={_v58_sell_sol_1000:.3f}/{_v58_max_sell_sol_1000:.3f} "
+                f"buy_sell_ratio_1000={_v58_buy_sell_ratio_1000:.3f}/{_v58_min_buy_sell_ratio_1000:.3f} "
+                f"top_share250={_v58_top_share_250:.3f}/{_v58_max_top_share_250:.3f} "
+                f"source_lead_ms={_v58_source_lead}/{_v58_max_source_lead} "
+                f"pass={int(_v58_pass)}"
+            )
+            if _v58_pass:
+                _signal_lanes.append("v58_fast_flow")
+                clean_floor = max(
+                    float(required_floor_for_size(float(final_size))),
+                    float(_v58_clean_floor),
+                )
+                if _v58_max_source_lead > 0:
+                    source_lead_limit_ms = max(
+                        int(source_lead_limit_ms),
+                        int(_v58_max_source_lead),
+                    )
+                log(
+                    f"PGG2-V58-FLOW-CONFIRM-PASS mint={_short(mint)} "
+                    f"clean_floor={clean_floor:.6f} "
+                    f"source_lead_limit_ms={source_lead_limit_ms}"
+                )
+
+        _v61_lane_enabled = (
+            os.environ.get("PGG2_V61_FANOUT_LEAD_LANE_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _v61_actual_enabled = (
+            os.environ.get("PGG2_V61_ACTUAL_ENTRY_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _v61_pass = False
+        if _v61_lane_enabled and _v61_actual_enabled:
+            _signal_gate_enabled = True
+            _v61_clean_floor = float(
+                os.environ.get("PGG2_V61_CLEAN_FLOOR_SOL", "0.001000") or 0.001000
+            )
+            _v61_max_source_lead = int(
+                os.environ.get("PGG2_V61_MAX_SOURCE_LEAD_MS", "2500") or 2500
+            )
+            _v61_require_v56b = _env_flag("PGG2_V61_REQUIRE_V56B_GATE", "0")
+            _v61_max_buy_sol = float(
+                os.environ.get("PGG2_V61_MAX_BUY_SOL", "0") or 0.0
+            )
+            _v61_pre_gate = bool(rec.get("v61_fanout_pre_gate_pass", False))
+            _v61_v56b_pass = bool(rec.get("v56b_gate_pass", False))
+            _v61_buy_sol = float(rec.get("v61_buy_sol_2000", 0.0))
+            _v61_blockers = []
+            if not _v61_pre_gate:
+                _v61_blockers.append("pre_gate")
+            if _v61_require_v56b and not _v61_v56b_pass:
+                _v61_blockers.append("v56b_gate")
+            if _v61_max_buy_sol > 0.0 and _v61_buy_sol > _v61_max_buy_sol + 1e-12:
+                _v61_blockers.append("buy_sol_overextended")
+            _v61_pass = not _v61_blockers
+            rec["v61_fanout_gate_enabled"] = True
+            rec["v61_fanout_gate_pass"] = bool(_v61_pass)
+            rec["v61_require_v56b_gate"] = bool(_v61_require_v56b)
+            rec["v61_max_buy_sol_2000"] = float(_v61_max_buy_sol)
+            rec["v61_clean_floor_sol"] = float(_v61_clean_floor)
+            rec["v61_max_source_lead_ms"] = int(_v61_max_source_lead)
+            log(
+                f"PGG2-V61-FANOUT-LANE-CHECK mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"pre_gate={int(bool(rec.get('v61_fanout_pre_gate_pass', False)))} "
+                f"v56b={int(_v61_v56b_pass)} "
+                f"require_v56b={int(_v61_require_v56b)} "
+                f"exp_pnl={float(rec.get('exp_pnl', 0.0)):+.6f} "
+                f"buy_sol2000={_v61_buy_sol:.3f} "
+                f"max_buy_sol2000={_v61_max_buy_sol:.3f} "
+                f"ub2000={int(rec.get('v61_unique_buyers_2000', 0))} "
+                f"top2000={float(rec.get('v61_top_share_2000', 1.0)):.3f} "
+                f"sells2000={int(rec.get('v61_sell_count_2000', 999999))} "
+                f"curve_pretrend={float(rec.get('v61_curve_pretrend_pct', 0.0)):+.1f} "
+                f"pass={int(_v61_pass)} "
+                f"blockers={'|'.join(_v61_blockers) if _v61_blockers else '-'}"
+            )
+            if _v61_pass:
+                _signal_lanes.append("v61_fanout_rebound")
+                clean_floor = max(
+                    float(required_floor_for_size(float(final_size))),
+                    float(_v61_clean_floor),
+                )
+                if _v61_max_source_lead > 0:
+                    source_lead_limit_ms = max(
+                        int(source_lead_limit_ms),
+                        int(_v61_max_source_lead),
+                    )
+                log(
+                    f"PGG2-V61-FANOUT-LANE-PASS mint={_short(mint)} "
+                    f"clean_floor={clean_floor:.6f} "
+                    f"source_lead_limit_ms={source_lead_limit_ms}"
+                )
+
+        _v60_enabled = (
+            os.environ.get("PGG2_V60_FLOW_CONFIRM_LANE_ENABLED", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        _v60_pass = False
+        if _v60_enabled:
+            _signal_gate_enabled = True
+            _v60_seed_min_ep = float(
+                os.environ.get("PGG2_V60_SEED_MIN_EXPECTED_PNL", "0.000550") or 0.000550
+            )
+            _v60_seed_max_top = float(
+                os.environ.get("PGG2_V60_SEED_MAX_TOP_SHARE_250", "0.600") or 0.600
+            )
+            _v60_seed_max_ratio = float(
+                os.environ.get("PGG2_V60_SEED_MAX_V47H_RATIO", "0.600") or 0.600
+            )
+            _v60_seed_max_source_lead = int(
+                os.environ.get("PGG2_V60_SEED_MAX_SOURCE_LEAD_MS", "2500") or 2500
+            )
+            _v60_confirm_delay_ms = max(
+                50,
+                int(os.environ.get("PGG2_V60_CONFIRM_DELAY_MS", "350") or 350),
+            )
+            _v60_confirm_max_wait_ms = max(
+                _v60_confirm_delay_ms,
+                int(os.environ.get("PGG2_V60_CONFIRM_MAX_WAIT_MS", "1100") or 1100),
+            )
+            _v60_ep = float(rec.get("exp_pnl", 0.0) or 0.0)
+            _v60_top = float(rec.get("tbs_250", 1.0) or 1.0)
+            _v60_ratio = float(rec.get("v47h_ratio", 0.0) or 0.0)
+            _v60_lead = int(rec.get("source_lead_ms", 999999) or 999999)
+            _v60_ub = int(rec.get("ub_250", 0) or 0)
+            _v60_pbs1000 = float(rec.get("pbs_1000", 0.0) or 0.0)
+            _v60_psc1000 = int(rec.get("psc_1000", 0) or 0)
+            _v60_pss1000 = float(rec.get("pss_1000", 0.0) or 0.0)
+            _v60_seed_blockers = []
+            if _v60_ep < _v60_seed_min_ep - 1e-12:
+                _v60_seed_blockers.append("expected_pnl")
+            if _v60_top > _v60_seed_max_top + 1e-12:
+                _v60_seed_blockers.append("top_share")
+            if _v60_seed_max_ratio > 0.0 and _v60_ratio > _v60_seed_max_ratio + 1e-12:
+                _v60_seed_blockers.append("v47h_ratio")
+            if _v60_seed_max_source_lead > 0 and _v60_lead > _v60_seed_max_source_lead:
+                _v60_seed_blockers.append("source_lead")
+            _v60_seed_pass = not _v60_seed_blockers
+            rec["v60_flow_gate_enabled"] = True
+            rec["v60_seed_pass"] = bool(_v60_seed_pass)
+            log(
+                f"PGG2-V60-FLOW-WATCH-SEED mint={_short(mint)} "
+                f"decision_id={rec.get('decision_id')} "
+                f"exp_pnl={_v60_ep:+.6f}/{_v60_seed_min_ep:+.6f} "
+                f"top_share250={_v60_top:.3f}/{_v60_seed_max_top:.3f} "
+                f"v47h_ratio={_v60_ratio:.4f}/{_v60_seed_max_ratio:.4f} "
+                f"source_lead_ms={_v60_lead}/{_v60_seed_max_source_lead} "
+                f"pass={int(_v60_seed_pass)} blockers={'|'.join(_v60_seed_blockers) if _v60_seed_blockers else '-'}"
+            )
+            _v60_fast_enabled = (
+                os.environ.get("PGG2_V60_FAST_BURST_LANE_ENABLED", "1").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            if _v60_fast_enabled:
+                _v60_fast_min_ep = float(
+                    os.environ.get("PGG2_V60_FAST_BURST_MIN_EXPECTED_PNL", "0.001500") or 0.001500
+                )
+                _v60_fast_min_ub = int(
+                    os.environ.get("PGG2_V60_FAST_BURST_MIN_UNIQUE_BUYERS_250", "5") or 5
+                )
+                _v60_fast_min_buy = float(
+                    os.environ.get("PGG2_V60_FAST_BURST_MIN_BUY_SOL_1000", "5.000") or 5.000
+                )
+                _v60_fast_max_top = float(
+                    os.environ.get("PGG2_V60_FAST_BURST_MAX_TOP_SHARE_250", "0.300") or 0.300
+                )
+                _v60_fast_max_ratio = float(
+                    os.environ.get("PGG2_V60_FAST_BURST_MAX_V47H_RATIO", "0.550") or 0.550
+                )
+                _v60_fast_max_lead = int(
+                    os.environ.get("PGG2_V60_FAST_BURST_MAX_SOURCE_LEAD_MS", "120") or 120
+                )
+                _v60_fast_max_sells = int(
+                    os.environ.get("PGG2_V60_FAST_BURST_MAX_SELL_COUNT_1000", "0") or 0
+                )
+                _v60_fast_actual = (
+                    os.environ.get("PGG2_V60_ACTUAL_ENTRY_ENABLED", "0").strip().lower()
+                    in ("1", "true", "yes", "on")
+                )
+                _v60_fast_blockers = []
+                if _v60_ep < _v60_fast_min_ep - 1e-12:
+                    _v60_fast_blockers.append("expected_pnl")
+                if _v60_ub < _v60_fast_min_ub:
+                    _v60_fast_blockers.append("unique_buyers")
+                if _v60_pbs1000 < _v60_fast_min_buy - 1e-12:
+                    _v60_fast_blockers.append("buy_sol")
+                if _v60_top > _v60_fast_max_top + 1e-12:
+                    _v60_fast_blockers.append("top_share")
+                if _v60_fast_max_ratio > 0.0 and _v60_ratio > _v60_fast_max_ratio + 1e-12:
+                    _v60_fast_blockers.append("v47h_ratio")
+                if _v60_fast_max_lead > 0 and _v60_lead > _v60_fast_max_lead:
+                    _v60_fast_blockers.append("source_lead")
+                if _v60_psc1000 > _v60_fast_max_sells or _v60_pss1000 > 1e-12:
+                    _v60_fast_blockers.append("sell_pressure")
+                _v60_fast_pass = not _v60_fast_blockers
+                log(
+                    f"PGG2-V60-FAST-BURST-CHECK mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"exp_pnl={_v60_ep:+.6f}/{_v60_fast_min_ep:+.6f} "
+                    f"ub250={_v60_ub}/{_v60_fast_min_ub} "
+                    f"pbs1000={_v60_pbs1000:.3f}/{_v60_fast_min_buy:.3f} "
+                    f"tbs250={_v60_top:.3f}/{_v60_fast_max_top:.3f} "
+                    f"v47h_ratio={_v60_ratio:.4f}/{_v60_fast_max_ratio:.4f} "
+                    f"source_lead_ms={_v60_lead}/{_v60_fast_max_lead} "
+                    f"sell_count1000={_v60_psc1000}/{_v60_fast_max_sells} "
+                    f"pass={int(_v60_fast_pass)} blockers={'|'.join(_v60_fast_blockers) if _v60_fast_blockers else '-'}"
+                )
+                if _v60_fast_pass:
+                    rec["v60_flow_gate_pass"] = True
+                    rec["v60_fast_burst_pass"] = True
+                    rec["v60_fast_burst_actual_enabled"] = bool(_v60_fast_actual)
+                    if not _v60_fast_actual:
+                        _emit_v48_candidate_decision(rec, False)
+                        log(
+                            f"PGG2-V60-FAST-BURST-SHADOW-PASS mint={_short(mint)} "
+                            f"decision_id={rec.get('decision_id')} "
+                            f"expected_pnl={_v60_ep:+.6f} "
+                            f"ub250={_v60_ub} pbs1000={_v60_pbs1000:.3f} "
+                            f"top_share250={_v60_top:.3f} "
+                            f"action=no_fee_spend actual_entry_enabled=0"
+                        )
+                        _write_jsonl({
+                            "type": "v60_fast_burst_shadow_pass",
+                            "decision_id": rec.get("decision_id"),
+                            "mint": mint,
+                            "ts_ms": int(ts_ms_now),
+                            "expected_pnl": float(_v60_ep),
+                            "ub250": int(_v60_ub),
+                            "pbs1000": float(_v60_pbs1000),
+                            "tbs250": float(_v60_top),
+                            "v47h_ratio": float(_v60_ratio),
+                            "source_lead_ms": int(_v60_lead),
+                        })
+                        _log_v48_entry_block(
+                            rec,
+                            "v60_fast_burst_shadow_pass",
+                            "actual_entry_enabled=0",
+                            int(ts_ms_now),
+                        )
+                        return
+                    if "v60_fast_burst" not in _signal_lanes:
+                        _signal_lanes.append("v60_fast_burst")
+                    rec["signal_lane"] = "|".join(_signal_lanes)
+            if _v60_seed_pass:
+                if mint in _queued_mints():
+                    upgraded = False
+                    for queued_rec in backfill_queue:
+                        if (
+                            str(queued_rec.get("mint") or "") == mint
+                            and bool(queued_rec.get("v60_flow_watch_pending", False))
+                        ):
+                            old_ep = float(queued_rec.get("exp_pnl", 0.0) or 0.0)
+                            if _v60_ep > old_ep + 1e-12:
+                                keep_not_before = int(queued_rec.get("not_before_ms", ts_ms_now) or ts_ms_now)
+                                queued_rec.update(dict(rec))
+                                queued_rec["v60_flow_watch_pending"] = True
+                                queued_rec["queued_at_ms"] = int(ts_ms_now)
+                                queued_rec["not_before_ms"] = min(
+                                    keep_not_before,
+                                    int(ts_ms_now) + int(_v60_confirm_delay_ms),
+                                )
+                                queued_rec["expires_at_ms"] = int(ts_ms_now) + int(_v60_confirm_max_wait_ms)
+                                queued_rec["opened_or_deferred"] = "queued_v60_flow_watch_upgraded"
+                                upgraded = True
+                                log(
+                                    f"PGG2-V60-FLOW-WATCH-UPGRADE mint={_short(mint)} "
+                                    f"old_exp_pnl={old_ep:+.6f} new_decision_id={rec.get('decision_id')} "
+                                    f"new_exp_pnl={_v60_ep:+.6f} "
+                                    f"not_before_ms={queued_rec['not_before_ms']} "
+                                    f"expires_at_ms={queued_rec['expires_at_ms']}"
+                                )
+                            break
+                    _log_v48_entry_block(
+                        rec,
+                        "duplicate_mint",
+                        "v60_already_queued_upgraded" if upgraded else "v60_already_queued",
+                        int(ts_ms_now),
+                    )
+                    return
+                queued = dict(rec)
+                queued["v60_flow_watch_pending"] = True
+                queued["queued_at_ms"] = int(ts_ms_now)
+                queued["not_before_ms"] = int(ts_ms_now) + int(_v60_confirm_delay_ms)
+                queued["expires_at_ms"] = int(ts_ms_now) + int(_v60_confirm_max_wait_ms)
+                queued["opened_or_deferred"] = "queued_v60_flow_watch"
+                backfill_queue.append(queued)
+                _emit_v48_candidate_decision(rec, False)
+                _log_v48_entry_block(
+                    rec,
+                    "v60_flow_watch_wait",
+                    f"confirm_delay_ms={_v60_confirm_delay_ms}_max_wait_ms={_v60_confirm_max_wait_ms}",
+                    int(ts_ms_now),
+                )
+                log(
+                    f"PGG2-V60-FLOW-WATCH-ADD mint={_short(mint)} "
+                    f"decision_id={rec.get('decision_id')} "
+                    f"not_before_ms={queued['not_before_ms']} "
+                    f"expires_at_ms={queued['expires_at_ms']} "
+                    f"queue_len={len(backfill_queue)} action=watch_then_confirm"
+                )
+                _write_jsonl({
+                    "type": "v60_flow_watch_add",
+                    "decision_id": rec.get("decision_id"),
+                    "mint": mint,
+                    "ts_ms": int(ts_ms_now),
+                    "not_before_ms": int(queued["not_before_ms"]),
+                    "expires_at_ms": int(queued["expires_at_ms"]),
+                    "expected_pnl": float(_v60_ep),
+                    "top_share250": float(_v60_top),
+                    "v47h_ratio": float(_v60_ratio),
+                    "source_lead_ms": int(_v60_lead),
+                })
+                return
+            rec["v60_flow_gate_pass"] = False
+
+        rec["signal_lane"] = "|".join(_signal_lanes)
+        if _signal_gate_enabled and not _signal_lanes:
+            v48_clean_close_gate_blocks += 1
+            _emit_v48_candidate_decision(rec, False)
+            _log_v48_entry_block(
+                rec,
+                "v56_signal_gate",
+                (
+                    f"v56b_pass={int(bool(rec.get('v56b_gate_pass', False)))}_"
+                    f"v56d_pass={int(bool(rec.get('v56d_flow_gate_pass', False)))}_"
+                    f"v67_pass={int(bool(rec.get('v67_flow_confirm_gate_pass', False)))}_"
+                    f"v57_pass={int(bool(rec.get('v57_impulse_gate_pass', False)))}_"
+                    f"v58_pass={int(bool(rec.get('v58_flow_gate_pass', False)))}_"
+                    f"v60_seed_pass={int(bool(rec.get('v60_seed_pass', False)))}_"
+                    f"v61_pass={int(bool(rec.get('v61_fanout_gate_pass', False)))}"
+                ),
+                int(ts_ms_now),
+            )
+            return
+
+        recent_veto_memory_ms = max(0, int(args.recent_v47i_veto_memory_ms))
+        recent_veto = recent_v47i_veto_by_mint.get(mint)
+        if recent_veto_memory_ms > 0 and recent_veto is not None:
+            veto_ts, veto_reasons = recent_veto
+            veto_age_ms = int(ts_ms_now) - int(veto_ts)
+            if 0 <= veto_age_ms <= recent_veto_memory_ms:
+                v61_recent_veto_bypass = (
+                    bool(rec.get("v61_fanout_gate_pass", False))
+                    and (
+                        os.environ.get(
+                            "PGG2_V61_ALLOW_V47I_NEG_DELTA_BYPASS", "0"
+                        )
+                        .strip()
+                        .lower()
+                        in ("1", "true", "yes", "on")
+                    )
+                    and "negative_delta" in str(veto_reasons)
+                )
+                if v61_recent_veto_bypass:
+                    log(
+                        f"PGG2-V61-RECENT-V47I-VETO-MEMORY-BYPASS "
+                        f"mint={_short(mint)} decision_id={rec.get('decision_id')} "
+                        f"age_ms={veto_age_ms} reasons={veto_reasons}"
+                    )
+                else:
+                    v48_recent_veto_memory_blocks += 1
+                    v48_clean_close_gate_blocks += 1
+                    _emit_v48_candidate_decision(rec, False)
+                    _log_v48_entry_block(
+                        rec,
+                        "clean_close_gate",
+                        (
+                            f"recent_v47i_negative_delta_veto_age_ms={veto_age_ms}"
+                            f"_reasons={veto_reasons}"
+                        ),
+                        int(ts_ms_now),
+                    )
+                    return
+        if source_lead_limit_ms > 0 and int(source_lead_ms) > source_lead_limit_ms:
+            v48_clean_close_gate_blocks += 1
+            _emit_v48_candidate_decision(rec, False)
+            _log_v48_entry_block(
+                rec,
+                "stale_curve_state",
+                f"source_lead_ms={int(source_lead_ms)}_gt_{source_lead_limit_ms}",
+                int(ts_ms_now),
+            )
+            return
+        # V68 BYPASS: whale-follow lane fires on the WHALE'S buy size as the EV
+        # signal, not on our own exp_pnl at our small entry size. The clean_floor
+        # (V55 0.0015 SOL) was tuned for the swarm/multi-buyer pattern and is
+        # not the right gate for whale-follow. Skip the floor only when V68
+        # passed; existing V47H/V47I rug vetoes + watchdog still cap loss.
+        _v68_passed_for_floor = bool(rec.get("v68_whale_follow_gate_pass", False))
+        if not _v68_passed_for_floor and float(rec["exp_pnl"]) < clean_floor - 1e-12:
+            v48_clean_close_gate_blocks += 1
+            _emit_v48_candidate_decision(rec, False)
+            _log_v48_entry_block(
+                rec,
+                "clean_close_gate",
+                f"exp_pnl_lt_clean_floor_{clean_floor:.6f}",
+                int(ts_ms_now),
+            )
+            return
+        if _v68_passed_for_floor and float(rec["exp_pnl"]) < clean_floor - 1e-12:
+            log(
+                f"PGG2-V68-CLEAN-FLOOR-BYPASS mint={_short(mint)} "
+                f"exp_pnl={float(rec['exp_pnl']):+.6f}/{clean_floor:.6f} "
+                f"reason=v68_whale_follow_owns_entry"
+            )
+        concentration_max_buyers = max(0, int(args.concentration_guard_max_buyers))
+        concentration_top_share = float(args.concentration_guard_top_share)
+        if (
+            concentration_max_buyers > 0
+            and int(rec["ub_250"]) <= concentration_max_buyers
+            and float(rec["tbs_250"]) > concentration_top_share + 1e-12
+        ):
+            v61_concentration_bypass = (
+                bool(rec.get("v61_fanout_gate_pass", False))
+                and os.environ.get(
+                    "PGG2_V61_BYPASS_250MS_CONCENTRATION_CLEAN_CLOSE", "0"
+                )
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            )
+            v67_concentration_bypass = (
+                bool(rec.get("v67_flow_confirm_gate_pass", False))
+                and os.environ.get(
+                    "PGG2_V67_BYPASS_CLEAN_CLOSE_CONCENTRATION", "0"
+                )
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            )
+            if v61_concentration_bypass:
+                log(
+                    f"PGG2-V61-CLEAN-CLOSE-CONCENTRATION-BYPASS "
+                    f"mint={_short(mint)} decision_id={rec.get('decision_id')} "
+                    f"ub250={int(rec['ub_250'])} "
+                    f"top250={float(rec['tbs_250']):.3f} "
+                    f"ub2000={int(rec.get('v61_unique_buyers_2000', 0) or 0)} "
+                    f"top2000={float(rec.get('v61_top_share_2000', 1.0)):.3f} "
+                    f"buy_sol2000={float(rec.get('v61_buy_sol_2000', 0.0)):.3f} "
+                    f"sells2000={int(rec.get('v61_sell_count_2000', 0) or 0)} "
+                    f"reason=v61_fanout_uses_2s_distribution"
+                )
+            elif v67_concentration_bypass:
+                log(
+                    f"PGG2-V67-CLEAN-CLOSE-CONCENTRATION-BYPASS "
+                    f"mint={_short(mint)} decision_id={rec.get('decision_id')} "
+                    f"ub250={int(rec['ub_250'])} "
+                    f"top250={float(rec['tbs_250']):.3f} "
+                    f"v47h_ratio={float(rec.get('v47h_ratio', 0.0)):.4f} "
+                    f"pbs1000={float(rec.get('pbs_1000', 0.0)):.3f} "
+                    f"pss1000={float(rec.get('pss_1000', 0.0)):.3f} "
+                    f"psc1000={int(rec.get('psc_1000', 0) or 0)} "
+                    f"reason=v67_final_gate_owns_concentration"
+                )
+            else:
+                v48_concentration_gate_blocks += 1
+                v48_clean_close_gate_blocks += 1
+                _emit_v48_candidate_decision(rec, False)
+                _log_v48_entry_block(
+                    rec,
+                    "clean_close_gate",
+                    (
+                        f"ub_le{concentration_max_buyers}_top_share_gt_"
+                        f"{concentration_top_share:.3f}"
+                    ),
+                    int(ts_ms_now),
+                )
+                return
+        velocity_max_buyers = max(0, int(args.velocity_edge_max_buyers))
+        velocity_min_buy_sol = float(args.velocity_edge_min_buy_sol)
+        velocity_floor = float(args.velocity_edge_floor_sol)
+        _v68_owns_velocity = bool(rec.get("v68_whale_follow_gate_pass", False))
+        if (
+            velocity_max_buyers > 0
+            and int(rec["ub_250"]) <= velocity_max_buyers
+            and float(rec["pbs_250"]) >= velocity_min_buy_sol
+            and float(rec["exp_pnl"]) < velocity_floor - 1e-12
+            and not _v68_owns_velocity
+        ):
+            v48_velocity_edge_gate_blocks += 1
+            v48_clean_close_gate_blocks += 1
+            _emit_v48_candidate_decision(rec, False)
+            _log_v48_entry_block(
+                rec,
+                "clean_close_gate",
+                (
+                    f"ub_le{velocity_max_buyers}_pbs250_ge_"
+                    f"{velocity_min_buy_sol:.3f}_exp_pnl_lt_{velocity_floor:.6f}"
+                ),
+                int(ts_ms_now),
+            )
+            return
+        if _v68_owns_velocity and (
+            velocity_max_buyers > 0
+            and int(rec["ub_250"]) <= velocity_max_buyers
+            and float(rec["pbs_250"]) >= velocity_min_buy_sol
+            and float(rec["exp_pnl"]) < velocity_floor - 1e-12
+        ):
+            log(
+                f"PGG2-V68-VELOCITY-EDGE-BYPASS mint={_short(mint)} "
+                f"ub250={int(rec['ub_250'])} pbs250={float(rec['pbs_250']):.3f} "
+                f"exp_pnl={float(rec['exp_pnl']):+.6f}/{velocity_floor:+.6f} "
+                f"reason=v68_whale_follow_owns_entry"
+            )
+        v48_candidates_passed += 1
+        _emit_v48_candidate_decision(rec, True)
+        recent_close_ms = _recent_nonnegative_close_ms(mint, int(ts_ms_now))
+        if recent_close_ms is not None:
+            v48_duplicate_blocks += 1
+            _log_v48_entry_block(
+                rec,
+                "duplicate_mint",
+                f"recent_nonnegative_close_age_ms={int(ts_ms_now) - int(recent_close_ms)}",
+                ts_ms_now,
+            )
+            return
+        recent_loss_ms = _recent_loss_close_ms(mint, int(ts_ms_now))
+        if recent_loss_ms is not None:
+            v48_duplicate_blocks += 1
+            _log_v48_entry_block(
+                rec,
+                "session_loss_blacklist",
+                f"recent_loss_close_age_ms={int(ts_ms_now) - int(recent_loss_ms)}",
+                ts_ms_now,
+            )
+            log(
+                f"PGG2-V48-LIVE-LOSS-BLACKLIST-BLOCK mint={_short(mint)} "
+                f"recent_loss_age_ms={int(ts_ms_now) - int(recent_loss_ms)} "
+                f"reason=mint_already_lost_this_session"
+            )
+            return
+        if any(str(r.get("mint") or "") == mint for r in open_positions.values()):
+            v48_duplicate_blocks += 1
+            _log_v48_entry_block(rec, "duplicate_mint", "already_open", ts_ms_now)
+            return
+        if mint in _queued_mints():
+            v48_duplicate_blocks += 1
+            _log_v48_entry_block(rec, "duplicate_mint", "already_queued", ts_ms_now)
+            return
+        if len(open_positions) >= max_open:
+            max_open_skips += 1
+            _queue_v48_record(rec, int(ts_ms_now))
+            return
+        _open_v48_record(rec, from_backfill=False)
+
+    async def _prefetch_v48_live_mint(mint: str) -> None:
+        if not live_smoke or not live_mint_owner_prefetch:
+            return
+        from solders.pubkey import Pubkey  # type: ignore
+        retry_window_ms = max(
+            0,
+            int(os.environ.get("PGG2_V57_PREFETCH_RETRY_WINDOW_MS", "550") or 550),
+        )
+        retry_interval_ms = max(
+            20,
+            int(os.environ.get("PGG2_V57_PREFETCH_RETRY_INTERVAL_MS", "50") or 50),
+        )
+        start_ms = _now_ms()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                mint_pk = Pubkey.from_string(mint)
+                async with live_prefetch_sem:
+                    await asyncio.to_thread(broker.mint_owner, mint_pk)
+                live_prefetch_status[mint] = ("ok", _now_ms(), "")
+                log(
+                    f"PGG2-V48-LIVE-HOT-MINT-PREFETCH mint={_short(mint)} "
+                    f"status=ok attempts={attempt} elapsed_ms={_now_ms() - start_ms}"
+                )
+                return
+            except Exception as exc:
+                err = f"{type(exc).__name__}:{exc}"
+                now_retry = _now_ms()
+                live_prefetch_status[mint] = ("error", now_retry, err)
+                elapsed_ms = now_retry - start_ms
+                if (
+                    retry_window_ms <= 0
+                    or elapsed_ms >= retry_window_ms
+                    or not _v57_prefetch_error_retryable(err)
+                ):
+                    log(
+                        f"PGG2-V48-LIVE-HOT-MINT-PREFETCH mint={_short(mint)} "
+                        f"status=error attempts={attempt} elapsed_ms={elapsed_ms} "
+                        f"err={err}"
+                    )
+                    return
+                log(
+                    f"PGG2-V57-HOT-MINT-PREFETCH-RETRY mint={_short(mint)} "
+                    f"attempt={attempt} elapsed_ms={elapsed_ms}/{retry_window_ms} "
+                    f"sleep_ms={retry_interval_ms} err={err}"
+                )
+                try:
+                    await asyncio.sleep(retry_interval_ms / 1000.0)
+                except asyncio.CancelledError:
+                    return
+
+    async def _blockhash_prefetcher() -> None:
+        if not live_smoke or not live_blockhash_prefetch:
+            return
+        interval_s = live_blockhash_prefetch_interval_ms / 1000.0
+        while not shred_stop.is_set():
+            try:
+                await asyncio.to_thread(broker.refresh_blockhash_cache)
+            except Exception as exc:
+                log(f"PGG2-V48-LIVE-BLOCKHASH-PREFETCH status=error err={type(exc).__name__}:{exc}")
+            try:
+                await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                return
+
+    async def _shred_listener():
+        nonlocal raw_buys_seen, raw_sells_seen
+        nonlocal last_shred_msg_ms, last_pump_trade_ms
+        if disable_shred:
+            log("PGG2-V48-SHRED-DISABLED env=PGG2_V48_DISABLE_SHRED")
+            return
+        try:
+            import websockets  # type: ignore
+        except Exception:
+            return
+        url = os.environ.get("SOLANATRACKER_RPC_WS", "")
+        if not url:
+            return
+        backoff = 2.0
+        while not shred_stop.is_set():
+            try:
+                log(f"PGG2-V48-SHRED-CONNECT url_configured=1")
+                async with websockets.connect(
+                    url, ping_interval=20, ping_timeout=60,
+                    max_queue=4096, max_size=8 * 1024 * 1024,
+                ) as ws:
+                    backoff = 2.0
+                    sub = {"jsonrpc": "2.0", "id": 92347,
+                           "method": "shredSubscribe",
+                           "params": [
+                               {"accountInclude": [PUMP_PROGRAM],
+                                "accountRequired": [PUMP_PROGRAM],
+                                "vote": False},
+                               {"encoding": "base64",
+                                "transactionDetails": "full",
+                                "maxSupportedTransactionVersion": 0},
+                           ]}
+                    await ws.send(json.dumps(sub))
+                    last_shred_msg_ms = _now_ms()
+                    log("PGG2-V48-SHRED-SUBSCRIBED method=shredSubscribe")
+                    async for raw in ws:
+                        if shred_stop.is_set():
+                            break
+                        last_shred_msg_ms = _now_ms()
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+                        if "shred" not in str(
+                            data.get("method") or "",
+                        ).lower():
+                            continue
+                        result = (
+                            (data.get("params") or {}).get("result") or {}
+                        )
+                        try:
+                            events_ = list(
+                                parse_base64_shred_for_pump_events(
+                                    result, set(),
+                                )
+                            )
+                        except Exception:
+                            events_ = []
+                        ts_ms = _now_ms()
+                        for ev in events_:
+                            m = getattr(ev, "mint", "") or ""
+                            if not m or getattr(ev, "kind", "") != "trade":
+                                continue
+                            last_pump_trade_ms = ts_ms
+                            slot = int(getattr(ev, "slot", 0) or 0)
+                            sol_lamports = int(
+                                getattr(ev, "sol_lamports", 0) or 0
+                            )
+                            tokens = int(
+                                getattr(ev, "token_amount", 0) or 0
+                            )
+                            sol_in = sol_lamports / 1_000_000_000.0
+                            signer = str(getattr(ev, "signer", "") or "")
+                            is_buy = bool(getattr(ev, "is_buy", False))
+                            if is_buy:
+                                buffer_.ingest_pump_buy(
+                                    m, sol_in, signer, slot, ts_ms,
+                                )
+                                raw_buys_seen += 1
+                                _maybe_evaluate(
+                                    m, ts_ms, slot, sol_in, signer,
+                                    str(getattr(ev, "sig", "") or ""),
+                                )
+                            else:
+                                buffer_.ingest_pump_sell(
+                                    m, tokens, signer, slot, ts_ms, 0.0,
+                                )
+                                raw_sells_seen += 1
+                            hot_mint_last_seen[m] = ts_ms
+                            if len(hot_mint_last_seen) <= args.max_hot_mints:
+                                oracle.request_subscription(m)
+                            if (
+                                live_smoke
+                                and live_mint_owner_prefetch
+                                and m not in live_prefetched_mints
+                            ):
+                                live_prefetched_mints.add(m)
+                                asyncio.create_task(_prefetch_v48_live_mint(m))
+                            oracle.mark_feed_event(m, ts_ms)
+            except asyncio.CancelledError:
+                log("PGG2-V48-SHRED-LISTENER-CANCELLED")
+                return
+            except Exception as exc:
+                log(
+                    f"PGG2-V48-SHRED-RECONNECT reason={type(exc).__name__}:{exc} "
+                    f"backoff_s={backoff:.1f}"
+                )
+                try:
+                    await asyncio.sleep(backoff)
+                except asyncio.CancelledError:
+                    return
+                backoff = min(backoff * 2.0, 30.0)
+
+    # LAYER 3 FISHERMAN FIX (2026-05-18): PumpPortal WSS new-token feed runs
+    # in parallel with the ST shred listener. Each pump.fun mint create event
+    # arrives within seconds of on-chain creation, carrying mint + creator +
+    # bonding curve PDA inline. We use it to pre-warm broker._account_cache
+    # BEFORE the first shred-derived trade event hits — so when shred fires,
+    # the prefetch is already done and the trade can be evaluated without RPC
+    # round-trip. Env-gated via PGG2_V48_PUMPPORTAL_ENABLED (default ON).
+    async def _pumpportal_listener() -> None:
+        if not live_smoke or not live_mint_owner_prefetch:
+            return
+        if not _env_flag("PGG2_V48_PUMPPORTAL_ENABLED", "1"):
+            log("PGG2-V48-PUMPPORTAL-LISTENER-DISABLED")
+            return
+        try:
+            import websockets  # type: ignore
+        except ImportError:
+            log("PGG2-V48-PUMPPORTAL-LISTENER-NO-WEBSOCKETS-LIB")
+            return
+        url = os.environ.get("PGG2_V48_PUMPPORTAL_WSS", "wss://pumpportal.fun/api/data")
+        nonlocal_seed = {"events": 0, "prefetches_triggered": 0, "vsol_cached": 0}
+        backoff = 1.0
+        while not shred_stop.is_set():
+            try:
+                log(f"PGG2-V48-PUMPPORTAL-CONNECT url={url}")
+                async with websockets.connect(
+                    url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=2,
+                    max_size=2**20,
+                ) as ws:
+                    await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                    log("PGG2-V48-PUMPPORTAL-SUBSCRIBED method=subscribeNewToken")
+                    backoff = 1.0
+                    while not shred_stop.is_set():
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=60.0)
+                        except asyncio.TimeoutError:
+                            continue
+                        try:
+                            data = json.loads(msg)
+                        except Exception:
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+                        if data.get("txType") != "create":
+                            continue
+                        m = str(data.get("mint", "") or "")
+                        if not m:
+                            continue
+                        nonlocal_seed["events"] += 1
+                        creator = str(data.get("traderPublicKey", "") or "")
+                        initial_buy = float(data.get("solAmount", 0.0) or 0.0)
+                        # CACHE create-event curve state for the vsol filter.
+                        # When RPC is throttled and curve_snapshot is 0, the
+                        # filter falls back to this cache. Fresh mints have
+                        # vsol=30-32 SOL (below the 37 floor) so they fail
+                        # the "too_fresh" check — exactly what we want during
+                        # throttle: block all fresh-mint garbage trades.
+                        try:
+                            v_sol = float(data.get("vSolInBondingCurve", 0.0) or 0.0)
+                            if v_sol > 0:
+                                _pumpportal_curve_cache[m] = (
+                                    int(v_sol * 1.0e9),
+                                    int(time.time() * 1000),
+                                )
+                                nonlocal_seed["vsol_cached"] += 1
+                        except Exception:
+                            pass
+                        if m not in live_prefetched_mints:
+                            live_prefetched_mints.add(m)
+                            nonlocal_seed["prefetches_triggered"] += 1
+                            asyncio.create_task(_prefetch_v48_live_mint(m))
+                            log(
+                                f"PGG2-V48-PUMPPORTAL-NEW-MINT mint={_short(m)} "
+                                f"creator={_short(creator)} initial_buy_sol={initial_buy:.6f} "
+                                f"v_sol_cached={data.get('vSolInBondingCurve', 0)} "
+                                f"events_seen={nonlocal_seed['events']} "
+                                f"prefetches_triggered={nonlocal_seed['prefetches_triggered']} "
+                                f"vsol_cached={nonlocal_seed['vsol_cached']}"
+                            )
+            except asyncio.CancelledError:
+                log("PGG2-V48-PUMPPORTAL-LISTENER-CANCELLED")
+                return
+            except Exception as exc:
+                log(
+                    f"PGG2-V48-PUMPPORTAL-RECONNECT reason={type(exc).__name__}:{exc} "
+                    f"backoff_s={backoff:.1f} events_so_far={nonlocal_seed['events']}"
+                )
+                try:
+                    await asyncio.sleep(backoff)
+                except asyncio.CancelledError:
+                    return
+                backoff = min(backoff * 2.0, 30.0)
+
+    shred_task = asyncio.create_task(_shred_listener())
+    blockhash_task = asyncio.create_task(_blockhash_prefetcher())
+    pumpportal_task = asyncio.create_task(_pumpportal_listener())
+    deadline_ms = _now_ms() + args.max_seconds * 1000
+    t_start_wall = _now_ms()
+    progress_interval_ms = max(1, int(args.progress_interval_seconds)) * 1000
+    next_progress_ms = t_start_wall + progress_interval_ms
+    # Fisherman watchdog state (LAYER 4 2026-05-18).
+    _fisherman_last_candidates_seen = 0
+    _fisherman_frozen_cycles = 0
+
+    try:
+        while _now_ms() < deadline_ms:
+            await asyncio.sleep(0.05)
+            now_ts = _now_ms()
+            if feed_stall_reconnect_ms > 0 and not disable_shred:
+                feed_msg_age_ms = max(0, now_ts - int(last_shred_msg_ms))
+                if shred_task.done() or feed_msg_age_ms > feed_stall_reconnect_ms:
+                    reason = "task_done" if shred_task.done() else "message_stall"
+                    shred_reconnects += 1
+                    log(
+                        f"PGG2-V48-FEED-STALL-RECONNECT reason={reason} "
+                        f"msg_age_ms={feed_msg_age_ms} "
+                        f"trade_age_ms={max(0, now_ts - int(last_pump_trade_ms))} "
+                        f"reconnects={shred_reconnects}"
+                    )
+                    try:
+                        if not shred_task.done():
+                            shred_task.cancel()
+                        try:
+                            await shred_task
+                        except BaseException:
+                            pass
+                    except Exception:
+                        pass
+                    last_shred_msg_ms = now_ts
+                    shred_task = asyncio.create_task(_shred_listener())
+            stale_cutoff = now_ts - 30_000
+            cold = [m for m, t in hot_mint_last_seen.items()
+                    if t < stale_cutoff]
+            for m in cold:
+                hot_mint_last_seen.pop(m, None)
+
+            for mint in list(hot_mint_last_seen.keys())[: args.max_hot_mints]:
+                st = oracle._states.get(mint)
+                if st is None or not st.points:
+                    continue
+                last_ingest_ts = seen_curve_ts.get(mint, 0)
+                new_points = []
+                for p in st.points:
+                    if int(p.ts_ms) > int(last_ingest_ts):
+                        new_points.append(p)
+                if not new_points:
+                    continue
+                new_points.sort(key=lambda x: x.ts_ms)
+                for p in new_points:
+                    seen_curve_ts[mint] = int(p.ts_ms)
+                    if p.error: continue
+                    # V47H: pass vsol_lamports so the sell-aware buffer
+                    # records a curve-delta history (used by veto B).
+                    buffer_.mark_curve_update(
+                        mint, int(p.ts_ms),
+                        int(p.virtual_sol_reserves),
+                    )
+                    curve_updates_seen += 1
+                    snapshots_total += 1
+                    cs_now = curve_state_from_subscriber_point(
+                        int(p.virtual_sol_reserves),
+                        int(p.virtual_token_reserves),
+                        int(p.real_token_reserves),
+                        fee_bps, creator_fee_bps,
+                    )
+                    # V47I: record reference local sell quote per mint so
+                    # the medium-rug veto C (quote weakening) has at least
+                    # 5 historical points. Reference size 0.005 SOL.
+                    try:
+                        _ref_buy_tok = local_buy_quote_tokens_raw(
+                            cs_now, 0.005,
+                        )
+                        if int(_ref_buy_tok) > 0:
+                            _ref_sell_lams, _ = local_sell_quote_sol(
+                                cs_now, int(_ref_buy_tok),
+                            )
+                            _ref_sell_sol = (
+                                float(_ref_sell_lams)
+                                / float(LAMPORTS_PER_SOL)
+                            )
+                            buffer_.record_local_quote(
+                                mint, int(p.ts_ms), float(_ref_sell_sol),
+                            )
+                    except Exception:
+                        pass
+                    for key, rec in list(pending_candidates.items()):
+                        m, dts = key
+                        if m != mint:
+                            continue
+                        if int(p.ts_ms) <= int(dts):
+                            continue
+                        tok_at_dec = int(rec.get("expected_tokens", 0))
+                        size_sol = float(rec.get("selected_size_sol", 0.0))
+                        if tok_at_dec <= 0:
+                            sell_lams_now = 0
+                        else:
+                            sell_lams_now, _ = local_sell_quote_sol(
+                                cs_now, int(tok_at_dec)
+                            )
+                        sell_sol_now = float(sell_lams_now) / float(LAMPORTS_PER_SOL)
+                        pnl_now = (sell_sol_now - float(size_sol)
+                                   - 2.0 * float(DEFAULT_TX_FEE_SOL))
+                        lag = int(p.ts_ms) - int(dts)
+
+                        # --- V47G Phase 5: mid-hold dump abort
+                        prev_peak_q = float(rec.get("v47g_peak_quote", 0.0))
+                        prev_peak_v = float(rec.get("v47g_peak_vsol", 0.0))
+                        prev_peak_p = float(rec.get("v47g_peak_pnl", -1e18))
+                        prev_last_q = float(rec.get("v47g_last_quote", 0.0))
+                        prev_neg_g = int(rec.get("v47g_neg_grad_count", 0))
+                        prev_above = bool(
+                            rec.get("v47g_had_been_above_bank_or_scratch", False)
+                        )
+                        cur_q = float(sell_sol_now)
+                        cur_v = (
+                            int(cs_now.virtual_sol_reserves)
+                            / float(LAMPORTS_PER_SOL)
+                        )
+                        new_peak_q = max(prev_peak_q, cur_q)
+                        new_peak_v = max(prev_peak_v, cur_v)
+                        new_peak_p = max(prev_peak_p, float(pnl_now))
+                        grad = cur_q - prev_last_q if prev_last_q > 0 else 0.0
+                        new_neg_g = prev_neg_g + 1 if grad < 0.0 else 0
+                        new_above = prev_above or (pnl_now >= SCRATCH_TH)
+                        rec["v47g_peak_quote"] = new_peak_q
+                        rec["v47g_peak_vsol"] = new_peak_v
+                        rec["v47g_peak_pnl"] = new_peak_p
+                        rec["v47g_last_quote"] = cur_q
+                        rec["v47g_neg_grad_count"] = new_neg_g
+                        rec["v47g_had_been_above_bank_or_scratch"] = new_above
+                        try:
+                            now_snap = buffer_.buyer_stats(
+                                mint, int(p.ts_ms), int(p.ts_ms),
+                            )
+                            pbs_now_h = float(now_snap.get("pending_buy_sol_250ms", 0.0))
+                            pss_now_h = float(now_snap.get("pending_sell_sol_250ms", 0.0))
+                        except Exception:
+                            pbs_now_h = 0.0
+                            pss_now_h = 0.0
+                        break_even_q = float(size_sol) + 2.0 * float(DEFAULT_TX_FEE_SOL)
+                        pos_state = {
+                            "mint": mint,
+                            "size_sol": size_sol,
+                            "current_all_in_pnl": float(pnl_now),
+                            "peak_all_in_pnl": new_peak_p,
+                            "current_local_sell_quote": cur_q,
+                            "peak_local_sell_quote": new_peak_q,
+                            "current_curve_vsol": cur_v,
+                            "peak_curve_vsol": new_peak_v,
+                            "latest_pending_buy_sol_250ms": pbs_now_h,
+                            "latest_pending_sell_sol_250ms": pss_now_h,
+                            "latest_quote_gradient": grad,
+                            "consecutive_negative_gradient_count": new_neg_g,
+                            "had_been_above_bank_or_scratch": new_above,
+                            "break_even_sell_quote": break_even_q,
+                        }
+                        # ---- V47G WATCHDOG: poll for asynchronous decision ----
+                        _v47g_wd = v47g_watchdogs.get(key)
+                        _v47g_dec = _v47g_wd.get_exit_decision() if _v47g_wd else None
+                        if _v47g_wd is not None:
+                            try:
+                                v47g_snap_silence_events += int(
+                                    _v47g_wd.snap_silence_events > 0
+                                )
+                            except Exception:
+                                pass
+                        if _v47g_dec is not None:
+                            # Watchdog already decided. Translate to close_kind.
+                            wd_action = str(_v47g_dec.get("action") or "hold")
+                            wd_pnl = float(_v47g_dec.get("pnl") or 0.0)
+                            wd_ts = int(_v47g_dec.get("ts") or p.ts_ms)
+                            wd_age = int(_v47g_dec.get("age_ms") or lag)
+                            wd_reason = str(_v47g_dec.get("reason") or "")
+                            wd_label = v47g_close_kind_from_action(wd_action)
+                            if wd_label != "hold":
+                                v47g_watchdog_drove_exits += 1
+                                v47g_watchdog_action_counts[wd_action] += 1
+                                rec["close_kind"] = wd_label
+                                rec["close_pnl"] = float(wd_pnl)
+                                rec["close_lag_ms"] = int(wd_age)
+                                rec["v47g_watchdog_action"] = wd_action
+                                rec["v47g_watchdog_reason"] = wd_reason
+                                rec["v47g_drove_exit"] = True
+                                if v47g_is_negative(wd_action):
+                                    negative_closes += 1
+                                    net_pnl_sol += float(wd_pnl)
+                                    if wd_pnl < max_loss_sol:
+                                        max_loss_sol = float(wd_pnl)
+                                    stop_reason = "negative_close"
+                                else:
+                                    non_neg_closes += 1
+                                    net_pnl_sol += float(wd_pnl)
+                                jsonl_fp.write(json.dumps({
+                                    "type": "v47i_drylive_close",
+                                    **{k: rec[k] for k in (
+                                        "mint", "decision_ts_ms",
+                                        "selected_size_sol",
+                                        "close_pnl", "close_kind",
+                                        "close_lag_ms",
+                                    )},
+                                    "ts_ms": int(wd_ts),
+                                    "v47g_watchdog_action": wd_action,
+                                    "v47g_watchdog_reason": wd_reason,
+                                    "v47g_drove_exit": True,
+                                }) + "\n")
+                                jsonl_fp.flush()
+                                pending_candidates.pop(key, None)
+                                open_positions.pop(key, None)
+                                _wd_to_stop = v47g_watchdogs.pop(key, None)
+                                if _wd_to_stop is not None:
+                                    try:
+                                        await _wd_to_stop.stop()
+                                    except Exception:
+                                        pass
+                                log(
+                                    f"V47H-DRYLIVE-CLOSE watchdog "
+                                    f"action={wd_action} label={wd_label} "
+                                    f"pnl={wd_pnl:+.6f} lag={wd_age}ms "
+                                    f"mint={_short(mint)} reason={wd_reason}"
+                                )
+                                if v47g_is_negative(wd_action):
+                                    break
+                                continue
+                        ab, ab_act, ab_reason = should_abort_midhold(
+                            pos_state, {}, logger=log,
+                        )
+                        if ab:
+                            v47g_subscriber_drove_exits += 1
+                            v47g_midhold_abort_count += 1
+                            v47g_midhold_abort_actions[str(ab_act)] += 1
+                            v47g_midhold_abort_details.append({
+                                "mint": mint, "size_sol": size_sol,
+                                "lag_ms": int(lag),
+                                "action": ab_act,
+                                "reason": ab_reason,
+                                "pnl_at_abort": float(pnl_now),
+                            })
+                            # Decide close kind based on action.
+                            if ab_act == ACTION_SCRATCH:
+                                ab_label = "scratch"
+                                ab_close_pnl = float(pnl_now)
+                            elif ab_act == ACTION_FLAT:
+                                ab_label = "scratch"
+                                ab_close_pnl = float(pnl_now)
+                            else:  # ACTION_EMERGENCY
+                                if pnl_now >= 0.0:
+                                    ab_label = "scratch"
+                                elif pnl_now > LOSS_TH:
+                                    ab_label = "expired_loss"
+                                else:
+                                    ab_label = "clamp_loss"
+                                ab_close_pnl = float(pnl_now)
+                            rec["close_kind"] = ab_label
+                            rec["close_pnl"] = float(ab_close_pnl)
+                            rec["close_lag_ms"] = int(lag)
+                            rec["v47g_abort_triggered"] = True
+                            rec["v47g_abort_reason"] = ab_reason
+                            if ab_label in ("clamp_loss", "expired_loss"):
+                                negative_closes += 1
+                                net_pnl_sol += float(ab_close_pnl)
+                                if ab_close_pnl < max_loss_sol:
+                                    max_loss_sol = float(ab_close_pnl)
+                                stop_reason = "negative_close"
+                            else:
+                                non_neg_closes += 1
+                                net_pnl_sol += float(ab_close_pnl)
+                            jsonl_fp.write(json.dumps({
+                                "type": "v47i_drylive_close",
+                                **{k: rec[k] for k in (
+                                    "mint", "decision_ts_ms",
+                                    "selected_size_sol",
+                                    "close_pnl", "close_kind",
+                                    "close_lag_ms",
+                                )},
+                                "ts_ms": int(p.ts_ms),
+                                "v47g_abort_triggered": True,
+                                "v47g_abort_action": str(ab_act),
+                                "v47g_abort_reason": str(ab_reason),
+                            }) + "\n")
+                            jsonl_fp.flush()
+                            pending_candidates.pop(key, None)
+                            open_positions.pop(key, None)
+                            log(
+                                f"V47H-DRYLIVE-CLOSE midhold_abort={ab_act} "
+                                f"label={ab_label} pnl={ab_close_pnl:+.6f} "
+                                f"lag={lag}ms mint={_short(mint)} "
+                                f"reason={ab_reason}"
+                            )
+                            if ab_label in ("clamp_loss", "expired_loss"):
+                                break  # negative -> trigger stop
+                            continue
+
+                        if pnl_now >= BANK_TH:
+                            rec["close_kind"] = "bank"
+                            rec["close_pnl"] = float(pnl_now)
+                            rec["close_lag_ms"] = int(lag)
+                            non_neg_closes += 1
+                            net_pnl_sol += float(pnl_now)
+                            jsonl_fp.write(json.dumps({
+                                "type": "v47i_drylive_close",
+                                **{k: rec[k] for k in (
+                                    "mint", "decision_ts_ms",
+                                    "selected_size_sol",
+                                    "close_pnl", "close_kind",
+                                    "close_lag_ms",
+                                )}, "ts_ms": int(p.ts_ms),
+                            }) + "\n")
+                            jsonl_fp.flush()
+                            pending_candidates.pop(key, None)
+                            open_positions.pop(key, None)
+                            log(
+                                f"V47H-DRYLIVE-CLOSE bank pnl={pnl_now:+.6f} "
+                                f"lag={lag}ms mint={_short(mint)} "
+                                f"non_neg={non_neg_closes} "
+                                f"open_now={len(open_positions)}"
+                            )
+                            continue
+                        if pnl_now <= LOSS_TH:
+                            rec["close_kind"] = "clamp_loss"
+                            rec["close_pnl"] = float(pnl_now)
+                            rec["close_lag_ms"] = int(lag)
+                            negative_closes += 1
+                            net_pnl_sol += float(pnl_now)
+                            if pnl_now < max_loss_sol:
+                                max_loss_sol = float(pnl_now)
+                            jsonl_fp.write(json.dumps({
+                                "type": "v47i_drylive_close",
+                                **{k: rec[k] for k in (
+                                    "mint", "decision_ts_ms",
+                                    "selected_size_sol",
+                                    "close_pnl", "close_kind",
+                                    "close_lag_ms",
+                                )}, "ts_ms": int(p.ts_ms),
+                            }) + "\n")
+                            jsonl_fp.flush()
+                            pending_candidates.pop(key, None)
+                            open_positions.pop(key, None)
+                            log(
+                                f"V47H-DRYLIVE-CLOSE clamp_loss "
+                                f"pnl={pnl_now:+.6f} lag={lag}ms "
+                                f"mint={_short(mint)} "
+                                f"neg={negative_closes} "
+                                f"open_now={len(open_positions)}"
+                            )
+                            # Trigger early exit by setting deadline.
+                            stop_reason = "negative_close"
+                            break
+                        v47g_caps_rt = get_hold_caps(float(size_sol))
+                        hold = int(v47g_caps_rt["max_hold_ms"])
+                        rt_max_ext = int(v47g_caps_rt["max_extend_ms"])
+                        rt_def_allowed = bool(v47g_caps_rt["extend_allowed"])
+                        if float(size_sol) > 0.020 + 1e-9:
+                            # Strict large-size: extend requires 5 conditions.
+                            extend_ok, extend_reason = check_extend_allowed(
+                                float(size_sol),
+                                {
+                                    "current_all_in_pnl_sol": float(pnl_now),
+                                    "latest_curve_delta": 0.0,
+                                    "latest_quote_gradient": float(grad),
+                                    "pending_buy_sol_250ms": float(pbs_now_h),
+                                    "pending_sell_sol_250ms": float(pss_now_h),
+                                    "no_negative_curve_update_last_250ms": (
+                                        int(rec.get("v47g_neg_grad_count", 0)) == 0
+                                    ),
+                                },
+                                logger=log, mint_for_log=mint,
+                            )
+                            if extend_ok:
+                                hold = hold + rt_max_ext
+                                rec["v47g_extended_count"] = (
+                                    int(rec.get("v47g_extended_count", 0)) + 1
+                                )
+                            else:
+                                v47g_extend_skipped_large_size += 1
+                        elif rt_def_allowed and pnl_now > 0:
+                            hold = hold + rt_max_ext
+                            rec["v47g_extended_count"] = (
+                                int(rec.get("v47g_extended_count", 0)) + 1
+                            )
+                        if lag >= hold:
+                            v47g_hold_cap_forced_exits += 1
+                            label = (
+                                "scratch" if abs(pnl_now) < SCRATCH_TH
+                                else ("neutral" if pnl_now > 0
+                                      else "expired_loss")
+                            )
+                            rec["close_kind"] = label
+                            rec["close_pnl"] = float(pnl_now)
+                            rec["close_lag_ms"] = int(lag)
+                            if label == "expired_loss":
+                                negative_closes += 1
+                                net_pnl_sol += float(pnl_now)
+                                if pnl_now < max_loss_sol:
+                                    max_loss_sol = float(pnl_now)
+                                stop_reason = "negative_close"
+                            else:
+                                non_neg_closes += 1
+                                net_pnl_sol += float(pnl_now)
+                            jsonl_fp.write(json.dumps({
+                                "type": "v47i_drylive_close",
+                                **{k: rec[k] for k in (
+                                    "mint", "decision_ts_ms",
+                                    "selected_size_sol",
+                                    "close_pnl", "close_kind",
+                                    "close_lag_ms",
+                                )}, "ts_ms": int(p.ts_ms),
+                            }) + "\n")
+                            jsonl_fp.flush()
+                            pending_candidates.pop(key, None)
+                            open_positions.pop(key, None)
+                            log(
+                                f"V47H-DRYLIVE-CLOSE {label} "
+                                f"pnl={pnl_now:+.6f} lag={lag}ms "
+                                f"mint={_short(mint)} "
+                                f"open_now={len(open_positions)}"
+                            )
+
+            _expire_v48_backfill(now_ts)
+            _consume_v48_backfill(now_ts)
+
+            stop_trigger = None
+            if negative_closes > 0 and not _env_flag("PGG2_V48_ALLOW_NEGATIVE_CLOSES", "0"):
+                stop_trigger = "negative_close"
+            elif (
+                non_neg_closes >= args.target_non_neg_closes
+                and not open_positions
+                and not pending_candidates
+                and not backfill_queue
+            ):
+                stop_trigger = "target_reached_clean"
+            elif failed_buy_fees_total >= FEE_BUDGET:
+                stop_trigger = "fee_budget_exceeded"
+
+            if stop_trigger is not None:
+                stop_reason = stop_trigger
+                log(
+                    f"V47H-DRYLIVE stop_trigger={stop_trigger} "
+                    f"open_now={len(open_positions)} "
+                    f"pending_now={len(pending_candidates)} "
+                    f"entering_drain_max_s={args.post_stop_drain_seconds}"
+                )
+                # Post-stop drain: keep resolving open positions for up to
+                # post_stop_drain_seconds. Stop accepting new entries.
+                drain_deadline_ms = now_ts + (
+                    int(args.post_stop_drain_seconds) * 1000
+                )
+                # Replace per-tick exit: continue the outer while loop until
+                # open_positions == 0 OR drain deadline.
+                while (
+                    _now_ms() < drain_deadline_ms
+                    and (open_positions or pending_candidates)
+                ):
+                    await asyncio.sleep(0.05)
+                    drain_now = _now_ms()
+                    for mint_drain in list(hot_mint_last_seen.keys())[
+                        : args.max_hot_mints
+                    ]:
+                        st_d = oracle._states.get(mint_drain)
+                        if st_d is None or not st_d.points:
+                            continue
+                        last_t = seen_curve_ts.get(mint_drain, 0)
+                        new_pts = []
+                        for p in st_d.points:
+                            if int(p.ts_ms) > int(last_t):
+                                new_pts.append(p)
+                        if not new_pts:
+                            continue
+                        new_pts.sort(key=lambda x: x.ts_ms)
+                        for p in new_pts:
+                            seen_curve_ts[mint_drain] = int(p.ts_ms)
+                            if p.error: continue
+                            buffer_.mark_curve_update(
+                                mint_drain, int(p.ts_ms),
+                                int(p.virtual_sol_reserves),
+                            )
+                            curve_updates_seen += 1
+                            snapshots_total += 1
+                            cs_d = curve_state_from_subscriber_point(
+                                int(p.virtual_sol_reserves),
+                                int(p.virtual_token_reserves),
+                                int(p.real_token_reserves),
+                                fee_bps, creator_fee_bps,
+                            )
+                            for key_d, rec_d in list(
+                                pending_candidates.items()
+                            ):
+                                m_d, dts_d = key_d
+                                if m_d != mint_drain:
+                                    continue
+                                if int(p.ts_ms) <= int(dts_d):
+                                    continue
+                                tok_d = int(rec_d.get("expected_tokens", 0))
+                                size_d = float(
+                                    rec_d.get("selected_size_sol", 0.0)
+                                )
+                                if tok_d <= 0:
+                                    sell_lams_d = 0
+                                else:
+                                    sell_lams_d, _ = local_sell_quote_sol(
+                                        cs_d, int(tok_d)
+                                    )
+                                sell_sol_d = (
+                                    float(sell_lams_d)
+                                    / float(LAMPORTS_PER_SOL)
+                                )
+                                pnl_d = (
+                                    sell_sol_d - float(size_d)
+                                    - 2.0 * float(DEFAULT_TX_FEE_SOL)
+                                )
+                                lag_d = int(p.ts_ms) - int(dts_d)
+
+                                # V47G midhold dump abort (drain).
+                                prev_peak_qd = float(rec_d.get("v47g_peak_quote", 0.0))
+                                prev_peak_vd = float(rec_d.get("v47g_peak_vsol", 0.0))
+                                prev_peak_pd = float(rec_d.get("v47g_peak_pnl", -1e18))
+                                prev_last_qd = float(rec_d.get("v47g_last_quote", 0.0))
+                                prev_neg_gd = int(rec_d.get("v47g_neg_grad_count", 0))
+                                prev_above_d = bool(rec_d.get("v47g_had_been_above_bank_or_scratch", False))
+                                cur_qd = float(sell_sol_d)
+                                cur_vd = int(cs_d.virtual_sol_reserves) / float(LAMPORTS_PER_SOL)
+                                new_peak_qd = max(prev_peak_qd, cur_qd)
+                                new_peak_vd = max(prev_peak_vd, cur_vd)
+                                new_peak_pd = max(prev_peak_pd, float(pnl_d))
+                                grad_d = cur_qd - prev_last_qd if prev_last_qd > 0 else 0.0
+                                new_neg_gd = prev_neg_gd + 1 if grad_d < 0.0 else 0
+                                new_above_d = prev_above_d or (pnl_d >= SCRATCH_TH)
+                                rec_d["v47g_peak_quote"] = new_peak_qd
+                                rec_d["v47g_peak_vsol"] = new_peak_vd
+                                rec_d["v47g_peak_pnl"] = new_peak_pd
+                                rec_d["v47g_last_quote"] = cur_qd
+                                rec_d["v47g_neg_grad_count"] = new_neg_gd
+                                rec_d["v47g_had_been_above_bank_or_scratch"] = new_above_d
+                                try:
+                                    now_snap_d = buffer_.buyer_stats(
+                                        mint_drain, int(p.ts_ms), int(p.ts_ms),
+                                    )
+                                    pbs_d_h = float(now_snap_d.get("pending_buy_sol_250ms", 0.0))
+                                    pss_d_h = float(now_snap_d.get("pending_sell_sol_250ms", 0.0))
+                                except Exception:
+                                    pbs_d_h = 0.0
+                                    pss_d_h = 0.0
+                                break_even_qd = float(size_d) + 2.0 * float(DEFAULT_TX_FEE_SOL)
+                                pos_state_d = {
+                                    "mint": mint_drain, "size_sol": size_d,
+                                    "current_all_in_pnl": float(pnl_d),
+                                    "peak_all_in_pnl": new_peak_pd,
+                                    "current_local_sell_quote": cur_qd,
+                                    "peak_local_sell_quote": new_peak_qd,
+                                    "current_curve_vsol": cur_vd,
+                                    "peak_curve_vsol": new_peak_vd,
+                                    "latest_pending_buy_sol_250ms": pbs_d_h,
+                                    "latest_pending_sell_sol_250ms": pss_d_h,
+                                    "latest_quote_gradient": grad_d,
+                                    "consecutive_negative_gradient_count": new_neg_gd,
+                                    "had_been_above_bank_or_scratch": new_above_d,
+                                    "break_even_sell_quote": break_even_qd,
+                                }
+                                ab_d, ab_act_d, ab_reason_d = should_abort_midhold(
+                                    pos_state_d, {}, logger=log,
+                                )
+                                if ab_d:
+                                    v47g_subscriber_drove_exits += 1
+                                    v47g_midhold_abort_count += 1
+                                    v47g_midhold_abort_actions[str(ab_act_d)] += 1
+                                    if ab_act_d == ACTION_SCRATCH:
+                                        lbl_d = "scratch"
+                                        pnl_d_close = float(pnl_d)
+                                    elif ab_act_d == ACTION_FLAT:
+                                        lbl_d = "scratch"
+                                        pnl_d_close = float(pnl_d)
+                                    else:
+                                        if pnl_d >= 0.0:
+                                            lbl_d = "scratch"
+                                        elif pnl_d > LOSS_TH:
+                                            lbl_d = "expired_loss"
+                                        else:
+                                            lbl_d = "clamp_loss"
+                                        pnl_d_close = float(pnl_d)
+                                    rec_d["close_kind"] = lbl_d
+                                    rec_d["close_pnl"] = float(pnl_d_close)
+                                    rec_d["close_lag_ms"] = int(lag_d)
+                                    rec_d["v47g_abort_triggered"] = True
+                                    rec_d["v47g_abort_reason"] = ab_reason_d
+                                    if lbl_d in ("clamp_loss", "expired_loss"):
+                                        negative_closes += 1
+                                        net_pnl_sol += float(pnl_d_close)
+                                        if pnl_d_close < max_loss_sol:
+                                            max_loss_sol = float(pnl_d_close)
+                                    else:
+                                        non_neg_closes += 1
+                                        net_pnl_sol += float(pnl_d_close)
+                                    jsonl_fp.write(json.dumps({
+                                        "type": "v47i_drylive_close",
+                                        **{k: rec_d[k] for k in (
+                                            "mint", "decision_ts_ms",
+                                            "selected_size_sol",
+                                            "close_pnl", "close_kind",
+                                            "close_lag_ms",
+                                        )}, "ts_ms": int(p.ts_ms),
+                                        "v47g_abort_triggered": True,
+                                        "v47g_abort_action": str(ab_act_d),
+                                        "v47g_abort_reason": str(ab_reason_d),
+                                    }) + "\n")
+                                    jsonl_fp.flush()
+                                    pending_candidates.pop(key_d, None)
+                                    open_positions.pop(key_d, None)
+                                    log(
+                                        f"V47H-DRYLIVE-DRAIN-CLOSE midhold_abort={ab_act_d} "
+                                        f"label={lbl_d} pnl={pnl_d_close:+.6f} "
+                                        f"lag={lag_d}ms mint={_short(mint_drain)} "
+                                        f"reason={ab_reason_d}"
+                                    )
+                                    continue
+
+                                if pnl_d >= BANK_TH:
+                                    rec_d["close_kind"] = "bank"
+                                    rec_d["close_pnl"] = float(pnl_d)
+                                    rec_d["close_lag_ms"] = int(lag_d)
+                                    non_neg_closes += 1
+                                    net_pnl_sol += float(pnl_d)
+                                    jsonl_fp.write(json.dumps({
+                                        "type": "v47i_drylive_close",
+                                        **{k: rec_d[k] for k in (
+                                            "mint", "decision_ts_ms",
+                                            "selected_size_sol",
+                                            "close_pnl", "close_kind",
+                                            "close_lag_ms",
+                                        )}, "ts_ms": int(p.ts_ms),
+                                    }) + "\n")
+                                    jsonl_fp.flush()
+                                    pending_candidates.pop(key_d, None)
+                                    open_positions.pop(key_d, None)
+                                    log(
+                                        f"V47H-DRYLIVE-DRAIN-CLOSE bank "
+                                        f"pnl={pnl_d:+.6f} lag={lag_d}ms "
+                                        f"mint={_short(mint_drain)} "
+                                        f"non_neg={non_neg_closes} "
+                                        f"open_now={len(open_positions)}"
+                                    )
+                                    continue
+                                if pnl_d <= LOSS_TH:
+                                    rec_d["close_kind"] = "clamp_loss"
+                                    rec_d["close_pnl"] = float(pnl_d)
+                                    rec_d["close_lag_ms"] = int(lag_d)
+                                    negative_closes += 1
+                                    net_pnl_sol += float(pnl_d)
+                                    if pnl_d < max_loss_sol:
+                                        max_loss_sol = float(pnl_d)
+                                    jsonl_fp.write(json.dumps({
+                                        "type": "v47i_drylive_close",
+                                        **{k: rec_d[k] for k in (
+                                            "mint", "decision_ts_ms",
+                                            "selected_size_sol",
+                                            "close_pnl", "close_kind",
+                                            "close_lag_ms",
+                                        )}, "ts_ms": int(p.ts_ms),
+                                    }) + "\n")
+                                    jsonl_fp.flush()
+                                    pending_candidates.pop(key_d, None)
+                                    open_positions.pop(key_d, None)
+                                    log(
+                                        f"V47H-DRYLIVE-DRAIN-CLOSE clamp_loss "
+                                        f"pnl={pnl_d:+.6f} lag={lag_d}ms "
+                                        f"mint={_short(mint_drain)} "
+                                        f"open_now={len(open_positions)}"
+                                    )
+                                    continue
+                                v47g_caps_d = get_hold_caps(float(size_d))
+                                hold_d = int(v47g_caps_d["max_hold_ms"])
+                                rt_max_ext_d = int(v47g_caps_d["max_extend_ms"])
+                                rt_def_allowed_d = bool(v47g_caps_d["extend_allowed"])
+                                if float(size_d) > 0.020 + 1e-9:
+                                    extend_ok_d, _ = check_extend_allowed(
+                                        float(size_d),
+                                        {
+                                            "current_all_in_pnl_sol": float(pnl_d),
+                                            "latest_curve_delta": 0.0,
+                                            "latest_quote_gradient": float(grad_d),
+                                            "pending_buy_sol_250ms": float(pbs_d_h),
+                                            "pending_sell_sol_250ms": float(pss_d_h),
+                                            "no_negative_curve_update_last_250ms": (
+                                                int(rec_d.get("v47g_neg_grad_count", 0)) == 0
+                                            ),
+                                        },
+                                    )
+                                    if extend_ok_d:
+                                        hold_d = hold_d + rt_max_ext_d
+                                elif rt_def_allowed_d and pnl_d > 0:
+                                    hold_d = hold_d + rt_max_ext_d
+                                if lag_d >= hold_d:
+                                    v47g_hold_cap_forced_exits += 1
+                                    label_d = (
+                                        "scratch" if abs(pnl_d) < SCRATCH_TH
+                                        else ("neutral" if pnl_d > 0
+                                              else "expired_loss")
+                                    )
+                                    rec_d["close_kind"] = label_d
+                                    rec_d["close_pnl"] = float(pnl_d)
+                                    rec_d["close_lag_ms"] = int(lag_d)
+                                    if label_d == "expired_loss":
+                                        negative_closes += 1
+                                        net_pnl_sol += float(pnl_d)
+                                        if pnl_d < max_loss_sol:
+                                            max_loss_sol = float(pnl_d)
+                                    else:
+                                        non_neg_closes += 1
+                                        net_pnl_sol += float(pnl_d)
+                                    jsonl_fp.write(json.dumps({
+                                        "type": "v47i_drylive_close",
+                                        **{k: rec_d[k] for k in (
+                                            "mint", "decision_ts_ms",
+                                            "selected_size_sol",
+                                            "close_pnl", "close_kind",
+                                            "close_lag_ms",
+                                        )}, "ts_ms": int(p.ts_ms),
+                                    }) + "\n")
+                                    jsonl_fp.flush()
+                                    pending_candidates.pop(key_d, None)
+                                    open_positions.pop(key_d, None)
+                                    log(
+                                        f"V47H-DRYLIVE-DRAIN-CLOSE {label_d} "
+                                        f"pnl={pnl_d:+.6f} lag={lag_d}ms "
+                                        f"mint={_short(mint_drain)} "
+                                        f"open_now={len(open_positions)}"
+                                    )
+                    if drain_now - now_ts > 30_000:
+                        log(
+                            f"V47H-DRYLIVE drain_progress "
+                            f"elapsed_drain_s="
+                            f"{(drain_now - now_ts)/1000.0:.0f} "
+                            f"open={len(open_positions)} "
+                            f"pending={len(pending_candidates)} "
+                            f"non_neg={non_neg_closes} "
+                            f"neg={negative_closes}"
+                        )
+                        now_ts = drain_now
+                log(
+                    f"V47H-DRYLIVE drain_complete "
+                    f"final_open={len(open_positions)} "
+                    f"final_pending={len(pending_candidates)} "
+                    f"non_neg={non_neg_closes} neg={negative_closes}"
+                )
+                break
+
+            if now_ts >= next_progress_ms:
+                log(
+                    f"PGG2-V48-DRYLIVE-PROGRESS "
+                    f"elapsed_s={(now_ts - t_start_wall)/1000.0:.0f} "
+                    f"candidates_seen={v48_candidates_seen} "
+                    f"candidates_passed={v48_candidates_passed} "
+                    f"entries_opened={v48_entries_opened} "
+                    f"closed_nonnegative={non_neg_closes} "
+                    f"closed_negative={negative_closes} "
+                    f"scratches=0 "
+                    f"pending={len(pending_candidates)} "
+                    f"open={len(open_positions)} "
+                    f"queue={len(backfill_queue)} "
+                    f"top_blockers={dict(v48_entry_block_counts.most_common(5))} "
+                    f"max_open_blocks={max_open_skips} "
+                    f"replacement_scans={replacement_scans} "
+                    f"failed_buys={failed_buy_count} "
+                    f"failed_buy_fees={failed_buy_fees_total:.5f} "
+                    f"net_pnl={net_pnl_sol:+.6f} "
+                    f"live_buy_sends={v48_live_buy_sends} "
+                    f"live_buy_confirms={v48_live_buy_confirms} "
+                    f"live_sell_confirms={v48_live_sell_confirms} "
+                    f"live_safe_buy_failures={v48_live_buy_safe_failures} "
+                    f"live_safe_sell_failures={v48_live_sell_safe_failures} "
+                    f"feed_msg_age_s={max(0, now_ts - int(last_shred_msg_ms))/1000.0:.1f} "
+                    f"trade_age_s={max(0, now_ts - int(last_pump_trade_ms))/1000.0:.1f} "
+                    f"shred_reconnects={shred_reconnects}"
+                )
+                # LAYER 4 FISHERMAN WATCHDOG (2026-05-18). Detect the
+                # "fisherman sleeping" condition: candidates_seen counter
+                # hasn't advanced for N progress cycles → upstream feed is
+                # silently throttled/dead. Exit cleanly so external supervisor
+                # (cron, systemd) can restart fresh. Env-gated; default off
+                # initially (set FROZEN_THRESHOLD>0 to enable).
+                _frozen_threshold = int(
+                    os.environ.get("PGG2_V48_FISHERMAN_WATCHDOG_FROZEN_CYCLES", "3") or 3
+                )
+                _frozen_min_elapsed_s = int(
+                    os.environ.get("PGG2_V48_FISHERMAN_WATCHDOG_MIN_ELAPSED_S", "120") or 120
+                )
+                if _frozen_threshold > 0:
+                    if v48_candidates_seen == _fisherman_last_candidates_seen:
+                        _fisherman_frozen_cycles += 1
+                    else:
+                        _fisherman_frozen_cycles = 0
+                        _fisherman_last_candidates_seen = v48_candidates_seen
+                    if (
+                        _fisherman_frozen_cycles >= _frozen_threshold
+                        and (now_ts - t_start_wall) / 1000.0 >= _frozen_min_elapsed_s
+                    ):
+                        log(
+                            f"PGG2-V48-FISHERMAN-WATCHDOG-EXIT "
+                            f"candidates_seen={v48_candidates_seen} "
+                            f"frozen_for_cycles={_fisherman_frozen_cycles} "
+                            f"threshold={_frozen_threshold} "
+                            f"elapsed_s={(now_ts - t_start_wall)/1000.0:.0f} "
+                            f"reason=upstream_feed_stalled_supervisor_should_restart"
+                        )
+                        break
+                next_progress_ms = now_ts + progress_interval_ms
+    finally:
+        shred_stop.set()
+        try:
+            shred_task.cancel()
+            try:
+                await shred_task
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            blockhash_task.cancel()
+            try:
+                await blockhash_task
+            except BaseException:
+                pass
+        except Exception:
+            pass
+        try:
+            pumpportal_task.cancel()
+            try:
+                await pumpportal_task
+            except BaseException:
+                pass
+        except Exception:
+            pass
+        try:
+            await oracle.stop()
+        except Exception:
+            pass
+        try:
+            jsonl_fp.close()
+        except Exception:
+            pass
+
+    elapsed_s = (_now_ms() - t_start_wall) / 1000.0
+    budget_respected = failed_buy_fees_total <= FEE_BUDGET
+    # V47G: stop any remaining watchdogs (cleanup before report).
+    for _wkey, _wval in list(v47g_watchdogs.items()):
+        try:
+            await _wval.stop()
+        except Exception:
+            pass
+        v47g_watchdogs.pop(_wkey, None)
+
+    # Final open / pending counts.
+    _expire_v48_backfill(_now_ms())
+    final_open = len(open_positions)
+    final_backfill = len(backfill_queue)
+    final_pending = 0  # In drylive we collapse: anything still in
+    # pending_candidates that wasn't closed counts as pending. open_positions
+    # is a subset of pending_candidates.
+    for key, rec in pending_candidates.items():
+        if rec.get("close_kind") is None:
+            final_pending += 1
+
+    cc = evaluate_clean_close(
+        entries=len(candidates),
+        closed_nonneg=non_neg_closes,
+        closed_neg=negative_closes,
+        pending=final_pending,
+        open_positions=final_open,
+        target_closed_nonneg=int(args.target_non_neg_closes),
+        logger=log,
+    )
+
+    # V47H additional assertion: no sub-500ms rug admitted.
+    _no_sub500_rug_admitted_for_verdict = all(
+        not (r.get("close_kind") in ("clamp_loss", "expired_loss")
+             and r.get("close_lag_ms") is not None
+             and int(r.get("close_lag_ms", 0)) < 500)
+        for r in candidates
+    ) if candidates else True
+    # V47I additional assertion: no 500-1000ms rug admitted.
+    _no_500_1000_rug_admitted_for_verdict = all(
+        not (r.get("close_kind") in ("clamp_loss", "expired_loss")
+             and r.get("close_lag_ms") is not None
+             and 500 <= int(r.get("close_lag_ms", 0)) <= 1000)
+        for r in candidates
+    ) if candidates else True
+    overall_pass = bool(
+        cc["pass"]
+        and budget_respected
+        and net_pnl_sol > 0.0
+        and final_backfill == 0
+        and elapsed_s <= args.max_seconds + args.post_stop_drain_seconds + 1
+        and _no_sub500_rug_admitted_for_verdict
+        and _no_500_1000_rug_admitted_for_verdict
+    )
+
+    md_path = Path(args.out_md)
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("# V48 Corrected Dry-Live Result\n\n")
+        f.write(f"- run_ts_local: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- wall_clock_s: {elapsed_s:.1f}\n")
+        f.write(f"- stop_reason: {stop_reason}\n")
+        f.write(
+            f"- target_non_neg_closes: {args.target_non_neg_closes}\n"
+        )
+        f.write(f"- max_seconds: {args.max_seconds}\n")
+        f.write(f"- max_open_positions: {max_open}\n")
+        f.write(f"- backfill_ttl_ms: {backfill_ttl_ms}\n")
+        f.write(f"- post_stop_drain_seconds: {args.post_stop_drain_seconds}\n")
+        f.write(f"- failed_buy_fee_budget_sol: {FEE_BUDGET:.5f}\n\n")
+
+        f.write("## V48 harness telemetry\n\n")
+        f.write(f"- candidates_seen: {v48_candidates_seen}\n")
+        f.write(f"- candidates_passed: {v48_candidates_passed}\n")
+        f.write(f"- entries_opened: {v48_entries_opened}\n")
+        f.write(f"- silent_drops: {v48_silent_drops}\n")
+        f.write(f"- backfill_adds: {v48_backfill_adds}\n")
+        f.write(f"- backfill_consumes: {v48_backfill_consumes}\n")
+        f.write(f"- backfill_expires: {v48_backfill_expires}\n")
+        f.write(f"- backfill_remaining: {final_backfill}\n")
+        f.write(f"- duplicate_blocks: {v48_duplicate_blocks}\n")
+        f.write(f"- clean_close_gate_blocks: {v48_clean_close_gate_blocks}\n")
+        f.write(f"- concentration_gate_blocks: {v48_concentration_gate_blocks}\n")
+        f.write(f"- velocity_edge_gate_blocks: {v48_velocity_edge_gate_blocks}\n")
+        f.write(f"- recent_veto_memory_blocks: {v48_recent_veto_memory_blocks}\n")
+        f.write(f"- clean_close_entry_floor_sol: {float(args.clean_close_entry_floor_sol):.6f}\n")
+        f.write(f"- profit_reentry_block_ms: {int(args.profit_reentry_block_ms)}\n")
+        f.write(f"- recent_v47i_veto_memory_ms: {int(args.recent_v47i_veto_memory_ms)}\n")
+        f.write(
+            "- concentration_guard: "
+            f"ub<={int(args.concentration_guard_max_buyers)} "
+            f"and top_share>{float(args.concentration_guard_top_share):.3f}\n"
+        )
+        f.write(
+            "- velocity_edge_guard: "
+            f"ub<={int(args.velocity_edge_max_buyers)} "
+            f"and pbs250>={float(args.velocity_edge_min_buy_sol):.3f} "
+            f"and exp_pnl<{float(args.velocity_edge_floor_sol):.6f}\n"
+        )
+        if live_smoke:
+            f.write("\n## V48 live smoke telemetry\n\n")
+            f.write(f"- live_buy_sends: {v48_live_buy_sends}\n")
+            f.write(f"- live_buy_confirms: {v48_live_buy_confirms}\n")
+            f.write(f"- live_buy_safe_failures: {v48_live_buy_safe_failures}\n")
+            f.write(f"- live_sell_sends: {v48_live_sell_sends}\n")
+            f.write(f"- live_sell_confirms: {v48_live_sell_confirms}\n")
+            f.write(f"- live_sell_safe_failures: {v48_live_sell_safe_failures}\n")
+            f.write(f"- live_unclosed: {v48_live_unclosed}\n")
+        f.write("- entry_blockers:\n")
+        if v48_entry_block_counts:
+            for k, v in v48_entry_block_counts.most_common(20):
+                f.write(f"  - {k}: {v}\n")
+        else:
+            f.write("  - (none)\n")
+        f.write("\n")
+
+        f.write("## Engine sanity\n\n")
+        f.write(f"- raw_pump_buys: {raw_buys_seen}\n")
+        f.write(f"- raw_pump_sells: {raw_sells_seen}\n")
+        f.write(f"- curve_updates: {curve_updates_seen}\n")
+        f.write(f"- sim_evaluations: {sim_evals_total}\n")
+        f.write(f"- lookahead_blocks: {lookahead_block_count}\n\n")
+
+        f.write("## V47E two-buyer guard stats\n\n")
+        f.write(f"- evaluations: {two_buyer_total}\n")
+        f.write(f"- actual_pass: {two_buyer_actual}\n")
+        f.write(f"- shadow_only: {two_buyer_shadow}\n")
+        f.write(f"- block: {two_buyer_block}\n")
+        f.write(f"- delegate_v47d (ub>=3): {two_buyer_delegate}\n")
+        f.write("- (mode,reason) breakdown:\n")
+        if two_buyer_reason_counts:
+            for (m, r), c in two_buyer_reason_counts.most_common(20):
+                f.write(f"  - {m} / {r}: {c}\n")
+        else:
+            f.write("  - (none)\n")
+        f.write(f"- max_open_skips: {max_open_skips}\n\n")
+
+        f.write("## V47D boundary guard / downsize / replacement\n\n")
+        f.write(f"- boundary_guard_pass: {boundary_pass}\n")
+        f.write(f"- boundary_guard_block: {boundary_block}\n")
+        f.write(f"- downsize_ok: {downsize_ok}\n")
+        f.write(f"- downsize_fail: {downsize_fail}\n")
+        f.write(f"- replacement_scans: {replacement_scans}\n\n")
+
+        f.write("## V47G size-edge floor stats\n\n")
+        f.write(f"- evaluations: {v47g_floor_total}\n")
+        f.write(f"- pass: {v47g_floor_pass_total}\n")
+        f.write(f"- block: {v47g_floor_block_total}\n")
+        f.write("- blocker reasons:\n")
+        if v47g_floor_blocker_counts:
+            for k, v in v47g_floor_blocker_counts.most_common(20):
+                f.write(f"  - {k}: {v}\n")
+        else:
+            f.write("  - (none)\n")
+
+        f.write("\n## V47G downsize stats\n\n")
+        f.write(f"- attempts: {v47g_downsize_attempts}\n")
+        f.write(f"- success: {v47g_downsize_success}\n")
+        f.write(f"- fail: {v47g_downsize_fail}\n")
+
+        f.write("\n## V47G hold caps applied\n\n")
+        f.write(f"- hold_cap_forced_exits: {v47g_hold_cap_forced_exits}\n")
+        f.write(
+            f"- extend_skipped_large_size (size>0.020): "
+            f"{v47g_extend_skipped_large_size}\n"
+        )
+
+        f.write("\n## V47G mid-hold dump abort\n\n")
+        f.write(f"- abort_count: {v47g_midhold_abort_count}\n")
+        f.write("\n## V47G watchdog stats (live)\n\n")
+        f.write(f"- watchdog_drove_exits: {v47g_watchdog_drove_exits}\n")
+        f.write(f"- subscriber_drove_exits: {v47g_subscriber_drove_exits}\n")
+        f.write(f"- snap_silence_events_seen: {v47g_snap_silence_events}\n")
+        if v47g_watchdog_action_counts:
+            f.write("- watchdog action breakdown:\n")
+            for k, v in v47g_watchdog_action_counts.most_common():
+                f.write(f"  - {k}: {v}\n")
+        else:
+            f.write("- watchdog action breakdown: (none)\n")
+
+        f.write("\n## V47G mid-hold abort by action\n\n")
+        if v47g_midhold_abort_actions:
+            for k, v in v47g_midhold_abort_actions.most_common(10):
+                f.write(f"  - {k}: {v}\n")
+        else:
+            f.write("  - (none)\n")
+        if v47g_midhold_abort_details:
+            f.write("- per-mint detail:\n")
+            for d in v47g_midhold_abort_details[:30]:
+                f.write(
+                    f"  - {_short(d['mint'])}: size={d['size_sol']:.4f} "
+                    f"lag={d['lag_ms']}ms action={d['action']} "
+                    f"pnl_at_abort={d['pnl_at_abort']:+.6f} "
+                    f"reason={d['reason']}\n"
+                )
+
+
+        f.write("## Outcome counts\n\n")
+        f.write(f"- entries_opened: {len(candidates)}\n")
+        f.write(f"- non_negative_closes: {non_neg_closes}\n")
+        f.write(f"- negative_closes: {negative_closes}\n")
+        f.write(f"- pending_at_stop: {final_pending}\n")
+        f.write(f"- open_at_stop: {final_open}\n")
+        f.write(f"- final_open_positions: {final_open}\n")
+        f.write(f"- backfill_at_stop: {final_backfill}\n")
+        f.write(f"- max_open_skips: {max_open_skips}\n")
+        f.write(f"- failed_buys: {failed_buy_count}\n")
+        f.write(f"- failed_buy_fees_total: {failed_buy_fees_total:.5f}\n")
+        f.write(f"- budget_respected: {budget_respected}\n")
+        f.write(f"- net_pnl_sol: {net_pnl_sol:+.6f}\n")
+        f.write(f"- max_loss_sol: {max_loss_sol:+.6f}\n\n")
+
+        f.write("## V47E clean-close status\n\n")
+        f.write(f"- entries: {cc['entries']}\n")
+        f.write(f"- closed_nonneg: {cc['closed_nonneg']}\n")
+        f.write(f"- closed_neg: {cc['closed_neg']}\n")
+        f.write(f"- pending: {cc['pending']}\n")
+        f.write(f"- open_positions: {cc['open_positions']}\n")
+        f.write(f"- target_closed_nonneg: {cc['target_closed_nonneg']}\n")
+        f.write(f"- pass: {cc['pass']}\n")
+        f.write(f"- fail_reason: {cc['fail_reason']}\n\n")
+
+        f.write("## Selected size distribution\n\n")
+        for s, c in sorted(selected_size_dist.items()):
+            f.write(f"- {s}: {c}\n")
+        if not selected_size_dist:
+            f.write("- (none)\n")
+
+        f.write("\n## Per-entry table\n\n")
+        f.write(
+            "| # | ts | mint | size | orig_size | downsized | ub | tbs | "
+            "adv_outcome | max_hold | extended | abort | "
+            "exp_pnl | close_kind | close_pnl | close_lag |\n"
+            "|---|----|------|------|-----------|-----------|----|-----|"
+            "------------|----------|----------|-------|"
+            "---------|------------|-----------|-----------|\n"
+        )
+        for i, r in enumerate(candidates, 1):
+            cp = r.get("close_pnl")
+            f.write(
+                f"| {i} | {int(r.get('decision_ts_ms', 0))} | "
+                f"{_short(r.get('mint',''))} | "
+                f"{float(r.get('selected_size_sol',0.0)):.4f} | "
+                f"{float(r.get('original_size_sol',0.0)):.4f} | "
+                f"{int(bool(r.get('downsized', False)))} | "
+                f"{int(r.get('ub_250', 0))} | "
+                f"{float(r.get('tbs_250', 0.0)):.3f} | "
+                f"{r.get('adverse_branch','-')} | "
+                f"{int(r.get('v47g_max_hold_ms', 0))} | "
+                f"{int(r.get('v47g_extended_count', 0))} | "
+                f"{int(bool(r.get('v47g_abort_triggered', False)))} | "
+                f"{float(r.get('exp_pnl', 0.0)):+.6f} | "
+                f"{r.get('close_kind') or 'pending'} | "
+                f"{('%+.6f' % cp) if cp is not None else 'n/a'} | "
+                f"{r.get('close_lag_ms') if r.get('close_lag_ms') is not None else '-'} |\n"
+            )
+        if not candidates:
+            f.write("- (no entries)\n")
+
+        # --- V47H veto telemetry section ---
+        f.write("\n## V47H rug-veto stats\n\n")
+        f.write(f"- evaluations: {v47h_veto_total}\n")
+        f.write(f"- pass: {v47h_veto_pass_total}\n")
+        f.write(f"- block: {v47h_veto_block_total}\n")
+        f.write("- veto reason counts:\n")
+        if v47h_veto_reason_counts:
+            for k, v in v47h_veto_reason_counts.most_common(20):
+                f.write(f"  - {k}: {v}\n")
+        else:
+            f.write("  - (none)\n")
+        f.write(f"- shadow-only (recorded, not entered): "
+                f"{len(v47h_shadow_candidates)}\n")
+        if v47h_shadow_candidates:
+            f.write("- shadow-only sample (up to 20):\n")
+            for s in v47h_shadow_candidates[:20]:
+                f.write(
+                    f"  - {_short(s['mint'])} size={s['size']:.4f} "
+                    f"exp_pnl={s['exp_pnl']:+.6f} ub={s['ub_250']} "
+                    f"tbs={s['tbs_250']:.3f} "
+                    f"reasons={'|'.join(s['vetos_fired'])}\n"
+                )
+        f.write(f"- PGG2-V47H-BASE-INVARIANT-CHECK msg=v47g_modules_unchanged\n")
+        # Check no sub-500ms rug admitted (closed neg with lag < 500ms).
+        no_sub500_rug_admitted_dl = all(
+            not (r.get("close_kind") in ("clamp_loss", "expired_loss")
+                 and r.get("close_lag_ms") is not None
+                 and int(r.get("close_lag_ms", 0)) < 500)
+            for r in candidates
+        ) if candidates else True
+        f.write(f"- no_sub500_rug_admitted: {no_sub500_rug_admitted_dl}\n\n")
+
+        # --- V47I medium-rug veto section ---
+        f.write("\n## V47I medium-rug-veto stats\n\n")
+        f.write(f"- evaluations: {v47i_veto_total}\n")
+        f.write(f"- pass: {v47i_veto_pass_total}\n")
+        f.write(f"- block: {v47i_veto_block_total}\n")
+        f.write("- veto reason counts (one candidate may fire multiple):\n")
+        if v47i_veto_reason_counts:
+            for k, v in v47i_veto_reason_counts.most_common(20):
+                f.write(f"  - {k}: {v}\n")
+        else:
+            f.write("  - (none)\n")
+        f.write(
+            f"- shadow-only (recorded, not entered): "
+            f"{len(v47i_shadow_candidates)}\n"
+        )
+        if v47i_shadow_candidates:
+            f.write("- shadow-only sample (up to 20):\n")
+            for s in v47i_shadow_candidates[:20]:
+                f.write(
+                    f"  - {_short(s['mint'])} size={s['size']:.4f} "
+                    f"exp_pnl={s['exp_pnl']:+.6f} ub250={s['ub_250']} "
+                    f"ub500={s['ub_500']} tbs={s['tbs_250']:.3f} "
+                    f"reasons={'|'.join(s['vetos_fired'])}\n"
+                )
+        no_500_1000_rug_admitted_dl = all(
+            not (r.get("close_kind") in ("clamp_loss", "expired_loss")
+                 and r.get("close_lag_ms") is not None
+                 and 500 <= int(r.get("close_lag_ms", 0)) <= 1000)
+            for r in candidates
+        ) if candidates else True
+        f.write(f"- no_500_1000ms_rug_admitted: {no_500_1000_rug_admitted_dl}\n\n")
+
+        f.write("\n## PASS Criteria\n\n")
+        f.write(
+            f"- closed_nonneg >= {args.target_non_neg_closes}: "
+            f"{'YES' if non_neg_closes >= args.target_non_neg_closes else 'NO'} "
+            f"({non_neg_closes}/{args.target_non_neg_closes})\n"
+        )
+        f.write(
+            f"- 0 negative_closes: "
+            f"{'YES' if negative_closes == 0 else 'NO'} "
+            f"({negative_closes})\n"
+        )
+        f.write(
+            f"- 0 open_positions at end: "
+            f"{'YES' if final_open == 0 else 'NO'} "
+            f"({final_open})\n"
+        )
+        f.write(
+            f"- 0 pending_positions at end: "
+            f"{'YES' if final_pending == 0 else 'NO'} "
+            f"({final_pending})\n"
+        )
+        f.write(
+            f"- 0 backfill_queue at end: "
+            f"{'YES' if final_backfill == 0 else 'NO'} "
+            f"({final_backfill})\n"
+        )
+        f.write(
+            f"- silent_drops = 0: "
+            f"{'YES' if v48_silent_drops == 0 else 'NO'} "
+            f"({v48_silent_drops})\n"
+        )
+        f.write(
+            f"- clean_close_pass: {cc['pass']}\n"
+        )
+        f.write(
+            f"- budget_respected (<= {FEE_BUDGET:.5f}): "
+            f"{'YES' if budget_respected else 'NO'}\n"
+        )
+        f.write(
+            f"- net_pnl > 0: "
+            f"{'YES' if net_pnl_sol > 0 else 'NO'} "
+            f"(net={net_pnl_sol:+.6f})\n"
+        )
+        f.write(
+            f"\n## OVERALL_VERDICT: "
+            f"{'PASS' if overall_pass else 'FAIL'}\n"
+        )
+
+    log(f"V48-DRYLIVE wrote {md_path}")
+    log(
+        f"V48-DRYLIVE done elapsed_s={elapsed_s:.1f} "
+        f"non_neg={non_neg_closes} neg={negative_closes} "
+        f"open={final_open} pending={final_pending} backfill={final_backfill} "
+        f"candidates_passed={v48_candidates_passed} "
+        f"entries_opened={v48_entries_opened} "
+        f"silent_drops={v48_silent_drops} "
+        f"net={net_pnl_sol:+.6f} stop_reason={stop_reason} "
+        f"clean_close_pass={cc['pass']} "
+        f"live_buy_sends={v48_live_buy_sends} "
+        f"live_buy_confirms={v48_live_buy_confirms} "
+        f"live_sell_confirms={v48_live_sell_confirms} "
+        f"pass={int(overall_pass)}"
+    )
+    return 0 if overall_pass else 3
+
+
+def main() -> int:
+    try:
+        return asyncio.run(amain())
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

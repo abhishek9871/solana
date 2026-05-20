@@ -1804,6 +1804,22 @@ class SameBlockPiggybackBot(BirthFirstSniper):
             - max(0.0, top1500 - 0.40) * 55.0
             - sell_ratio * 95.0
         )
+        # SCORE GATE: validated against 488 historical OG live trades (May 6-18).
+        # Threshold 270 keeps 145/180 wins (81%) and blocks 76/308 losses (25%),
+        # improving net +0.110 SOL = +$20. The score formula already balances
+        # buy depth, uniqueness, move size, top-share, and sell pressure;
+        # filtering on it post-hoc surgically drops the trades where the
+        # composite signal is too weak. Default 0 = disabled (preserves OG
+        # behavior); set PGG2_PRICED_SNAP_MIN_SCORE>0 to enable.
+        min_score = env_float("PGG2_PRICED_SNAP_MIN_SCORE", 0.0)
+        if min_score > 0 and score < min_score:
+            log(
+                f"PGG2-PRICED-SNAP-SCORE-GATE-BLOCK {short_addr(event.mint)} "
+                f"score={score:.1f} min={min_score:.1f} "
+                f"buy1500={buy1500:.2f} uniq1500={uniq1500} "
+                f"top1500={top1500:.3f} move={entry_move:.3f}"
+            )
+            return None
         reason = (
             f"priced_snap move={entry_move:.2f}x age={age_sec:.1f}s "
             f"b1500={buy1500:.2f}/{uniq1500} top={top1500:.2f} "

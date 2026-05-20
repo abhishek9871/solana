@@ -1,0 +1,28 @@
+#!/bin/bash
+# V60 Stage A LIVE — 1 entry only, max_size=0.005, V60 firewall enforced
+export PGG2_LIVE_RPC_URL="https://beta.helius-rpc.com/?api-key=c2fa0510-cddd-4768-9424-e5db39429bbb"
+export HELIUS_RPC_URL="https://beta.helius-rpc.com/?api-key=c2fa0510-cddd-4768-9424-e5db39429bbb"
+
+# Mode: LIVE ON, observe shadow OFF
+export PGG2_ENABLE_LIVE="1"
+export PGG2_V60_OBSERVE_MODE="0"
+export PGG2_LIVE_CONFIRM="I_ACCEPT_REAL_SOL_RISK"
+export PGG2_DIRECT_LIVE_CONFIRM="I_ACCEPT_DIRECT_PUMP_RISK"
+
+# V59/V60 gates ON
+export PGG2_V59_TRUE_EDGE_ENABLED="1"
+export PGG2_V60_REQUIRE_RISK_PASS="0"  # risk wiring not plumbed yet; allow without
+
+# Stage A strict bounds
+export PGG2_LIVE_MAX_TRADE_SOL="0.005"
+export PGG2_LIVE_MIN_TRADE_SOL="0.005"
+export PGG2_V50B_MAX_OPEN="1"
+export PGG2_V48_MAX_OPEN="1"
+export PGG2_V50B_MAX_CLOSES="1"
+export PGG2_V48_TARGET_CLOSED_NONNEG="1"
+export PGG2_V50B_MAX_WALLET_DRAWDOWN_SOL="0.0030"
+export PGG2_V50B_MAX_SECONDS="1800"
+export PGG2_V48_MAX_SECONDS="1800"
+export PGG2_V50B_STAGEA_FEE_BUDGET_SOL="0.00030"
+
+exec bash /root/piggy/start_v55_stagea.sh

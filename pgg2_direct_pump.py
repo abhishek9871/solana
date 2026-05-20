@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 from solders.hash import Hash
-from solders.instruction import AccountMeta, Instruction
+from solders.instruction import AccountMeta, CompiledInstruction, Instruction
 from solders.message import MessageV0
 from solders.null_signer import NullSigner
 from solders.pubkey import Pubkey
@@ -232,7 +232,14 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         self._pump_buyback_cache: tuple[float, dict[str, Any]] = (0.0, {})
         self._pump_buyback_selected: dict[str, PumpBuybackPair] = {}
         self._pump_buyback_observed_miss: dict[str, float] = {}
+        # v30 — pair source tracking for the executable shadow lab.
+        self._last_pair_source: dict[str, str] = {}
+        self._last_pair_recipient: dict[str, str] = {}
+        self._last_pair_social: dict[str, str] = {}
         self._mint_decimals: dict[str, int] = {}
+        self._latest_blockhash_cache: tuple[float, Optional[Hash]] = (0.0, None)
+        # V47B in-flight quote tracker (restored 2026-05-19 V58 broker recovery)
+        self._inflight_quotes: dict[str, int] = {}
         log(
             f"PGG2-DIRECT: mode={self.mode.upper()} "
             "route=pump_fun_bonding_curve+pumpswap "
@@ -240,11 +247,78 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         )
 
     def build_swap(self, from_mint: str, to_mint: str, amount: Any, slippage: float) -> dict[str, Any]:
-        if from_mint == SOL_MINT and to_mint != SOL_MINT:
-            return self.build_buy(to_mint, float(amount), slippage)
-        if to_mint == SOL_MINT and from_mint != SOL_MINT:
-            return self.build_sell(from_mint, amount, slippage)
-        raise RuntimeError(f"direct broker only supports SOL<->token swaps: {from_mint}->{to_mint}")
+        side = "buy" if str(from_mint) == SOL_MINT else "sell"
+        mint = str(to_mint) if side == "buy" else str(from_mint)
+        priority = self.current_swap_priority() if hasattr(self, "current_swap_priority") else "background"
+        if env_bool("PGG2_GLOBAL_SWAP_BUDGET_ENABLED", False):
+            entry_critical = priority in {"entry", "risk"}
+            interval_ms = max(
+                0,
+                env_int(
+                    "PGG2_GLOBAL_SWAP_ENTRY_MIN_INTERVAL_MS" if entry_critical else "PGG2_GLOBAL_SWAP_MIN_INTERVAL_MS",
+                    0 if entry_critical else 450,
+                ),
+            )
+            max_wait_ms = max(
+                0,
+                env_int(
+                    "PGG2_GLOBAL_SWAP_ENTRY_MAX_WAIT_MS" if entry_critical else "PGG2_GLOBAL_SWAP_MAX_WAIT_MS",
+                    250 if entry_critical else 5000,
+                ),
+            )
+            wait_ms = 0
+            with self._swap_budget_lock:
+                now_ms = int(time.time() * 1000)
+                next_allowed_ms = self._swap_entry_next_allowed_ms if entry_critical else self._swap_next_allowed_ms
+                target_ms = max(next_allowed_ms, self._swap_backoff_until_ms)
+                raw_wait_ms = max(0, target_ms - now_ms)
+                if (
+                    not entry_critical
+                    and max_wait_ms > 0
+                    and raw_wait_ms > max_wait_ms
+                    and env_bool("PGG2_GLOBAL_SWAP_DROP_BACKGROUND_ON_WAIT", True)
+                ):
+                    log(
+                        f"PGG2-GLOBAL-SWAP-BUDGET-DROP side={side} mint={short_addr(mint)} "
+                        f"priority={priority} wait_ms={raw_wait_ms} max_wait_ms={max_wait_ms} "
+                        f"reason=background_wait_exceeded"
+                    )
+                    raise RuntimeError("global_swap_budget_background_wait_exceeded")
+                wait_ms = raw_wait_ms
+                if max_wait_ms > 0:
+                    wait_ms = min(wait_ms, max_wait_ms)
+                if entry_critical:
+                    self._swap_entry_next_allowed_ms = max(now_ms + wait_ms, now_ms) + interval_ms
+                else:
+                    self._swap_next_allowed_ms = max(now_ms + wait_ms, now_ms) + interval_ms
+            if wait_ms > 0:
+                log(
+                    f"PGG2-GLOBAL-SWAP-BUDGET-WAIT side={side} mint={short_addr(mint)} "
+                    f"priority={priority} wait_ms={wait_ms} interval_ms={interval_ms}"
+                )
+                time.sleep(wait_ms / 1000.0)
+        try:
+            if from_mint == SOL_MINT and to_mint != SOL_MINT:
+                return self.build_buy(to_mint, float(amount), slippage)
+            if to_mint == SOL_MINT and from_mint != SOL_MINT:
+                return self.build_sell(from_mint, amount, slippage)
+            raise RuntimeError(f"direct broker only supports SOL<->token swaps: {from_mint}->{to_mint}")
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            if env_bool("PGG2_GLOBAL_SWAP_BUDGET_ENABLED", False) and (
+                "429" in msg or "Too Many Requests" in msg
+            ):
+                backoff_ms = env_int("PGG2_GLOBAL_SWAP_429_BACKOFF_MS", 2500)
+                with self._swap_budget_lock:
+                    self._swap_backoff_until_ms = max(
+                        self._swap_backoff_until_ms,
+                        int(time.time() * 1000) + backoff_ms,
+                    )
+                log(
+                    f"PGG2-GLOBAL-SWAP-429-BACKOFF side={side} mint={short_addr(mint)} "
+                    f"backoff_ms={backoff_ms} error={msg}"
+                )
+            raise
 
     def account_info(self, pubkey: Pubkey, ttl_sec: float = 0.35) -> Optional[dict[str, Any]]:
         key = str(pubkey)
@@ -270,10 +344,32 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             return base64.b64decode(data)
         return b""
 
-    def latest_blockhash(self) -> Hash:
+    def latest_blockhash(self, force: bool = False) -> Hash:
         commitment = env_str("PGG2_DIRECT_BLOCKHASH_COMMITMENT", "processed")
+        ttl_ms = max(0, env_int("PGG2_DIRECT_BLOCKHASH_CACHE_MS", 0))
+        now = time.time()
+        cached_ts, cached_hash = self._latest_blockhash_cache
+        if (
+            not force
+            and ttl_ms > 0
+            and cached_hash is not None
+            and (now - cached_ts) * 1000.0 <= ttl_ms
+        ):
+            return cached_hash
+        start_ms = int(time.time() * 1000)
         out = self.rpc("getLatestBlockhash", [{"commitment": commitment}])
-        return Hash.from_string(str(((out or {}).get("value") or {}).get("blockhash")))
+        blockhash = Hash.from_string(str(((out or {}).get("value") or {}).get("blockhash")))
+        self._latest_blockhash_cache = (time.time(), blockhash)
+        if env_bool("PGG2_DIRECT_BLOCKHASH_CACHE_LOG", False):
+            log(
+                f"PGG2-DIRECT-BLOCKHASH-CACHE refresh=1 "
+                f"commitment={commitment} latency_ms={int(time.time() * 1000) - start_ms} "
+                f"ttl_ms={ttl_ms}"
+            )
+        return blockhash
+
+    def refresh_blockhash_cache(self) -> Hash:
+        return self.latest_blockhash(force=True)
 
     def compile_tx(self, instructions: list[Instruction]) -> str:
         payer = as_pubkey(self.public_key)
@@ -313,6 +409,8 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         if isinstance(amount, str):
             if amount == "auto":
                 return self.token_balance_raw(mint)
+            if amount.startswith("raw:"):
+                return max(0, int(amount.split(":", 1)[1]))
             amount = float(amount)
         return max(0, int(float(amount) * (10 ** self.mint_decimals(mint))))
 
@@ -531,6 +629,82 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         self._pump_buyback_observed_miss[key] = time.time()
         return None
 
+    def probe_pump_v2_buy(self, mint: Any, amount_sol: float) -> dict[str, Any]:
+        """v30 — Pump v2 instruction probe.
+
+        Pump's public docs announce three new bonding-curve instructions:
+            buy_v2, sell_v2, buy_exact_quote_in_v2
+        which are documented to use mandatory accounts in the same order for
+        all coins (no optional remaining accounts).
+
+        This probe is intentionally a SAFE STUB. We do not have an
+        authoritative IDL or canonical discriminator + account list for the v2
+        instructions in this repository. Guessing the layout would risk
+        corrupting live transactions, so we refuse to construct a v2 tx and
+        record exactly what is missing.
+
+        To enable a real build we need, from the official Pump source:
+          1. Instruction discriminator bytes for buy_v2 / sell_v2 /
+             buy_exact_quote_in_v2 (8-byte Anchor discriminators)
+          2. Exact account list and order for each instruction
+          3. Data layout (lamports / token amounts encoding)
+          4. Whether the fee_config PDA + buyback recipient / social fee PDA
+             accounts move into the mandatory list or are dropped
+        """
+        if not env_bool("PGG2_DIRECT_PUMP_V2_PROBE", False):
+            return {"v2_probe_attempted": False}
+        # mandatory hard-gate: never attempt v2 in real live mode
+        if self.mode == "live":
+            return {
+                "v2_probe_attempted": True,
+                "v2_probe_build_ok": False,
+                "v2_probe_sim_ok": False,
+                "v2_probe_error": "v2_probe_refused_live_mode",
+            }
+        missing_idl = (
+            "v2_idl_unavailable: need authoritative discriminator + account list for "
+            "buy_v2 / sell_v2 / buy_exact_quote_in_v2 before construction is safe"
+        )
+        log(
+            f"PGG2-DIRECT-V2-PROBE blocked mint={short_addr(str(mint))} reason=v2_idl_unavailable"
+        )
+        return {
+            "v2_probe_attempted": True,
+            "v2_probe_build_ok": False,
+            "v2_probe_sim_ok": False,
+            "v2_probe_error": missing_idl,
+        }
+
+    def prewarm_pump_buyback_pair_from_sig(self, mint: Any, sig: str) -> bool:
+        """v30 — discover and persist the Pump buyback/social pair from a
+        candidate event signature. Lets the shadow lab and live broker quote
+        fresh mints whose pair is not yet in the raw-event tape.
+
+        Returns True if a pair was discovered (newly or already cached).
+        Safe in any mode: only does a read-only RPC and updates cache; does
+        not change strict-required behavior at build time.
+        """
+        if not sig:
+            return False
+        try:
+            mint_pk = as_pubkey(str(mint))
+        except Exception:
+            return False
+        # already cached or in-memory? skip the RPC
+        if self.cached_pump_buyback_pair(mint_pk):
+            return True
+        pair = self.pump_buyback_pair_from_signature(sig)
+        if not pair:
+            return False
+        observed = PumpBuybackPair(pair[0], pair[1], "current_sig")
+        self.remember_pump_buyback_pair(mint_pk, observed)
+        log(
+            f"PGG2-DIRECT-PAIR-PREWARM mint={short_addr(str(mint))} sig={short_addr(sig)} "
+            f"source=current_sig recipient={short_addr(str(observed.recipient))} "
+            f"social={short_addr(str(observed.social_fee_pda))}"
+        )
+        return True
+
     def pump_buyback_pair_from_signature(self, sig: str) -> Optional[tuple[Pubkey, Pubkey]]:
         try:
             tx = self.rpc(
@@ -630,18 +804,54 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         ]
 
     def pump_buy_remaining_metas(self, mint: Pubkey) -> list[AccountMeta]:
-        pair = self.forced_pump_buyback_pair() or self.cached_pump_buyback_pair(mint) or self.observed_pump_buyback_pair(mint)
+        # v30 — record which source we end up using, for the shadow lab.
+        mint_key = str(mint)
+        forced = self.forced_pump_buyback_pair()
+        cached = self.cached_pump_buyback_pair(mint) if not forced else None
+        observed = self.observed_pump_buyback_pair(mint) if not (forced or cached) else None
+        pair = forced or cached or observed
         if not pair and env_bool("PGG2_DIRECT_REQUIRE_OBSERVED_BUYBACK_PAIR", self.mode == "live"):
+            self._last_pair_source[mint_key] = "none"
             raise RuntimeError(f"no confirmed pump buyback/social pair observed: {short_addr(str(mint))}")
         if pair:
+            if forced:
+                source = "forced"
+            elif cached:
+                # cache stores source ("current_sig", "sim_selected", "observed_raw_rpc", "env")
+                source = cached.source or "cache"
+            else:
+                source = observed.source or "observed_raw"
+            self._last_pair_source[mint_key] = source
+            self._last_pair_recipient[mint_key] = str(pair.recipient)
+            self._last_pair_social[mint_key] = str(pair.social_fee_pda)
             social_fee_pda = AccountMeta(pair.social_fee_pda, False, True)
         else:
             buyback = self.pump_buyback_remaining_metas(mint)
             social_fee_pda = buyback[-1] if buyback else None
+            self._last_pair_source[mint_key] = "default"
+            if social_fee_pda:
+                self._last_pair_social[mint_key] = str(social_fee_pda.pubkey)
         metas = [AccountMeta(self.pump_bonding_curve_v2(mint), False, False)]
         if social_fee_pda:
             metas.append(social_fee_pda)
         return metas
+
+    def last_pair_info(self, mint: Any) -> dict[str, str]:
+        """Return the most recent pair source/recipient/social PDA used for
+        this mint by the buy builder. Empty dict if not seen.
+        """
+        key = str(mint)
+        out: dict[str, str] = {}
+        src = self._last_pair_source.get(key)
+        if src is not None:
+            out["pair_source"] = src
+        rec = self._last_pair_recipient.get(key)
+        if rec:
+            out["pair_recipient"] = rec
+        soc = self._last_pair_social.get(key)
+        if soc:
+            out["pair_social_fee_pda"] = soc
+        return out
 
     def pump_sell_remaining_metas(self, mint: Pubkey, curve: PumpBondingCurve, user: Pubkey) -> list[AccountMeta]:
         buyback = self.pump_buyback_remaining_metas(mint)
@@ -686,6 +896,12 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             for social in socials:
                 if not any(pair.recipient == recipient and pair.social_fee_pda == social for pair in pairs):
                     pairs.append(PumpBuybackPair(recipient, social, "grid"))
+        # v30 — cap the sim-select candidate list so shadow-lab quote latency
+        # stays manageable. Cache hit / prewarm / observed pairs are kept at
+        # the head, so the cap rarely affects accuracy.
+        cap = env_int("PGG2_DIRECT_SIM_SELECT_MAX_CANDIDATES", 0)
+        if cap > 0:
+            return pairs[:cap]
         return pairs
 
     def quote_pump_buy_tokens(self, spend_lamports: int, curve: PumpBondingCurve, global_cfg: PumpGlobal) -> tuple[int, int]:
@@ -706,6 +922,715 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         return max(0, gross_sol - fees), max(0, fees)
 
     def build_buy(self, mint_str: str, amount_sol: float, slippage: float) -> dict[str, Any]:
+        # v31 — quote latency telemetry. Increment in-flight + capture start.
+        self._inflight_quotes[mint_str] = self._inflight_quotes.get(mint_str, 0) + 1
+        _qstart_ms = int(time.time() * 1000)
+        _qsim_needed = bool(env_bool("PGG2_DIRECT_SELECT_BUYBACK_BY_SIM", False) and self.quote_simulate)
+        try:
+            return self._build_buy_impl(mint_str, amount_sol, slippage, _qstart_ms, _qsim_needed)
+        except Exception as exc:
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="buy",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="error",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=False,
+                    error_class=type(exc).__name__,
+                    was_simulation_needed=_qsim_needed,
+                )
+            except Exception:
+                pass
+            raise
+        finally:
+            self._inflight_quotes[mint_str] = max(0, self._inflight_quotes.get(mint_str, 1) - 1)
+
+    def simulate_post_buy_pump_curve(self, curve: PumpBondingCurve, tokens_received: int) -> PumpBondingCurve:
+        """Shift the bonding-curve state to reflect a buy that yielded `tokens_received`.
+
+        Pump uses a CPMM with virtual reserves and k = vSOL × vTOK invariant:
+          - new vTOK = vTOK - tokens_received
+          - new vSOL = k / new vTOK
+        Real reserves and other fields are preserved for downstream callers.
+        """
+        if tokens_received <= 0:
+            return curve
+        k = int(curve.virtual_sol_reserves) * int(curve.virtual_token_reserves)
+        vtok_new = max(1, int(curve.virtual_token_reserves) - int(tokens_received))
+        vsol_new = max(1, k // vtok_new)
+        return PumpBondingCurve(
+            key=curve.key,
+            virtual_token_reserves=vtok_new,
+            virtual_sol_reserves=vsol_new,
+            real_token_reserves=max(0, int(curve.real_token_reserves) - int(tokens_received)),
+            real_sol_reserves=int(curve.real_sol_reserves),  # not used in CPMM math here
+            token_total_supply=int(curve.token_total_supply),
+            complete=bool(curve.complete),
+            creator=curve.creator,
+            is_mayhem=bool(getattr(curve, "is_mayhem", False)),
+            cashback_enabled=bool(getattr(curve, "cashback_enabled", False)),
+        )
+
+    def compute_min_buy_tokens_for_principal_recovery(
+        self,
+        mint_str: str,
+        amount_sol: float,
+        target_recovery_sol: float,
+        sell_fee_buffer_sol: float = 0.0,
+    ) -> dict[str, Any]:
+        """PR2-Phase 2: smallest T_min where, if our buy lands with exactly T_min
+        tokens, selling some recovery tranche of T_min on the post-our-buy curve
+        yields target_recovery_sol + sell_fee_buffer_sol.
+
+        Binary search over T_min. For each trial:
+          1. Simulate post-our-buy curve state (assumes our buy got exactly T_min).
+          2. On that post-buy curve, find smallest recovery_tokens (subset of T_min)
+             whose sell yields target.
+          3. If found AND recovery_fraction <= PGG2_V39_RECOVERY_MAX_FRACTION, feasible.
+
+        If even T_expected (best-case fill) is infeasible, returns
+        feasible=false and final_buy_min_tokens_raw = T_expected (so the caller
+        can decide to block the entry).
+        """
+        mint = as_pubkey(mint_str)
+        curve = self.bonding_curve(mint)
+        global_cfg = self.pump_global()
+        spend_lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
+        expected_tokens_raw, _expected_fee = self.quote_pump_buy_tokens(spend_lamports, curve, global_cfg)
+        target_lamports = max(1, int((target_recovery_sol + sell_fee_buffer_sol) * LAMPORTS_PER_SOL))
+        max_fraction = env_float("PGG2_V39_RECOVERY_MAX_FRACTION", 0.95)
+
+        def feasible_at(t_min: int) -> tuple[bool, int, int]:
+            """Return (feasible, recovery_tokens, expected_recovery_lamports) for a trial T_min."""
+            if t_min <= 0 or t_min > expected_tokens_raw:
+                return (False, 0, 0)
+            post_buy_curve = self.simulate_post_buy_pump_curve(curve, t_min)
+            # On post-buy curve, find smallest recovery_tokens whose sell yields target
+            max_sell_lp, _ = self.quote_pump_sell_sol(t_min, post_buy_curve, global_cfg)
+            if max_sell_lp < target_lamports:
+                return (False, t_min, max_sell_lp)
+            lo, hi, best = 1, t_min, t_min
+            for _ in range(40):
+                if lo >= hi:
+                    break
+                mid = (lo + hi) // 2
+                try:
+                    sol_out, _ = self.quote_pump_sell_sol(mid, post_buy_curve, global_cfg)
+                except Exception:
+                    lo = mid + 1
+                    continue
+                if sol_out >= target_lamports:
+                    best = mid
+                    hi = mid
+                else:
+                    lo = mid + 1
+            sol_out, _ = self.quote_pump_sell_sol(best, post_buy_curve, global_cfg)
+            rec_fraction = best / max(t_min, 1)
+            return (rec_fraction <= max_fraction, best, sol_out)
+
+        # Outer binary search over T_min, from a low floor up to expected_tokens_raw
+        lo = max(1, expected_tokens_raw // 2)
+        hi = expected_tokens_raw
+        best_t = expected_tokens_raw
+        best_rec = expected_tokens_raw
+        best_rec_lp = 0
+        any_feasible = False
+
+        # First check the worst case feasible-at-expected: if even T_expected is infeasible, block
+        feas_at_expected, rec_at_expected, rec_lp_at_expected = feasible_at(expected_tokens_raw)
+        if not feas_at_expected:
+            log(
+                f"PGG2-V39-BUY-RECOVERY-MIN-TOKEN-GUARD mint={short_addr(mint_str)} "
+                f"expected_tokens_raw={expected_tokens_raw} existing_min_tokens_raw=- "
+                f"min_recovery_buy_tokens_raw={expected_tokens_raw} "
+                f"final_buy_min_tokens_raw={expected_tokens_raw} "
+                f"recovery_fraction={rec_at_expected/max(expected_tokens_raw,1):.4f} "
+                f"feasible=false gate_pass=false reason=infeasible_at_expected_tokens"
+            )
+            return {
+                "expected_tokens_raw": expected_tokens_raw,
+                "min_recovery_buy_tokens_raw": expected_tokens_raw,
+                "recovery_tokens_raw_at_min": rec_at_expected,
+                "expected_recovery_lamports": rec_lp_at_expected,
+                "feasible": False,
+                "max_fraction": max_fraction,
+            }
+
+        any_feasible = True
+        best_t = expected_tokens_raw
+        max_iter = max(16, env_int("PGG2_V39_RECOVERY_MIN_TOKENS_BSEARCH_MAX_ITER", 50))
+        for _ in range(max_iter):
+            if lo >= hi:
+                break
+            mid = (lo + hi) // 2
+            feas, rec_tokens, rec_lp = feasible_at(mid)
+            if feas:
+                best_t = mid
+                best_rec = rec_tokens
+                best_rec_lp = rec_lp
+                hi = mid
+            else:
+                lo = mid + 1
+
+        # Re-check at best_t for the report
+        _, best_rec, best_rec_lp = feasible_at(best_t)
+        rec_fraction = best_rec / max(best_t, 1)
+        log(
+            f"PGG2-V39-BUY-RECOVERY-MIN-TOKEN-GUARD mint={short_addr(mint_str)} "
+            f"expected_tokens_raw={expected_tokens_raw} existing_min_tokens_raw=- "
+            f"min_recovery_buy_tokens_raw={best_t} final_buy_min_tokens_raw={best_t} "
+            f"recovery_tokens_at_min={best_rec} recovery_fraction={rec_fraction:.4f} "
+            f"expected_recovery_lamports={best_rec_lp} feasible=true gate_pass=true"
+        )
+        return {
+            "expected_tokens_raw": expected_tokens_raw,
+            "min_recovery_buy_tokens_raw": best_t,
+            "recovery_tokens_raw_at_min": best_rec,
+            "expected_recovery_lamports": best_rec_lp,
+            "feasible": True,
+            "max_fraction": max_fraction,
+        }
+
+    def quote_principal_recovery_tranche(
+        self,
+        mint_str: str,
+        actual_tokens_raw: int,
+        target_recovery_sol: float,
+        sell_fee_buffer_sol: float = 0.0,
+    ) -> dict[str, Any]:
+        """Binary-search the smallest token amount whose Pump bonding-curve sell
+        yield meets target_recovery_sol + sell_fee_buffer_sol.
+
+        This is the core primitive for PR-Phase 2: instead of full-position sells,
+        we sell *exactly enough* tokens to recover principal + fees + buffer, and
+        keep the rest as a free residual.
+
+        Returns:
+            recovery_tokens_raw, recovery_tokens_ui, recovery_min_sol_lamports,
+            expected_recovery_sol, residual_tokens_raw, principal_recovery_possible,
+            recovery_fraction (recovery_tokens_raw / actual_tokens_raw)
+        """
+        mint = as_pubkey(mint_str)
+        curve = self.bonding_curve(mint)
+        global_cfg = self.pump_global()
+        target_lamports = max(1, int((target_recovery_sol + sell_fee_buffer_sol) * LAMPORTS_PER_SOL))
+
+        # Feasibility check: even selling 100% must clear target
+        max_sol_lamports, _ = self.quote_pump_sell_sol(actual_tokens_raw, curve, global_cfg)
+        if max_sol_lamports < target_lamports:
+            log(
+                f"PGG2-V39-PRINCIPAL-RECOVERY-QUOTE mint={short_addr(mint_str)} "
+                f"actual_tokens_raw={actual_tokens_raw} target_recovery_sol={target_recovery_sol:.9f} "
+                f"sell_fee_buffer_sol={sell_fee_buffer_sol:.9f} target_lamports={target_lamports} "
+                f"max_sol_lamports={max_sol_lamports} recovery_tokens_raw={actual_tokens_raw} "
+                f"recovery_fraction=1.0000 residual_tokens_raw=0 principal_recovery_possible=false"
+            )
+            return {
+                "recovery_tokens_raw": actual_tokens_raw,
+                "recovery_tokens_ui": self.raw_to_ui(mint, actual_tokens_raw),
+                "expected_recovery_sol": max_sol_lamports / LAMPORTS_PER_SOL,
+                "recovery_min_sol_lamports": target_lamports,
+                "residual_tokens_raw": 0,
+                "recovery_fraction": 1.0,
+                "principal_recovery_possible": False,
+            }
+
+        # Binary search for the smallest token amount that clears target
+        lo, hi = 1, actual_tokens_raw
+        best = actual_tokens_raw
+        max_iter = max(16, env_int("PGG2_V39_RECOVERY_BSEARCH_MAX_ITER", 60))
+        for _ in range(max_iter):
+            if lo >= hi:
+                break
+            mid = (lo + hi) // 2
+            try:
+                sol_out, _ = self.quote_pump_sell_sol(mid, curve, global_cfg)
+            except Exception:
+                lo = mid + 1
+                continue
+            if sol_out >= target_lamports:
+                best = mid
+                hi = mid
+            else:
+                lo = mid + 1
+
+        sol_out, _ = self.quote_pump_sell_sol(best, curve, global_cfg)
+        recovery_fraction = best / max(actual_tokens_raw, 1)
+        log(
+            f"PGG2-V39-PRINCIPAL-RECOVERY-QUOTE mint={short_addr(mint_str)} "
+            f"actual_tokens_raw={actual_tokens_raw} target_recovery_sol={target_recovery_sol:.9f} "
+            f"sell_fee_buffer_sol={sell_fee_buffer_sol:.9f} target_lamports={target_lamports} "
+            f"recovery_tokens_raw={best} recovery_fraction={recovery_fraction:.4f} "
+            f"expected_recovery_lamports={sol_out} residual_tokens_raw={actual_tokens_raw - best} "
+            f"principal_recovery_possible=true"
+        )
+        return {
+            "recovery_tokens_raw": best,
+            "recovery_tokens_ui": self.raw_to_ui(mint, best),
+            "expected_recovery_sol": sol_out / LAMPORTS_PER_SOL,
+            "recovery_min_sol_lamports": target_lamports,
+            "residual_tokens_raw": actual_tokens_raw - best,
+            "recovery_fraction": recovery_fraction,
+            "principal_recovery_possible": True,
+        }
+
+    def estimate_recovery_feasibility_pre_entry(
+        self,
+        mint_str: str,
+        min_tokens_raw: int,
+        target_recovery_sol: float,
+    ) -> dict[str, Any]:
+        """PR-Phase 5 pre-entry feasibility gate.
+
+        Estimate whether principal recovery is plausible *before* sending the buy.
+        Uses the buy guard's min_tokens_raw (the worst-case fill) as the basis for
+        the recovery binary search. If even the worst-case fill can recover
+        target_recovery_sol with recovery_fraction <= max_fraction, gate passes.
+        """
+        max_fraction = env_float("PGG2_V39_RECOVERY_MAX_FRACTION", 0.95)
+        quote = self.quote_principal_recovery_tranche(
+            mint_str=mint_str,
+            actual_tokens_raw=int(min_tokens_raw),
+            target_recovery_sol=float(target_recovery_sol),
+        )
+        gate_pass = bool(quote["principal_recovery_possible"]) and quote["recovery_fraction"] <= max_fraction
+        log(
+            f"PGG2-V39-RECOVERY-FEASIBILITY-GATE mint={short_addr(mint_str)} "
+            f"expected_tokens_raw=- min_tokens_raw={int(min_tokens_raw)} "
+            f"estimated_recovery_tokens_raw={quote['recovery_tokens_raw']} "
+            f"recovery_fraction={quote['recovery_fraction']:.4f} "
+            f"expected_recovery_sol={quote['expected_recovery_sol']:.9f} "
+            f"target_recovery_sol={target_recovery_sol:.9f} max_fraction={max_fraction:.4f} "
+            f"gate_pass={'true' if gate_pass else 'false'}"
+        )
+        return {**quote, "gate_pass": gate_pass, "max_fraction": max_fraction}
+
+    def decode_pump_buy_guard_from_tx_b64(self, tx_b64: str) -> dict[str, Any]:
+        """Decode bytes 8..16 (spend_lamports) and 16..24 (min_tokens_raw) from
+        a signed/built Pump buy tx. Returns {kind, encoded_spend_lamports,
+        encoded_min_tokens_raw} or {kind: 'none'}.
+
+        Used by raptor's pre-send PGG2-V39-LIVE-BUY-GUARD-DECODE-PASS/FAIL check.
+        """
+        try:
+            tx = VersionedTransaction.from_bytes(base64.b64decode(str(tx_b64)))
+            for ix in tx.message.instructions:
+                program_id = tx.message.account_keys[ix.program_id_index]
+                data = bytes(ix.data)
+                if program_id == PUMP_PROGRAM_ID and data.startswith(DISC_PUMP_BUY_EXACT_SOL_IN):
+                    if len(data) >= len(DISC_PUMP_BUY_EXACT_SOL_IN) + 16:
+                        prefix = len(DISC_PUMP_BUY_EXACT_SOL_IN)
+                        return {
+                            "kind": "buy",
+                            "encoded_spend_lamports": struct.unpack("<Q", data[prefix:prefix + 8])[0],
+                            "encoded_min_tokens_raw": struct.unpack("<Q", data[prefix + 8:prefix + 16])[0],
+                        }
+        except Exception:
+            pass
+        return {"kind": "none"}
+
+    def decode_pump_sell_guard_from_tx_b64(self, tx_b64: str) -> dict[str, Any]:
+        """Decode bytes 8..16 (token_amount_raw) and 16..24 (min_sol_lamports)
+        from a Pump sell tx. Returns {kind, encoded_token_amount_raw,
+        encoded_min_sol_lamports} or {kind: 'none'}.
+        """
+        try:
+            tx = VersionedTransaction.from_bytes(base64.b64decode(str(tx_b64)))
+            for ix in tx.message.instructions:
+                program_id = tx.message.account_keys[ix.program_id_index]
+                data = bytes(ix.data)
+                if program_id == PUMP_PROGRAM_ID and data.startswith(DISC_PUMP_SELL):
+                    if len(data) >= len(DISC_PUMP_SELL) + 16:
+                        prefix = len(DISC_PUMP_SELL)
+                        return {
+                            "kind": "sell",
+                            "encoded_token_amount_raw": struct.unpack("<Q", data[prefix:prefix + 8])[0],
+                            "encoded_min_sol_lamports": struct.unpack("<Q", data[prefix + 8:prefix + 16])[0],
+                        }
+        except Exception:
+            pass
+        return {"kind": "none"}
+
+    def retarget_buy_min_tokens(self, quote: dict[str, Any], mint_str: str, min_tokens_ui: float) -> dict[str, Any]:
+        """Retarget an existing pump_bc buy transaction to an explicit min-token floor.
+
+        Fail-closed: after mutation + resign, decode the encoded min_tokens_raw
+        from the rebuilt tx bytes and verify it matches. Emit
+        PGG2-BUY-MIN-TOKEN-GUARD-ENCODED on every call (pass or fail) and raise
+        on mismatch so the caller cannot send a tx whose on-chain guard differs
+        from what Python intended.
+        """
+        mint = as_pubkey(mint_str)
+        min_tokens_raw = self.ui_to_raw(mint, min_tokens_ui)
+        tx = VersionedTransaction.from_bytes(base64.b64decode(str(quote["txn"])))
+        msg = tx.message
+        out_instructions = []
+        changed = False
+        expected_tokens_raw = 0
+        spend_lamports_encoded = 0
+        for ix in msg.instructions:
+            program_id = msg.account_keys[ix.program_id_index]
+            data = bytes(ix.data)
+            if program_id == PUMP_PROGRAM_ID and data.startswith(DISC_PUMP_BUY_EXACT_SOL_IN):
+                prefix_len = len(DISC_PUMP_BUY_EXACT_SOL_IN) + 8
+                # capture pre-mutation values for guard-encoded log
+                if len(data) >= prefix_len:
+                    spend_lamports_encoded = struct.unpack("<Q", data[len(DISC_PUMP_BUY_EXACT_SOL_IN):prefix_len])[0]
+                if len(data) >= prefix_len + 8:
+                    expected_tokens_raw = struct.unpack("<Q", data[prefix_len:prefix_len + 8])[0]
+                data = data[:prefix_len] + u64(min_tokens_raw) + data[prefix_len + 8 :]
+                changed = True
+            out_instructions.append(CompiledInstruction(ix.program_id_index, data, ix.accounts))
+        if not changed:
+            log(
+                f"PGG2-BUY-MIN-TOKEN-GUARD-ENCODED mint={short_addr(mint_str)} "
+                f"expected_tokens_raw=0 min_tokens_raw={min_tokens_raw} encoded_min_tokens_raw=-1 "
+                f"adaptive_slippage_pct=- guard_match=false reason=pump_buy_instruction_not_found"
+            )
+            raise RuntimeError("pump_buy_instruction_not_found_for_min_token_retarget")
+        new_msg = MessageV0(msg.header, msg.account_keys, msg.recent_blockhash, out_instructions, msg.address_table_lookups)
+        signer = self.keypair if self.keypair else NullSigner(as_pubkey(self.public_key))
+        new_tx = VersionedTransaction(new_msg, [signer])
+        new_tx_bytes = bytes(new_tx)
+        # post-mutation decode-verify: parse the rebuilt tx and read bytes 16..24
+        # of the pump buy ix data to confirm what's actually encoded
+        verify_tx = VersionedTransaction.from_bytes(new_tx_bytes)
+        encoded_min_tokens_raw = -1
+        for ix in verify_tx.message.instructions:
+            program_id = verify_tx.message.account_keys[ix.program_id_index]
+            data = bytes(ix.data)
+            if program_id == PUMP_PROGRAM_ID and data.startswith(DISC_PUMP_BUY_EXACT_SOL_IN):
+                if len(data) >= len(DISC_PUMP_BUY_EXACT_SOL_IN) + 16:
+                    encoded_min_tokens_raw = struct.unpack(
+                        "<Q", data[len(DISC_PUMP_BUY_EXACT_SOL_IN) + 8: len(DISC_PUMP_BUY_EXACT_SOL_IN) + 16]
+                    )[0]
+                break
+        guard_match = (encoded_min_tokens_raw == min_tokens_raw)
+        adaptive_slip_pct = -1.0
+        if expected_tokens_raw > 0:
+            adaptive_slip_pct = 100.0 * (1.0 - (min_tokens_raw / max(expected_tokens_raw, 1)))
+        log(
+            f"PGG2-BUY-MIN-TOKEN-GUARD-ENCODED mint={short_addr(mint_str)} "
+            f"expected_tokens_raw={expected_tokens_raw} min_tokens_raw={min_tokens_raw} "
+            f"encoded_min_tokens_raw={encoded_min_tokens_raw} "
+            f"adaptive_slippage_pct={adaptive_slip_pct:.4f} guard_match={'true' if guard_match else 'false'}"
+        )
+        if not guard_match:
+            raise RuntimeError(
+                f"pump_buy_min_token_guard_encoding_mismatch: "
+                f"intended={min_tokens_raw} encoded={encoded_min_tokens_raw}"
+            )
+        out = dict(quote)
+        rate = dict(out.get("rate") or {})
+        rate["minAmountOut"] = self.raw_to_ui(mint, min_tokens_raw)
+        out["rate"] = rate
+        out["txn"] = base64.b64encode(new_tx_bytes).decode("ascii")
+        log(
+            f"PGG2-DIRECT-BUY-MIN-RETARGET mint={short_addr(mint_str)} "
+            f"min_tokens={rate['minAmountOut']:.6f} source=existing_quote"
+        )
+        return out
+
+    def build_buy_with_min_tokens(self, mint_str: str, amount_sol: float, min_tokens_ui: float) -> dict[str, Any]:
+        """Build a pump_bc exact-SOL-in buy with an explicit token floor."""
+        self._inflight_quotes[mint_str] = self._inflight_quotes.get(mint_str, 0) + 1
+        _qstart_ms = int(time.time() * 1000)
+        _qsim_needed = bool(env_bool("PGG2_DIRECT_SELECT_BUYBACK_BY_SIM", False) and self.quote_simulate)
+        try:
+            mint = as_pubkey(mint_str)
+            curve = self.bonding_curve(mint)
+            if curve.complete:
+                raise RuntimeError("explicit_min_tokens_only_supports_pump_bc")
+            global_cfg = self.pump_global()
+            spend_lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
+            token_out, fee_lamports = self.quote_pump_buy_tokens(spend_lamports, curve, global_cfg)
+            min_tokens_out = max(0, self.ui_to_raw(mint, min_tokens_ui))
+            token_program = self.mint_owner(mint)
+            user = as_pubkey(self.public_key)
+            user_ata = get_associated_token_address(user, mint, token_program)
+            associated_curve = get_associated_token_address(curve.key, mint, token_program)
+            creator_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(curve.creator))
+            fee_recipient = self.pump_fee_recipient(global_cfg, curve)
+            user_volume = pda(PUMP_PROGRAM_ID, b"user_volume_accumulator", bytes(user))
+            track_volume = b"\x01" if env_bool("PGG2_DIRECT_TRACK_VOLUME", True) else b"\x00"
+            data = DISC_PUMP_BUY_EXACT_SOL_IN + u64(spend_lamports) + u64(min_tokens_out) + track_volume
+            base_metas = [
+                AccountMeta(self.pump_global_key, False, False),
+                AccountMeta(fee_recipient, False, True),
+                AccountMeta(mint, False, False),
+                AccountMeta(curve.key, False, True),
+                AccountMeta(associated_curve, False, True),
+                AccountMeta(user_ata, False, True),
+                AccountMeta(user, True, True),
+                AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+                AccountMeta(token_program, False, False),
+                AccountMeta(creator_vault, False, True),
+                AccountMeta(self.pump_event_authority, False, False),
+                AccountMeta(PUMP_PROGRAM_ID, False, False),
+                AccountMeta(self.pump_global_volume_accumulator, False, False),
+                AccountMeta(user_volume, False, True),
+                AccountMeta(self.pump_fee_config, False, False),
+                AccountMeta(PUMP_FEE_PROGRAM_ID, False, False),
+            ]
+            ata_ix = create_idempotent_associated_token_account(user, user, mint, token_program)
+
+            def make_tx(extra_metas: list[AccountMeta]) -> str:
+                return self.compile_tx(
+                    [
+                        *self.compute_budget_ixs(),
+                        ata_ix,
+                        Instruction(PUMP_PROGRAM_ID, data, [*base_metas, *extra_metas]),
+                    ]
+                )
+
+            selected_pair = ""
+            txn = make_tx(self.pump_buy_remaining_metas(mint))
+            existing_pair_src = self._last_pair_source.get(str(mint), "none")
+            skip_sim_if_cached = env_bool("PGG2_DIRECT_SKIP_SIM_IF_CACHED", True)
+            has_fast_pair = existing_pair_src in {"forced", "cache", "current_sig", "observed_raw_rpc"}
+            if skip_sim_if_cached and has_fast_pair:
+                _qsim_needed = False
+            if env_bool("PGG2_DIRECT_SELECT_BUYBACK_BY_SIM", False) and self.quote_simulate and not (skip_sim_if_cached and has_fast_pair):
+                selected = False
+                for pair in self.pump_buyback_candidate_pairs(mint):
+                    candidate_txn = make_tx(
+                        [
+                            AccountMeta(self.pump_bonding_curve_v2(mint), False, False),
+                            AccountMeta(pair.social_fee_pda, False, True),
+                        ]
+                    )
+                    try:
+                        signed_b64, _ = self.sign_transaction(candidate_txn)
+                        if self.simulate_signed(signed_b64):
+                            txn = candidate_txn
+                            selected_pair = (
+                                f" buyback={short_addr(str(pair.recipient))}/"
+                                f"{short_addr(str(pair.social_fee_pda))} source={pair.source}"
+                            )
+                            self.remember_pump_buyback_pair(mint, pair)
+                            self._last_pair_source[str(mint)] = f"sim_selected:{pair.source}"
+                            self._last_pair_recipient[str(mint)] = str(pair.recipient)
+                            self._last_pair_social[str(mint)] = str(pair.social_fee_pda)
+                            selected = True
+                            break
+                    except Exception as exc:
+                        log(
+                            "PGG2-DIRECT-WARN buyback_pair_sim_error "
+                            f"{short_addr(str(pair.recipient))}/{short_addr(str(pair.social_fee_pda))} "
+                            f"source={pair.source} "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                if not selected:
+                    msg = "PGG2-DIRECT-WARN no_buyback_pair_simulated_ok"
+                    if env_bool("PGG2_DIRECT_REQUIRE_SIM_SELECTED_BUYBACK", self.mode == "live"):
+                        raise RuntimeError(msg)
+                    log(f"{msg} returning_default_pair")
+            out_ui = self.raw_to_ui(mint, token_out)
+            min_ui = self.raw_to_ui(mint, min_tokens_out)
+            fee_sol = fee_lamports / LAMPORTS_PER_SOL
+            log(
+                f"PGG2-DIRECT-QUOTE BUY {short_addr(mint_str)} route=pump_bc "
+                f"in={amount_sol:.6f} out={out_ui:.6f} min={min_ui:.6f} "
+                f"fee_bps={global_cfg.fee_bps + global_cfg.creator_fee_bps} fee={fee_sol:.6f} "
+                f"explicit_min_tokens=1{selected_pair}"
+            )
+            _qend_ms = int(time.time() * 1000)
+            pair_source = self._last_pair_source.get(str(mint), "unknown")
+            try:
+                self.record_quote_latency(
+                    side="buy",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source=pair_source,
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=True,
+                    pair_source=pair_source,
+                    was_simulation_needed=_qsim_needed,
+                )
+            except Exception:
+                pass
+            return {
+                "txn": txn,
+                "route": "pump_bc",
+                "quote_network_latency_ms": max(0, _qend_ms - _qstart_ms),
+                "quote_returned_ts_ms": _qend_ms,
+                "rate": {
+                    "amountOut": out_ui,
+                    "minAmountOut": min_ui,
+                    "priceImpact": spend_lamports / max(curve.virtual_sol_reserves, 1),
+                    "fee": fee_sol,
+                    "feeBps": global_cfg.fee_bps + global_cfg.creator_fee_bps,
+                },
+            }
+        except Exception as exc:
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="buy",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="error",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=False,
+                    error_class=type(exc).__name__,
+                    was_simulation_needed=_qsim_needed,
+                )
+            except Exception:
+                pass
+            raise
+        finally:
+            self._inflight_quotes[mint_str] = max(0, self._inflight_quotes.get(mint_str, 1) - 1)
+
+    def build_buy_with_min_tokens_from_curve_snapshot(
+        self,
+        mint_str: str,
+        amount_sol: float,
+        min_tokens_ui: float,
+        *,
+        virtual_token_reserves: int,
+        virtual_sol_reserves: int,
+        real_token_reserves: int,
+        real_sol_reserves: int,
+        token_total_supply: int = 0,
+        complete: bool = False,
+        creator: str = "",
+        is_mayhem: bool = False,
+        cashback_enabled: bool = False,
+        snapshot_ts_ms: int = 0,
+    ) -> dict[str, Any]:
+        """Build a pump_bc buy from the already-observed curve snapshot.
+
+        This avoids the live adapter doing a fresh bonding-curve RPC read after
+        V48 has already decided from accountSubscribe data. The transaction is
+        still protected by the explicit min-token guard; if the chain has moved
+        by send/sim time, Pump fails it with slippage rather than opening a bad
+        position.
+        """
+        self._inflight_quotes[mint_str] = self._inflight_quotes.get(mint_str, 0) + 1
+        _qstart_ms = int(time.time() * 1000)
+        _qsim_needed = False
+        try:
+            mint = as_pubkey(mint_str)
+            curve_key = pda(PUMP_PROGRAM_ID, b"bonding-curve", bytes(mint))
+            creator_pk = as_pubkey(creator) if creator else Pubkey.default()
+            curve = PumpBondingCurve(
+                key=curve_key,
+                virtual_token_reserves=int(virtual_token_reserves),
+                virtual_sol_reserves=int(virtual_sol_reserves),
+                real_token_reserves=int(real_token_reserves),
+                real_sol_reserves=int(real_sol_reserves),
+                token_total_supply=int(token_total_supply),
+                complete=bool(complete),
+                creator=creator_pk,
+                is_mayhem=bool(is_mayhem),
+                cashback_enabled=bool(cashback_enabled),
+            )
+            if curve.complete:
+                raise RuntimeError("snapshot_explicit_min_tokens_only_supports_pump_bc")
+            global_cfg = self.pump_global()
+            spend_lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
+            token_out, fee_lamports = self.quote_pump_buy_tokens(spend_lamports, curve, global_cfg)
+            min_tokens_out = max(0, self.ui_to_raw(mint, min_tokens_ui))
+            token_program = self.mint_owner(mint)
+            user = as_pubkey(self.public_key)
+            user_ata = get_associated_token_address(user, mint, token_program)
+            associated_curve = get_associated_token_address(curve.key, mint, token_program)
+            creator_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(curve.creator))
+            fee_recipient = self.pump_fee_recipient(global_cfg, curve)
+            user_volume = pda(PUMP_PROGRAM_ID, b"user_volume_accumulator", bytes(user))
+            track_volume = b"\x01" if env_bool("PGG2_DIRECT_TRACK_VOLUME", True) else b"\x00"
+            data = DISC_PUMP_BUY_EXACT_SOL_IN + u64(spend_lamports) + u64(min_tokens_out) + track_volume
+            base_metas = [
+                AccountMeta(self.pump_global_key, False, False),
+                AccountMeta(fee_recipient, False, True),
+                AccountMeta(mint, False, False),
+                AccountMeta(curve.key, False, True),
+                AccountMeta(associated_curve, False, True),
+                AccountMeta(user_ata, False, True),
+                AccountMeta(user, True, True),
+                AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+                AccountMeta(token_program, False, False),
+                AccountMeta(creator_vault, False, True),
+                AccountMeta(self.pump_event_authority, False, False),
+                AccountMeta(PUMP_PROGRAM_ID, False, False),
+                AccountMeta(self.pump_global_volume_accumulator, False, False),
+                AccountMeta(user_volume, False, True),
+                AccountMeta(self.pump_fee_config, False, False),
+                AccountMeta(PUMP_FEE_PROGRAM_ID, False, False),
+            ]
+            ata_ix = create_idempotent_associated_token_account(user, user, mint, token_program)
+            txn = self.compile_tx([
+                *self.compute_budget_ixs(),
+                ata_ix,
+                Instruction(PUMP_PROGRAM_ID, data, [*base_metas, *self.pump_buy_remaining_metas(mint)]),
+            ])
+            out_ui = self.raw_to_ui(mint, token_out)
+            min_ui = self.raw_to_ui(mint, min_tokens_out)
+            fee_sol = fee_lamports / LAMPORTS_PER_SOL
+            self._last_pair_source[str(mint)] = "decision_curve_snapshot"
+            log(
+                f"PGG2-DIRECT-QUOTE BUY {short_addr(mint_str)} route=pump_bc "
+                f"in={amount_sol:.6f} out={out_ui:.6f} min={min_ui:.6f} "
+                f"fee_bps={global_cfg.fee_bps + global_cfg.creator_fee_bps} fee={fee_sol:.6f} "
+                f"explicit_min_tokens=1 source=decision_curve_snapshot "
+                f"snapshot_age_ms={max(0, int(time.time() * 1000) - int(snapshot_ts_ms or 0)) if snapshot_ts_ms else -1}"
+            )
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="buy",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="decision_curve_snapshot",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=True,
+                    pair_source="decision_curve_snapshot",
+                    was_simulation_needed=_qsim_needed,
+                )
+            except Exception:
+                pass
+            return {
+                "txn": txn,
+                "route": "pump_bc",
+                "quote_network_latency_ms": max(0, _qend_ms - _qstart_ms),
+                "quote_returned_ts_ms": _qend_ms,
+                "quote_source": "decision_curve_snapshot",
+                "snapshot_ts_ms": int(snapshot_ts_ms or 0),
+                "rate": {
+                    "amountOut": out_ui,
+                    "minAmountOut": min_ui,
+                    "priceImpact": spend_lamports / max(curve.virtual_sol_reserves, 1),
+                    "fee": fee_sol,
+                    "feeBps": global_cfg.fee_bps + global_cfg.creator_fee_bps,
+                },
+            }
+        except Exception as exc:
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="buy",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="decision_curve_snapshot_error",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=False,
+                    error_class=type(exc).__name__,
+                    was_simulation_needed=_qsim_needed,
+                )
+            except Exception:
+                pass
+            raise
+        finally:
+            self._inflight_quotes[mint_str] = max(0, self._inflight_quotes.get(mint_str, 1) - 1)
+
+    def _build_buy_impl(self, mint_str: str, amount_sol: float, slippage: float, _qstart_ms: int, _qsim_needed: bool) -> dict[str, Any]:
         mint = as_pubkey(mint_str)
         curve = self.bonding_curve(mint)
         if curve.complete:
@@ -754,7 +1679,22 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
 
         selected_pair = ""
         txn = make_tx(self.pump_buy_remaining_metas(mint))
-        if env_bool("PGG2_DIRECT_SELECT_BUYBACK_BY_SIM", False) and self.quote_simulate:
+        # v32 — fast path: if pair was already discovered (forced/cache/observed
+        # /current_sig), skip the sim-select grid search. Sim-select costs
+        # 600-1700ms per pair candidate which makes actual-entry impossible to
+        # risk-manage. Default ON; can be disabled if a deeper sim sweep is
+        # explicitly needed for research.
+        _existing_pair_src = self._last_pair_source.get(str(mint), "none")
+        _skip_sim_if_cached = env_bool("PGG2_DIRECT_SKIP_SIM_IF_CACHED", True)
+        _has_fast_pair = _existing_pair_src in {
+            "forced",
+            "cache",
+            "current_sig",
+            "observed_raw_rpc",
+        }
+        if _skip_sim_if_cached and _has_fast_pair:
+            _qsim_needed = False  # we are NOT going to sim-select
+        if env_bool("PGG2_DIRECT_SELECT_BUYBACK_BY_SIM", False) and self.quote_simulate and not (_skip_sim_if_cached and _has_fast_pair):
             selected = False
             for pair in self.pump_buyback_candidate_pairs(mint):
                 candidate_txn = make_tx(
@@ -772,6 +1712,15 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
                             f"{short_addr(str(pair.social_fee_pda))} source={pair.source}"
                         )
                         self.remember_pump_buyback_pair(mint, pair)
+                        # v30 — overwrite last-pair tracking with the sim-selected pair
+                        self._last_pair_source[str(mint)] = f"sim_selected:{pair.source}"
+                        self._last_pair_recipient[str(mint)] = str(pair.recipient)
+                        self._last_pair_social[str(mint)] = str(pair.social_fee_pda)
+                        log(
+                            f"PGG2-DIRECT-PAIR-SIM-SELECTED mint={short_addr(str(mint))} "
+                            f"source={pair.source} recipient={short_addr(str(pair.recipient))} "
+                            f"social={short_addr(str(pair.social_fee_pda))}"
+                        )
                         selected = True
                         break
                 except Exception as exc:
@@ -794,9 +1743,28 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             f"in={amount_sol:.6f} out={out_ui:.6f} min={min_ui:.6f} "
             f"fee_bps={global_cfg.fee_bps + global_cfg.creator_fee_bps} fee={fee_sol:.6f}{selected_pair}"
         )
+        # v31 — record latency telemetry for the successful buy quote
+        _qend_ms = int(time.time() * 1000)
+        _pair_source = self._last_pair_source.get(str(mint), "unknown")
+        try:
+            self.record_quote_latency(
+                side="buy",
+                mint=mint_str,
+                route="pump_bc",
+                source=_pair_source,
+                start_ms=_qstart_ms,
+                end_ms=_qend_ms,
+                success=True,
+                pair_source=_pair_source,
+                was_simulation_needed=_qsim_needed,
+            )
+        except Exception:
+            pass
         return {
             "txn": txn,
             "route": "pump_bc",
+            "quote_network_latency_ms": max(0, _qend_ms - _qstart_ms),
+            "quote_returned_ts_ms": _qend_ms,
             "rate": {
                 "amountOut": out_ui,
                 "minAmountOut": min_ui,
@@ -807,6 +1775,269 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         }
 
     def build_sell(self, mint_str: str, amount: Any, slippage: float) -> dict[str, Any]:
+        # v31 — quote latency telemetry for sell.
+        self._inflight_quotes[mint_str] = self._inflight_quotes.get(mint_str, 0) + 1
+        _qstart_ms = int(time.time() * 1000)
+        try:
+            result = self._build_sell_impl(mint_str, amount, slippage, _qstart_ms)
+            # v34 — populate recent-sell-quote cache so the close() path for
+            # risk-owned mints can reuse this quote and skip a parallel
+            # network call (broker in_flight=1 invariant).
+            try:
+                self.record_sell_quote(mint_str, result, float(self.rate_amount_out(result)))
+            except Exception:
+                pass
+            return result
+        except Exception as exc:
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="sell",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="error",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=False,
+                    error_class=type(exc).__name__,
+                )
+            except Exception:
+                pass
+            raise
+        finally:
+            self._inflight_quotes[mint_str] = max(0, self._inflight_quotes.get(mint_str, 1) - 1)
+
+    def build_sell_from_curve_snapshot(
+        self,
+        mint_str: str,
+        amount: Any,
+        slippage: float,
+        *,
+        virtual_token_reserves: int,
+        virtual_sol_reserves: int,
+        real_token_reserves: int,
+        real_sol_reserves: int,
+        token_total_supply: int = 0,
+        complete: bool = False,
+        creator: str = "",
+        is_mayhem: bool = False,
+        cashback_enabled: bool = False,
+        snapshot_ts_ms: int = 0,
+        include_close_token_ata: bool = False,
+    ) -> dict[str, Any]:
+        """Build a pump_bc sell from an already-observed accountSubscribe curve.
+
+        V48 live cannot afford a fresh bonding_curve()/token-balance quote round
+        trip after the buy lands. This mirrors the buy snapshot builder: quote
+        and build from the latest local curve point, then protect execution with
+        the caller's min-SOL guard.
+        """
+        self._inflight_quotes[mint_str] = self._inflight_quotes.get(mint_str, 0) + 1
+        _qstart_ms = int(time.time() * 1000)
+        try:
+            mint = as_pubkey(mint_str)
+            curve_key = pda(PUMP_PROGRAM_ID, b"bonding-curve", bytes(mint))
+            creator_pk = as_pubkey(creator) if creator else Pubkey.default()
+            curve = PumpBondingCurve(
+                key=curve_key,
+                virtual_token_reserves=int(virtual_token_reserves),
+                virtual_sol_reserves=int(virtual_sol_reserves),
+                real_token_reserves=int(real_token_reserves),
+                real_sol_reserves=int(real_sol_reserves),
+                token_total_supply=int(token_total_supply),
+                complete=bool(complete),
+                creator=creator_pk,
+                is_mayhem=bool(is_mayhem),
+                cashback_enabled=bool(cashback_enabled),
+            )
+            if curve.complete:
+                raise RuntimeError("snapshot_sell_only_supports_pump_bc")
+            global_cfg = self.pump_global()
+            token_amount = self.ui_to_raw(mint, amount)
+            expected_lamports, fee_lamports = self.quote_pump_sell_sol(token_amount, curve, global_cfg)
+            min_sol_output = int(expected_lamports * max(0.0, 1.0 - float(slippage) / 100.0))
+            token_program = self.mint_owner(mint)
+            user = as_pubkey(self.public_key)
+            user_ata = get_associated_token_address(user, mint, token_program)
+            associated_curve = get_associated_token_address(curve.key, mint, token_program)
+            creator_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(curve.creator))
+            fee_recipient = self.pump_fee_recipient(global_cfg, curve)
+            data = DISC_PUMP_SELL + u64(token_amount) + u64(min_sol_output)
+            metas = [
+                AccountMeta(self.pump_global_key, False, False),
+                AccountMeta(fee_recipient, False, True),
+                AccountMeta(mint, False, False),
+                AccountMeta(curve.key, False, True),
+                AccountMeta(associated_curve, False, True),
+                AccountMeta(user_ata, False, True),
+                AccountMeta(user, True, True),
+                AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+                AccountMeta(creator_vault, False, True),
+                AccountMeta(token_program, False, False),
+                AccountMeta(self.pump_event_authority, False, False),
+                AccountMeta(PUMP_PROGRAM_ID, False, False),
+                AccountMeta(self.pump_fee_config, False, False),
+                AccountMeta(PUMP_FEE_PROGRAM_ID, False, False),
+                *self.pump_sell_remaining_metas(mint, curve, user),
+            ]
+            ixs = [*self.compute_budget_ixs(), Instruction(PUMP_PROGRAM_ID, data, metas)]
+            if include_close_token_ata:
+                ixs.append(close_token_account(token_program, user_ata, user, user))
+            txn = self.compile_tx(ixs)
+            out_sol = expected_lamports / LAMPORTS_PER_SOL
+            min_sol = min_sol_output / LAMPORTS_PER_SOL
+            fee_sol = fee_lamports / LAMPORTS_PER_SOL
+            log(
+                f"PGG2-DIRECT-QUOTE SELL {short_addr(mint_str)} route=pump_bc "
+                f"in_tokens={self.raw_to_ui(mint, token_amount):.6f} out={out_sol:.6f} "
+                f"min={min_sol:.6f} fee_bps={global_cfg.fee_bps + global_cfg.creator_fee_bps} "
+                f"fee={fee_sol:.6f} source=curve_snapshot "
+                f"snapshot_age_ms={max(0, int(time.time() * 1000) - int(snapshot_ts_ms or 0)) if snapshot_ts_ms else -1}"
+            )
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="sell",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="curve_snapshot",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=True,
+                    pair_source=self._last_pair_source.get(str(mint), "unknown"),
+                )
+            except Exception:
+                pass
+            result = {
+                "txn": txn,
+                "route": "pump_bc",
+                "quote_network_latency_ms": max(0, _qend_ms - _qstart_ms),
+                "quote_returned_ts_ms": _qend_ms,
+                "quote_source": "curve_snapshot",
+                "snapshot_ts_ms": int(snapshot_ts_ms or 0),
+                "rate": {
+                    "amountOut": out_sol,
+                    "minAmountOut": min_sol,
+                    "priceImpact": token_amount / max(curve.virtual_token_reserves, 1),
+                    "fee": fee_sol,
+                    "feeBps": global_cfg.fee_bps + global_cfg.creator_fee_bps,
+                },
+            }
+            try:
+                self.record_sell_quote(mint_str, result, float(self.rate_amount_out(result)))
+            except Exception:
+                pass
+            return result
+        except Exception as exc:
+            _qend_ms = int(time.time() * 1000)
+            try:
+                self.record_quote_latency(
+                    side="sell",
+                    mint=mint_str,
+                    route="pump_bc",
+                    source="curve_snapshot_error",
+                    start_ms=_qstart_ms,
+                    end_ms=_qend_ms,
+                    success=False,
+                    error_class=type(exc).__name__,
+                )
+            except Exception:
+                pass
+            raise
+        finally:
+            self._inflight_quotes[mint_str] = max(0, self._inflight_quotes.get(mint_str, 1) - 1)
+
+    def retarget_sell_min_sol(self, quote: dict[str, Any], mint_str: str, min_sol_out: float) -> dict[str, Any]:
+        """Retarget an existing pump_bc sell transaction to an explicit SOL floor.
+
+        Fail-closed:
+          - refuse min_sol_lamports == 0 (or 1, the legacy EXIT_ANY fallback)
+          - after mutation, decode the rebuilt tx and verify encoded_min_sol_lamports
+            matches what was intended
+          - emit PGG2-SELL-MIN-SOL-GUARD-ENCODED with structured fields
+          - raise on mismatch so caller cannot send an unprotected sell
+
+        Callers that want the legacy "exit at any price" behaviour for non-v39
+        emergencies must use the default builder path; v39 live emergency
+        closes must still go through this function with an explicit floor.
+        """
+        min_lamports = max(0, int(float(min_sol_out) * LAMPORTS_PER_SOL))
+        # block v39 unsafe-zero / one-lamport encodings
+        floor_lamports = max(1, env_int("PGG2_V39_SELL_MIN_SOL_FLOOR_LAMPORTS", 100))
+        if min_lamports < floor_lamports:
+            log(
+                f"PGG2-SELL-MIN-SOL-GUARD-ENCODED mint={short_addr(mint_str)} "
+                f"sell_tokens_raw=0 expected_sol_out=- min_sol_lamports={min_lamports} "
+                f"encoded_min_sol_lamports=-1 guard_match=false reason=below_floor "
+                f"floor_lamports={floor_lamports}"
+            )
+            raise RuntimeError(
+                f"pump_sell_min_sol_below_floor: min_lamports={min_lamports} floor={floor_lamports}"
+            )
+        tx = VersionedTransaction.from_bytes(base64.b64decode(str(quote["txn"])))
+        msg = tx.message
+        out_instructions = []
+        changed = False
+        sell_tokens_raw = 0
+        for ix in msg.instructions:
+            program_id = msg.account_keys[ix.program_id_index]
+            data = bytes(ix.data)
+            if program_id == PUMP_PROGRAM_ID and data.startswith(DISC_PUMP_SELL):
+                prefix_len = len(DISC_PUMP_SELL) + 8
+                if len(data) >= prefix_len:
+                    sell_tokens_raw = struct.unpack(
+                        "<Q", data[len(DISC_PUMP_SELL):prefix_len]
+                    )[0]
+                data = data[:prefix_len] + u64(min_lamports) + data[prefix_len + 8 :]
+                changed = True
+            out_instructions.append(CompiledInstruction(ix.program_id_index, data, ix.accounts))
+        if not changed:
+            log(
+                f"PGG2-SELL-MIN-SOL-GUARD-ENCODED mint={short_addr(mint_str)} "
+                f"sell_tokens_raw=0 expected_sol_out=- min_sol_lamports={min_lamports} "
+                f"encoded_min_sol_lamports=-1 guard_match=false reason=pump_sell_instruction_not_found"
+            )
+            raise RuntimeError("pump_sell_instruction_not_found_for_min_sol_retarget")
+        new_msg = MessageV0(msg.header, msg.account_keys, msg.recent_blockhash, out_instructions, msg.address_table_lookups)
+        signer = self.keypair if self.keypair else NullSigner(as_pubkey(self.public_key))
+        new_tx = VersionedTransaction(new_msg, [signer])
+        new_tx_bytes = bytes(new_tx)
+        verify_tx = VersionedTransaction.from_bytes(new_tx_bytes)
+        encoded_min_sol_lamports = -1
+        for ix in verify_tx.message.instructions:
+            program_id = verify_tx.message.account_keys[ix.program_id_index]
+            data = bytes(ix.data)
+            if program_id == PUMP_PROGRAM_ID and data.startswith(DISC_PUMP_SELL):
+                if len(data) >= len(DISC_PUMP_SELL) + 16:
+                    encoded_min_sol_lamports = struct.unpack(
+                        "<Q", data[len(DISC_PUMP_SELL) + 8: len(DISC_PUMP_SELL) + 16]
+                    )[0]
+                break
+        expected_sol_out = float((quote.get("rate") or {}).get("amountOut") or 0.0)
+        guard_match = (encoded_min_sol_lamports == min_lamports)
+        log(
+            f"PGG2-SELL-MIN-SOL-GUARD-ENCODED mint={short_addr(mint_str)} "
+            f"sell_tokens_raw={sell_tokens_raw} expected_sol_out={expected_sol_out:.9f} "
+            f"min_sol_lamports={min_lamports} encoded_min_sol_lamports={encoded_min_sol_lamports} "
+            f"guard_match={'true' if guard_match else 'false'}"
+        )
+        if not guard_match:
+            raise RuntimeError(
+                f"pump_sell_min_sol_guard_encoding_mismatch: "
+                f"intended={min_lamports} encoded={encoded_min_sol_lamports}"
+            )
+        out = dict(quote)
+        rate = dict(out.get("rate") or {})
+        rate["minAmountOut"] = min_lamports / LAMPORTS_PER_SOL
+        out["rate"] = rate
+        out["txn"] = base64.b64encode(new_tx_bytes).decode("ascii")
+        log(
+            f"PGG2-DIRECT-SELL-MIN-RETARGET mint={short_addr(mint_str)} "
+            f"min_sol={rate['minAmountOut']:.9f} source=existing_quote"
+        )
+        return out
+
+    def _build_sell_impl(self, mint_str: str, amount: Any, slippage: float, _qstart_ms: int) -> dict[str, Any]:
         mint = as_pubkey(mint_str)
         curve = self.bonding_curve(mint)
         if curve.complete:
@@ -816,7 +2047,15 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         expected_lamports, fee_lamports = self.quote_pump_sell_sol(token_amount, curve, global_cfg)
         min_sol_output = int(expected_lamports * max(0.0, 1.0 - slippage / 100.0))
         if env_bool("PGG2_DIRECT_EXIT_ANY_EXECUTABLE_PRICE", False):
-            min_sol_output = max(0, env_int("PGG2_DIRECT_EXIT_MIN_LAMPORTS", 1))
+            if env_bool("PGG2_V39_LIVE_FORBID_EXIT_ANY", False):
+                # PR-Phase 1: block the legacy "exit at any price" override when
+                # v39-live forbids it. Keep the slippage-based min_sol_output instead.
+                log(
+                    f"PGG2-V39-FALLBACK-PATH-BLOCK side=sell reason=exit_any_executable_price "
+                    f"mint={short_addr(mint_str)} retained_min_sol_lamports={min_sol_output}"
+                )
+            else:
+                min_sol_output = max(0, env_int("PGG2_DIRECT_EXIT_MIN_LAMPORTS", 1))
         token_program = self.mint_owner(mint)
         user = as_pubkey(self.public_key)
         user_ata = get_associated_token_address(user, mint, token_program)
@@ -842,7 +2081,22 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             *self.pump_sell_remaining_metas(mint, curve, user),
         ]
         ixs = [*self.compute_budget_ixs(), Instruction(PUMP_PROGRAM_ID, data, metas)]
-        if env_bool("PGG2_DIRECT_CLOSE_TOKEN_ATA_ON_SELL", True):
+        include_close = env_bool("PGG2_DIRECT_CLOSE_TOKEN_ATA_ON_SELL", True) and not bool(
+            getattr(self, "_force_no_close_token_ata", False)
+        )
+        if include_close and self.mode == "live" and env_bool("PGG2_DIRECT_CLOSE_TOKEN_ATA_ONLY_ON_FULL_BALANCE", True):
+            try:
+                live_balance_raw = int(self.token_balance_raw(mint))
+            except Exception:
+                live_balance_raw = -1
+            if live_balance_raw <= 0 or token_amount < live_balance_raw:
+                include_close = False
+                log(
+                    f"PGG2-DIRECT-CLOSE-ATA-SKIP mint={short_addr(mint_str)} "
+                    f"reason=partial_or_unknown_balance sell_tokens_raw={token_amount} "
+                    f"wallet_balance_raw={live_balance_raw}"
+                )
+        if include_close:
             ixs.append(close_token_account(token_program, user_ata, user, user))
         txn = self.compile_tx(ixs)
         out_sol = expected_lamports / LAMPORTS_PER_SOL
@@ -853,9 +2107,27 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             f"in_tokens={self.raw_to_ui(mint, token_amount):.6f} out={out_sol:.6f} "
             f"min={min_sol:.6f} fee_bps={global_cfg.fee_bps + global_cfg.creator_fee_bps} fee={fee_sol:.6f}"
         )
+        # v31 — record sell quote latency
+        _qend_ms = int(time.time() * 1000)
+        _pair_source = self._last_pair_source.get(str(mint), "unknown")
+        try:
+            self.record_quote_latency(
+                side="sell",
+                mint=mint_str,
+                route="pump_bc",
+                source=_pair_source,
+                start_ms=_qstart_ms,
+                end_ms=_qend_ms,
+                success=True,
+                pair_source=_pair_source,
+            )
+        except Exception:
+            pass
         return {
             "txn": txn,
             "route": "pump_bc",
+            "quote_network_latency_ms": max(0, _qend_ms - _qstart_ms),
+            "quote_returned_ts_ms": _qend_ms,
             "rate": {
                 "amountOut": out_sol,
                 "minAmountOut": min_sol,
@@ -863,6 +2135,221 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
                 "fee": fee_sol,
                 "feeBps": global_cfg.fee_bps + global_cfg.creator_fee_bps,
             },
+        }
+
+    # ------------------------------------------------------------------
+    # V63 standalone CloseAccount builder — safety net for ATAs that
+    # remained open after a full-balance sell. Used by
+    # pgg2_v63_post_sell_clean_close after V62B-SELL-CONFIRMED to recover
+    # any rent that the broker's atomic sell+close path failed to recover.
+    # ------------------------------------------------------------------
+    def build_close_account(
+        self,
+        mint: str,
+        ata: str,
+        owner: str,
+        token_program: str,
+    ) -> dict[str, Any]:
+        user = as_pubkey(self.public_key)
+        if str(user) != owner:
+            raise RuntimeError(
+                f"build_close_account_owner_mismatch broker={user} requested={owner}"
+            )
+        ata_pk = as_pubkey(ata)
+        tp_pk = as_pubkey(token_program)
+        close_ix = close_token_account(tp_pk, ata_pk, user, user)
+        ixs = [*self.compute_budget_ixs(), close_ix]
+        txn = self.compile_tx(ixs)
+        return {"txn": txn, "route": "v63_close_account"}
+
+    # ------------------------------------------------------------------
+    # v36c-3 ATOMIC ESB — one Solana v0 transaction containing
+    #   compute_budget(x2)  +  create_idempotent_ATA  +  pump_buy
+    #   +  pump_sell  +  close_token_account
+    # All-or-nothing atomicity preserves the entry-snapshot edge in live
+    # mode without requiring a Jito tip. Caller: AtomicSingleTxESBExecutor.
+    # ------------------------------------------------------------------
+    def build_atomic_buy_sell_close(
+        self,
+        mint_str: str,
+        amount_sol: float,
+        sell_slippage_pct: float,
+        compute_unit_limit: int = 600_000,
+        compute_unit_price_micro_lamports: int = 22_700,
+        expected_quote_tokens: Optional[float] = None,
+    ) -> dict[str, Any]:
+        # Route-aware refusal: this builder only supports pump_bc. The
+        # caller has already gated on route, but defend in depth.
+        mint = as_pubkey(mint_str)
+        curve = self.bonding_curve(mint)
+        if curve.complete:
+            raise RuntimeError(
+                "build_atomic_buy_sell_close: curve complete; pump_bc required, "
+                "pumpswap atomic not supported in this builder"
+            )
+        global_cfg = self.pump_global()
+        # ----- BUY instruction (mirrors _build_buy_impl exactly) -----
+        spend_lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
+        token_out, _buy_fee_lamports = self.quote_pump_buy_tokens(
+            spend_lamports, curve, global_cfg
+        )
+        # Allow zero buy-side slippage in atomic mode; the sell side's
+        # min_sol_output enforces price floor on the exit leg.
+        min_tokens_out = int(token_out)
+        token_program = self.mint_owner(mint)
+        user = as_pubkey(self.public_key)
+        user_ata = get_associated_token_address(user, mint, token_program)
+        associated_curve = get_associated_token_address(curve.key, mint, token_program)
+        creator_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(curve.creator))
+        fee_recipient = self.pump_fee_recipient(global_cfg, curve)
+        user_volume = pda(PUMP_PROGRAM_ID, b"user_volume_accumulator", bytes(user))
+        track_volume = b"\x01" if env_bool("PGG2_DIRECT_TRACK_VOLUME", True) else b"\x00"
+        buy_data = (
+            DISC_PUMP_BUY_EXACT_SOL_IN + u64(spend_lamports) + u64(min_tokens_out) + track_volume
+        )
+        buy_metas = [
+            AccountMeta(self.pump_global_key, False, False),
+            AccountMeta(fee_recipient, False, True),
+            AccountMeta(mint, False, False),
+            AccountMeta(curve.key, False, True),
+            AccountMeta(associated_curve, False, True),
+            AccountMeta(user_ata, False, True),
+            AccountMeta(user, True, True),
+            AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+            AccountMeta(token_program, False, False),
+            AccountMeta(creator_vault, False, True),
+            AccountMeta(self.pump_event_authority, False, False),
+            AccountMeta(PUMP_PROGRAM_ID, False, False),
+            AccountMeta(self.pump_global_volume_accumulator, False, False),
+            AccountMeta(user_volume, False, True),
+            AccountMeta(self.pump_fee_config, False, False),
+            AccountMeta(PUMP_FEE_PROGRAM_ID, False, False),
+            *self.pump_buy_remaining_metas(mint),
+        ]
+        buy_ix = Instruction(PUMP_PROGRAM_ID, buy_data, buy_metas)
+        # ----- SELL instruction (sells the EXACT token_out from buy) -----
+        # min_sol_output is the slippage floor against the post-buy curve
+        # state. We compute it against the CURRENT (pre-buy) curve as a
+        # conservative lower bound — the post-buy state will have slightly
+        # less SOL in the curve (so sell output will be slightly lower),
+        # which is fine since min_sol_output is the FLOOR, not the
+        # expected.
+        sell_expected_lamports, _sell_fee_lamports = self.quote_pump_sell_sol(
+            token_out, curve, global_cfg
+        )
+        sell_min_sol_output = int(
+            sell_expected_lamports * max(0.0, 1.0 - float(sell_slippage_pct) / 100.0)
+        )
+        if env_bool("PGG2_DIRECT_EXIT_ANY_EXECUTABLE_PRICE", False):
+            sell_min_sol_output = max(
+                0, env_int("PGG2_DIRECT_EXIT_MIN_LAMPORTS", 1)
+            )
+        sell_data = DISC_PUMP_SELL + u64(token_out) + u64(sell_min_sol_output)
+        sell_metas = [
+            AccountMeta(self.pump_global_key, False, False),
+            AccountMeta(fee_recipient, False, True),
+            AccountMeta(mint, False, False),
+            AccountMeta(curve.key, False, True),
+            AccountMeta(associated_curve, False, True),
+            AccountMeta(user_ata, False, True),
+            AccountMeta(user, True, True),
+            AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+            AccountMeta(creator_vault, False, True),
+            AccountMeta(token_program, False, False),
+            AccountMeta(self.pump_event_authority, False, False),
+            AccountMeta(PUMP_PROGRAM_ID, False, False),
+            AccountMeta(self.pump_fee_config, False, False),
+            AccountMeta(PUMP_FEE_PROGRAM_ID, False, False),
+            *self.pump_sell_remaining_metas(mint, curve, user),
+        ]
+        sell_ix = Instruction(PUMP_PROGRAM_ID, sell_data, sell_metas)
+        # ----- ATA create_idempotent + (optional) close_account -----
+        ata_ix = create_idempotent_associated_token_account(user, user, mint, token_program)
+        # v36c-3: close_token_account in the atomic tx fails with SPL Token
+        # Custom:11 (NonNativeHasBalance) whenever Pump delivers MORE tokens
+        # than `min_tokens_out` (buy_exact_sol_in is a floor, not exact).
+        # Sell consumes exactly `token_out`, leaving residual dust. Close
+        # rejects non-empty accounts. Default to NO close inside the atomic
+        # tx; the cost is one ATA rent (~0.002 SOL) staying locked per
+        # trade. v33 cost model already accounts for ata_recoverable in
+        # the legacy/dry-live path; for atomic ESB the recovery is
+        # deferred to a separate cleanup tx (out of scope of one-entry
+        # smoke). Set PGG2_ATOMIC_ESB_INCLUDE_CLOSE=1 to force-include it
+        # if a future Pump instruction variant supports exact-output buys.
+        include_close = env_bool("PGG2_ATOMIC_ESB_INCLUDE_CLOSE", False)
+        close_ix = (
+            close_token_account(token_program, user_ata, user, user)
+            if include_close
+            else None
+        )
+        # ----- Custom compute budget (atomic needs more CU than per-leg) -----
+        from solders.compute_budget import (  # type: ignore
+            set_compute_unit_limit,
+            set_compute_unit_price,
+        )
+        cb_limit_ix = set_compute_unit_limit(int(compute_unit_limit))
+        cb_price_ix = set_compute_unit_price(int(compute_unit_price_micro_lamports))
+        # ----- Assemble the atomic instruction list -----
+        # Order matters:
+        #   1. compute budget (limit, price) — first so they apply to all
+        #   2. ATA create_idempotent — must run before buy stores tokens
+        #   3. pump buy
+        #   4. pump sell (sells the locked token_out from buy)
+        #   5. close token account — claim rent back since all tokens sold
+        instructions = [cb_limit_ix, cb_price_ix, ata_ix, buy_ix, sell_ix]
+        if close_ix is not None:
+            instructions.append(close_ix)
+        # Token invariant (REAL one): sell.token_amount must equal
+        # buy.token_out within the SAME transaction. Both use `token_out`
+        # from the same atomic-build quote, so this is satisfied by
+        # construction. The caller's `expected_quote_tokens` (if passed)
+        # came from an EARLIER dry-live quote against a different
+        # (typically pre-buy) curve state — comparing it strictly to the
+        # atomic build's now-quote is incorrect because the curve moves
+        # between quotes. We record the delta as a feature for the
+        # truth-test report instead of blocking.
+        buy_tokens_ui = self.raw_to_ui(mint, token_out)
+        caller_token_delta = None
+        if expected_quote_tokens is not None:
+            caller_token_delta = float(expected_quote_tokens) - float(buy_tokens_ui)
+        # Compile into a v0 transaction (compile_tx already returns a
+        # MessageV0-based VersionedTransaction). Then sign with the live
+        # keypair so the caller can simulate + send directly.
+        unsigned_b64 = self.compile_tx(instructions)
+        signed_b64, signed_b58 = self.sign_transaction(unsigned_b64)
+        # tx_size: decode + len. compile_tx returns base64 of the full
+        # serialized signed (well, NullSigner-stubbed) tx — but we then
+        # re-sign which produces the actual signed bytes.
+        signed_bytes_len = len(base64.b64decode(signed_b64))
+        ix_summary = {
+            "compute_budget_limit": int(compute_unit_limit),
+            "compute_budget_price": int(compute_unit_price_micro_lamports),
+            "ata_create_idempotent": True,
+            "pump_buy": True,
+            "pump_sell": True,
+            "close_token_account": bool(close_ix is not None),
+        }
+        log(
+            f"PGG2-ATOMIC-ESB-BUILD-PASS mint={short_addr(mint_str)} "
+            f"variant=A buy_sell_close size={signed_bytes_len}B "
+            f"cu_limit={compute_unit_limit} cu_price={compute_unit_price_micro_lamports} "
+            f"buy_tokens={buy_tokens_ui:.6f} sell_tokens={buy_tokens_ui:.6f} "
+            f"min_sol_out={sell_min_sol_output/LAMPORTS_PER_SOL:.6f}"
+        )
+        return {
+            "signed_b64": signed_b64,
+            "signed_b58": signed_b58,
+            "route": "pump_bc",
+            "expected_buy_tokens": float(buy_tokens_ui),
+            "sell_input_tokens": float(buy_tokens_ui),
+            "caller_token_delta": caller_token_delta,
+            "sell_min_sol_output_sol": sell_min_sol_output / LAMPORTS_PER_SOL,
+            "compute_unit_limit": int(compute_unit_limit),
+            "compute_unit_price_micro_lamports": int(compute_unit_price_micro_lamports),
+            "tx_size_bytes": int(signed_bytes_len),
+            "cost_model_route": "pump_bc",
+            "ix_summary": ix_summary,
+            "variant": "A",
         }
 
     def pumpswap_global(self) -> PumpSwapGlobal:

@@ -1,0 +1,110 @@
+{
+  "positions": {
+    "1000000BOBUSDT": {
+      "symbol": "1000000BOBUSDT",
+      "side": "SELL",
+      "qty": 2886.0,
+      "entry_price": 0.01386,
+      "entry_time": 1777458749.1139987,
+      "margin": 4.0,
+      "notional": 39.99996,
+      "tp_price": 0.01378,
+      "sl_price": 0.01392,
+      "tp_order_id": 1000000060920775,
+      "sl_order_id": 1000000060920777
+    },
+    "RAVEUSDT": {
+      "symbol": "RAVEUSDT",
+      "side": "BUY",
+      "qty": 48.0,
+      "entry_price": 0.82168,
+      "entry_time": 1777459040.3803113,
+      "margin": 4.0,
+      "notional": 39.44064,
+      "tp_price": 0.82661,
+      "sl_price": 0.81839,
+      "tp_order_id": 1000000060925322,
+      "sl_order_id": 1000000060925326
+    },
+    "XPINUSDT": {
+      "symbol": "XPINUSDT",
+      "side": "SELL",
+      "qty": 30280.0,
+      "entry_price": 0.001321,
+      "entry_time": 1777459043.5236728,
+      "margin": 4.0,
+      "notional": 39.99988,
+      "tp_price": 0.001313,
+      "sl_price": 0.001326,
+      "tp_order_id": 1000000060925376,
+      "sl_order_id": 1000000060925382
+    },
+    "AIAUSDT": {
+      "symbol": "AIAUSDT",
+      "side": "SELL",
+      "qty": 778.0,
+      "entry_price": 0.0514,
+      "entry_time": 1777459105.9547205,
+      "margin": 4.0,
+      "notional": 39.9892,
+      "tp_price": 0.05109,
+      "sl_price": 0.05161,
+      "tp_order_id": 1000000060925982,
+      "sl_order_id": 1000000060925987
+    }
+  },
+  "trade_log": [
+    {
+      "ts": "2026-04-29 15:55:57",
+      "symbol": "RAVEUSDT",
+      "side": "BUY",
+      "entry_px": 0.8253,
+      "exit_px": 0.83025,
+      "qty": 48.0,
+      "pnl_gross": 0.23760000000000048,
+      "fees_est": 0.035652960000000004,
+      "pnl_net": 0.20194704000000047,
+      "reason": "TP",
+      "duration_sec": 155
+    },
+    {
+      "ts": "2026-04-29 16:04:50",
+      "symbol": "RAVEUSDT",
+      "side": "BUY",
+      "entry_px": 0.8296,
+      "exit_px": 0.82628,
+      "qty": 48.0,
+      "pnl_gross": -0.1593599999999995,
+      "fees_est": 0.03583872,
+      "pnl_net": -0.1951987199999995,
+      "reason": "SL",
+      "duration_sec": 206
+    },
+    {
+      "ts": "2026-04-29 16:06:39",
+      "symbol": "TAKEUSDT",
+      "side": "SELL",
+      "entry_px": 0.03021,
+      "exit_px": 0.03033,
+      "qty": 1324.0,
+      "pnl_gross": -0.15887999999999813,
+      "fees_est": 0.035998236,
+      "pnl_net": -0.19487823599999815,
+      "reason": "SL",
+      "duration_sec": 792
+    },
+    {
+      "ts": "2026-04-29 16:07:29",
+      "symbol": "MOVRUSDT",
+      "side": "BUY",
+      "entry_px": 2.416,
+      "exit_px": 2.406,
+      "qty": 16.55,
+      "pnl_gross": -0.16549999999999648,
+      "fees_est": 0.03598632,
+      "pnl_net": -0.2014863199999965,
+      "reason": "SL",
+      "duration_sec": 171
+    }
+  ]
+}

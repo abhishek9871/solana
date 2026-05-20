@@ -1,0 +1,30 @@
+{
+  "paper_trading": false,
+  "pending": {},
+  "positions": {},
+  "session": {
+    "best_mult": 1.0,
+    "buys": 181,
+    "closes": 0,
+    "creates": 8,
+    "curve_updates": 382,
+    "kills": 0,
+    "losses": 0,
+    "partials": 0,
+    "pending": 0,
+    "pending_expired": 0,
+    "pending_filled": 0,
+    "realized_pnl_sol": 0.0,
+    "reconnects": 0,
+    "scale1": 0,
+    "scale2": 0,
+    "scouts": 0,
+    "sells": 81,
+    "shreds": 499,
+    "started_at": 1777991632.00865,
+    "strike_plans": 2,
+    "trades": 262,
+    "wins": 0
+  },
+  "updated_at": 1777991656.078648
+}

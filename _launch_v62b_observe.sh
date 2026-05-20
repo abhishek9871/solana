@@ -1,0 +1,42 @@
+#!/bin/bash
+# V62B observe launcher — LIVE OFF. Verifies sell routing wires up correctly
+# without sending real txs. Same V62B config as Stage A but live disabled.
+
+export PGG2_LIVE_RPC_URL="https://beta.helius-rpc.com/?api-key=c2fa0510-cddd-4768-9424-e5db39429bbb"
+export HELIUS_RPC_URL="https://beta.helius-rpc.com/?api-key=c2fa0510-cddd-4768-9424-e5db39429bbb"
+export PGG2_ENABLE_LIVE="0"
+export PGG2_V60_OBSERVE_MODE="1"
+export PGG2_V61_ENABLED="1"
+export PGG2_V59_TRUE_EDGE_ENABLED="1"
+export PGG2_V60_REQUIRE_RISK_PASS="0"
+export PGG2_LIVE_CONFIRM="I_ACCEPT_REAL_SOL_RISK"
+export PGG2_DIRECT_LIVE_CONFIRM="I_ACCEPT_DIRECT_PUMP_RISK"
+
+# V62B authoritative sell router
+export PGG2_V62B_ENABLED="1"
+export PGG2_V62B_BANK_EXPECTED_FRACTION="0.85"
+export PGG2_V62B_BANK_SMALL_PROFIT_FLOOR_SOL="0.000200"
+export PGG2_V62B_FEES_ESTIMATE_SOL="0.000060"
+export PGG2_V62B_SCRATCH_TOLERANCE_SOL="0.000050"
+export PGG2_V62B_EMERGENCY_MIN_SOL="0.000020"
+export PGG2_V62B_MAX_ATTEMPTS="3"
+export PGG2_V62B_POLL_INTERVAL_MS="100"
+export PGG2_V62B_PER_ATTEMPT_TIMEOUT_MS="300"
+export PGG2_V62B_TOTAL_BUDGET_MS="1500"
+export PGG2_V62B_FINAL_WAIT_MS="700"
+
+export PGG2_RESCUE_JUPITER_FALLBACK="0"
+export PGG2_V59_MICRO_TRUE_EDGE_MIN_SOL="0.000500"
+
+export PGG2_LIVE_MAX_TRADE_SOL="0.005"
+export PGG2_LIVE_MIN_TRADE_SOL="0.005"
+export PGG2_V50B_MAX_OPEN="0"
+export PGG2_V48_MAX_OPEN="0"
+export PGG2_V50B_MAX_CLOSES="1"
+export PGG2_V48_TARGET_CLOSED_NONNEG="1"
+export PGG2_V50B_MAX_WALLET_DRAWDOWN_SOL="0.0030"
+export PGG2_V50B_MAX_SECONDS="180"
+export PGG2_V48_MAX_SECONDS="180"
+export PGG2_V50B_STAGEA_FEE_BUDGET_SOL="0.00030"
+
+exec bash /root/piggy/start_v55_stagea.sh
