@@ -8,7 +8,9 @@ param(
     [int]$SendLimit = 80,
     [int]$MaxPerMint = 4,
     [int]$ProfitTargetLamports = 3000,
-    [int]$MinSendDeltaLamports = 3000,
+    [decimal]$MinProfitUsd = 2.00,
+    [decimal]$SolUsd = 80.00,
+    [int]$MinSendDeltaLamports = 0,
     [string]$Remote = "root@87.99.151.70",
     [string]$SshKey = "$env:USERPROFILE\.ssh\hetzner_sniper",
     [string]$WslDistro = "Ubuntu-24.04",
@@ -19,11 +21,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$sizes = "0.00005,0.00006,0.00007,0.00008,0.00009,0.00010,0.00011,0.00012,0.00013,0.00014,0.00015,0.00016,0.00018,0.00020,0.00025,0.00030,0.00040,0.00050,0.00075,0.001,0.0015,0.002,0.003,0.005,0.0075,0.01,0.015,0.02,0.03,0.04,0.05"
+$sizes = "0.00005,0.00006,0.00007,0.00008,0.00009,0.00010,0.00011,0.00012,0.00013,0.00014,0.00015,0.00016,0.00018,0.00020,0.00025,0.00030,0.00040,0.00050,0.00075,0.001,0.0015,0.002,0.003,0.005,0.0075,0.01,0.015,0.02,0.03,0.04,0.05,0.06,0.075,0.09"
 $runId = Get-Date -Format "yyyyMMdd_HHmmss"
 $logPath = Join-Path $PSScriptRoot "v256_rpcfast_atomic_loop_$runId.log"
 $localCandidate = Join-Path $PSScriptRoot $CandidateFile
 $startedAt = Get-Date
+
+$UsdFloorLamports = 0
+if ($MinProfitUsd -gt 0 -and $SolUsd -gt 0) {
+    $UsdFloorLamports = [int][Math]::Ceiling(([double]($MinProfitUsd / $SolUsd)) * 1000000000.0)
+}
+$ResolvedMinSendDeltaLamports = [Math]::Max([int]$MinSendDeltaLamports, [int]$UsdFloorLamports)
+$ResolvedProfitTargetLamports = [Math]::Max([int]$ProfitTargetLamports, [int]$ResolvedMinSendDeltaLamports)
 
 function Write-RunLog {
     param([string]$Message)
@@ -141,7 +150,7 @@ function Upload-Candidates {
 function Invoke-OneAtomicSend {
     $cmd = @"
 cd $RemoteProject
-timeout ${SendTimeoutSec}s /root/piggy/venv/bin/python -u v255_jito_inline_atomic.py --limit $SendLimit --max-per-mint $MaxPerMint --lut-json data/v244_static_lut.json --tip-ladder-lamports 0 --good-enough-tip-lamports 0 --good-enough-delta-lamports $ProfitTargetLamports --search-seconds $SearchSeconds --quote-cushions 1,2,4,8,10,16,24,32 --min-profit-lamports 1 --min-positive-delta-lamports $MinSendDeltaLamports --transport rpcfast_rpc --live --confirm-live I_ACCEPT_V255_JITO_INLINE_ATOMIC_RISK
+timeout ${SendTimeoutSec}s /root/piggy/venv/bin/python -u v255_jito_inline_atomic.py --limit $SendLimit --max-per-mint $MaxPerMint --lut-json data/v244_static_lut.json --tip-ladder-lamports 0 --good-enough-tip-lamports 0 --good-enough-delta-lamports $ResolvedProfitTargetLamports --search-seconds $SearchSeconds --quote-cushions 1,2,4,8,10,16,24,32 --min-profit-lamports 1 --min-positive-delta-lamports $ResolvedMinSendDeltaLamports --transport rpcfast_rpc --live --confirm-live I_ACCEPT_V255_JITO_INLINE_ATOMIC_RISK
 rc=`$?
 echo PGG2-V256-V255-EXIT=`$rc
 /root/piggy/venv/bin/python -u v246_wallet_check.py
@@ -161,7 +170,7 @@ exit 0
     return [pscustomobject]@{ Sent = $false; Pre = 0; Post = 0; Delta = 0; Output = $text }
 }
 
-Write-RunLog "PGG2-V256-LOOP-START target_wins=$TargetWins max_cycles=$MaxCycles max_minutes=$MaxMinutes profit_target_lamports=$ProfitTargetLamports min_send_delta_lamports=$MinSendDeltaLamports search_seconds=$SearchSeconds send_limit=$SendLimit"
+Write-RunLog "PGG2-V256-LOOP-START target_wins=$TargetWins max_cycles=$MaxCycles max_minutes=$MaxMinutes min_profit_usd=$MinProfitUsd sol_usd=$SolUsd usd_floor_lamports=$UsdFloorLamports profit_target_lamports=$ResolvedProfitTargetLamports min_send_delta_lamports=$ResolvedMinSendDeltaLamports search_seconds=$SearchSeconds send_limit=$SendLimit"
 Assert-RemoteClean
 $baseline = Get-WalletState
 $wins = 0
