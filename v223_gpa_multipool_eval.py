@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import http.client
 import json
 import os
 import time
@@ -65,6 +66,10 @@ def rpc_call(method: str, params: list[Any], timeout: float = 45.0) -> Any:
                 time.sleep(min(2.5, 0.2 * (attempt + 1)))
                 continue
             raise
+        except http.client.IncompleteRead as exc:
+            last = f"IncompleteRead:{len(exc.partial)}"
+            time.sleep(min(2.0, 0.2 * (attempt + 1)))
+            continue
     raise RuntimeError(f"rpc_call_rate_limited method={method} last={last}")
 
 
