@@ -31,8 +31,8 @@ $UsdFloorLamports = 0
 if ($MinProfitUsd -gt 0 -and $SolUsd -gt 0) {
     $UsdFloorLamports = [int][Math]::Ceiling(([double]($MinProfitUsd / $SolUsd)) * 1000000000.0)
 }
-$ResolvedMinSendDeltaLamports = [Math]::Max([int]$MinSendDeltaLamports, [int]$UsdFloorLamports)
-$ResolvedProfitTargetLamports = [Math]::Max([int]$ProfitTargetLamports, [int]$ResolvedMinSendDeltaLamports)
+$ResolvedMinSendDeltaLamports = [Math]::Max(1, [Math]::Max([int]$MinSendDeltaLamports, [int]$UsdFloorLamports))
+$ResolvedProfitTargetLamports = [Math]::Max([Math]::Max(1, [int]$ProfitTargetLamports), [int]$ResolvedMinSendDeltaLamports)
 
 function Write-RunLog {
     param([string]$Message)
@@ -150,7 +150,7 @@ function Upload-Candidates {
 function Invoke-OneAtomicSend {
     $cmd = @"
 cd $RemoteProject
-timeout ${SendTimeoutSec}s /root/piggy/venv/bin/python -u v255_jito_inline_atomic.py --limit $SendLimit --max-per-mint $MaxPerMint --lut-json data/v244_static_lut.json --tip-ladder-lamports 0 --good-enough-tip-lamports 0 --good-enough-delta-lamports $ResolvedProfitTargetLamports --search-seconds $SearchSeconds --quote-cushions 1,2,4,8,10,16,24,32 --min-profit-lamports 1 --min-positive-delta-lamports $ResolvedMinSendDeltaLamports --transport rpcfast_rpc --live --confirm-live I_ACCEPT_V255_JITO_INLINE_ATOMIC_RISK
+timeout ${SendTimeoutSec}s /root/piggy/venv/bin/python -u v255_jito_inline_atomic.py --limit $SendLimit --max-per-mint $MaxPerMint --lut-json data/v244_static_lut.json --tip-ladder-lamports 0 --good-enough-tip-lamports 0 --good-enough-delta-lamports $ResolvedProfitTargetLamports --good-enough-trade-delta-lamports $ResolvedProfitTargetLamports --search-seconds $SearchSeconds --quote-cushions 1,2,4,8,10,16,24,32 --min-profit-lamports 1 --min-positive-delta-lamports $ResolvedMinSendDeltaLamports --min-trade-delta-lamports $ResolvedMinSendDeltaLamports --transport rpcfast_rpc --live --confirm-live I_ACCEPT_V255_JITO_INLINE_ATOMIC_RISK
 rc=`$?
 echo PGG2-V256-V255-EXIT=`$rc
 /root/piggy/venv/bin/python -u v246_wallet_check.py

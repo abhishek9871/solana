@@ -402,16 +402,33 @@ def build_best(args: argparse.Namespace) -> dict[str, Any] | None:
                 log(f"PGG2-V255-SIM-BLOCK idx={idx} tip={tip} buf={buf} mint={mint_key[:4]}.. err={type(exc).__name__}:{str(exc)[:180]}")
                 continue
             delta = sim.get("wallet_delta_lamports")
+            projected_edge = int(meta.get("projected_edge_lamports") or 0)
+            base_tx_fee = int(os.environ.get("V255_BASE_TX_FEE_LAMPORTS", "5000") or 5000)
+            trade_delta_no_rent = projected_edge - base_tx_fee
+            rent_or_cleanup_delta = (
+                int(delta) - int(trade_delta_no_rent)
+                if delta is not None
+                else None
+            )
             log(
                 f"PGG2-V255-EXACT-SIM idx={idx} tip={tip} buf={buf} mint={mint_key[:4]}.. "
-                f"raw_edge={cand.get('edge_lamports')} projected={meta.get('projected_edge_lamports')} "
-                f"raw_len={raw_len} delta={delta} ok={int(bool(sim.get('ok')))} rpc={sim.get('rpc')} errs={sim.get('tx_errs')}"
+                f"raw_edge={cand.get('edge_lamports')} projected={projected_edge} "
+                f"raw_len={raw_len} delta={delta} trade_delta_no_rent={trade_delta_no_rent} "
+                f"rent_or_cleanup_delta={rent_or_cleanup_delta} ok={int(bool(sim.get('ok')))} "
+                f"rpc={sim.get('rpc')} errs={sim.get('tx_errs')}"
             )
-            if sim.get("ok") and delta is not None and int(delta) >= int(args.min_positive_delta_lamports):
+            if (
+                sim.get("ok")
+                and delta is not None
+                and int(delta) >= int(args.min_positive_delta_lamports)
+                and int(trade_delta_no_rent) >= int(args.min_trade_delta_lamports)
+            ):
                 candidate_best = {
                     "candidate": cand,
                     "meta": meta,
                     "sim": sim,
+                    "trade_delta_no_rent_lamports": int(trade_delta_no_rent),
+                    "rent_or_cleanup_delta_lamports": rent_or_cleanup_delta,
                     "buffer": buf,
                     "tip_lamports": tip,
                     "tx_b64": tx_b64,
@@ -422,20 +439,26 @@ def build_best(args: argparse.Namespace) -> dict[str, Any] | None:
                     or int(candidate_best["tip_lamports"]) > int(best["tip_lamports"])
                     or (
                         int(candidate_best["tip_lamports"]) == int(best["tip_lamports"])
-                        and int(candidate_best["sim"]["wallet_delta_lamports"])
-                        > int(best["sim"]["wallet_delta_lamports"])
+                        and int(candidate_best["trade_delta_no_rent_lamports"])
+                        > int(best["trade_delta_no_rent_lamports"])
                     )
                 ):
                     best = candidate_best
                     log(
                         f"PGG2-V255-BEST-UPDATE idx={idx} tip={tip} buf={buf} "
-                        f"mint={mint_key[:4]}.. delta={delta}"
+                        f"mint={mint_key[:4]}.. delta={delta} trade_delta_no_rent={trade_delta_no_rent}"
                     )
-                    if int(tip) >= good_enough_tip and int(delta) >= good_enough_delta:
+                    if (
+                        int(tip) >= good_enough_tip
+                        and int(delta) >= good_enough_delta
+                        and int(trade_delta_no_rent) >= int(args.good_enough_trade_delta_lamports)
+                    ):
                         log(
                             f"PGG2-V255-BEST-GOOD-ENOUGH idx={idx} tip={tip} "
                             f"tip_threshold={good_enough_tip} delta={delta} "
-                            f"delta_threshold={good_enough_delta}"
+                            f"delta_threshold={good_enough_delta} "
+                            f"trade_delta_no_rent={trade_delta_no_rent} "
+                            f"trade_delta_threshold={int(args.good_enough_trade_delta_lamports)}"
                         )
                         return best
                 break
@@ -468,6 +491,18 @@ def main() -> int:
     ap.add_argument("--search-seconds", type=float, default=0.0)
     ap.add_argument("--min-profit-lamports", type=int, default=1)
     ap.add_argument("--min-positive-delta-lamports", type=int, default=1)
+    ap.add_argument(
+        "--min-trade-delta-lamports",
+        type=int,
+        default=0,
+        help="Minimum route trade delta after base tx fee, excluding ATA rent/cleanup recovery.",
+    )
+    ap.add_argument(
+        "--good-enough-trade-delta-lamports",
+        type=int,
+        default=0,
+        help="Search-stop threshold for no-rent route trade delta.",
+    )
     ap.add_argument("--buy-mode", choices=["exact_quote_in", "exact_base_out"], default="exact_base_out")
     ap.add_argument("--quote-cushion-lamports", type=int, default=10)
     ap.add_argument("--quote-cushions", default="1,2,3,4,6,8,10,12,16,24,32")
@@ -486,6 +521,10 @@ def main() -> int:
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--confirm-live", default="")
     args = ap.parse_args()
+    if int(args.min_trade_delta_lamports) <= 0:
+        args.min_trade_delta_lamports = int(args.min_positive_delta_lamports)
+    if int(args.good_enough_trade_delta_lamports) <= 0:
+        args.good_enough_trade_delta_lamports = int(args.good_enough_delta_lamports)
 
     setup_env(args)
     pre = int(rpc_call(READ_RPC, "getBalance", [WALLET, {"commitment": "processed"}])["value"])
