@@ -3,9 +3,11 @@ param(
     [int]$MaxCycles = 30,
     [int]$MaxMinutes = 60,
     [int]$ScanTimeoutSec = 115,
-    [int]$SendTimeoutSec = 65,
-    [int]$SendLimit = 35,
+    [int]$SendTimeoutSec = 95,
+    [int]$SearchSeconds = 70,
+    [int]$SendLimit = 80,
     [int]$MaxPerMint = 4,
+    [int]$ProfitTargetLamports = 3000,
     [string]$Remote = "root@87.99.151.70",
     [string]$SshKey = "$env:USERPROFILE\.ssh\hetzner_sniper",
     [string]$WslDistro = "Ubuntu-24.04",
@@ -138,7 +140,7 @@ function Upload-Candidates {
 function Invoke-OneAtomicSend {
     $cmd = @"
 cd $RemoteProject
-timeout ${SendTimeoutSec}s /root/piggy/venv/bin/python -u v255_jito_inline_atomic.py --limit $SendLimit --max-per-mint $MaxPerMint --lut-json '' --tip-ladder-lamports 0 --good-enough-tip-lamports 0 --quote-cushions 1,2,4,8,10,16,24,32 --min-profit-lamports 1 --min-positive-delta-lamports 1 --transport rpcfast_rpc --live --confirm-live I_ACCEPT_V255_JITO_INLINE_ATOMIC_RISK
+timeout ${SendTimeoutSec}s /root/piggy/venv/bin/python -u v255_jito_inline_atomic.py --limit $SendLimit --max-per-mint $MaxPerMint --lut-json '' --tip-ladder-lamports 0 --good-enough-tip-lamports 0 --good-enough-delta-lamports $ProfitTargetLamports --search-seconds $SearchSeconds --quote-cushions 1,2,4,8,10,16,24,32 --min-profit-lamports 1 --min-positive-delta-lamports 1 --transport rpcfast_rpc --live --confirm-live I_ACCEPT_V255_JITO_INLINE_ATOMIC_RISK
 rc=`$?
 echo PGG2-V256-V255-EXIT=`$rc
 /root/piggy/venv/bin/python -u v246_wallet_check.py
@@ -158,7 +160,7 @@ exit 0
     return [pscustomobject]@{ Sent = $false; Pre = 0; Post = 0; Delta = 0; Output = $text }
 }
 
-Write-RunLog "PGG2-V256-LOOP-START target_wins=$TargetWins max_cycles=$MaxCycles max_minutes=$MaxMinutes"
+Write-RunLog "PGG2-V256-LOOP-START target_wins=$TargetWins max_cycles=$MaxCycles max_minutes=$MaxMinutes profit_target_lamports=$ProfitTargetLamports search_seconds=$SearchSeconds send_limit=$SendLimit"
 Assert-RemoteClean
 $baseline = Get-WalletState
 $wins = 0

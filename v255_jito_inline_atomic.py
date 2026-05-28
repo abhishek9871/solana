@@ -348,7 +348,19 @@ def build_best(args: argparse.Namespace) -> dict[str, Any] | None:
     structural_bad: dict[str, str] = {}
     best: dict[str, Any] | None = None
     good_enough_tip = int(args.good_enough_tip_lamports)
+    good_enough_delta = int(args.good_enough_delta_lamports)
+    deadline = time.time() + float(args.search_seconds) if float(args.search_seconds) > 0 else 0.0
     for idx, cand in enumerate(cands, 1):
+        if deadline and time.time() >= deadline:
+            if best is not None:
+                log(
+                    "PGG2-V255-SEARCH-DEADLINE-USE-BEST "
+                    f"idx={idx} delta={best['sim'].get('wallet_delta_lamports')} "
+                    f"target={good_enough_delta}"
+                )
+                return best
+            log(f"PGG2-V255-SEARCH-DEADLINE-NO-BEST idx={idx} target={good_enough_delta}")
+            break
         mint_key = str(cand.get("mint") or "")
         if mint_key in structural_bad:
             log(f"PGG2-V255-MINT-SKIP idx={idx} mint={mint_key[:4]}.. reason={structural_bad[mint_key]}")
@@ -419,10 +431,11 @@ def build_best(args: argparse.Namespace) -> dict[str, Any] | None:
                         f"PGG2-V255-BEST-UPDATE idx={idx} tip={tip} buf={buf} "
                         f"mint={mint_key[:4]}.. delta={delta}"
                     )
-                    if int(tip) >= good_enough_tip:
+                    if int(tip) >= good_enough_tip and int(delta) >= good_enough_delta:
                         log(
                             f"PGG2-V255-BEST-GOOD-ENOUGH idx={idx} tip={tip} "
-                            f"threshold={good_enough_tip}"
+                            f"tip_threshold={good_enough_tip} delta={delta} "
+                            f"delta_threshold={good_enough_delta}"
                         )
                         return best
                 break
@@ -451,6 +464,8 @@ def main() -> int:
     ap.add_argument("--tip-lamports", type=int, default=1000)
     ap.add_argument("--tip-ladder-lamports", default="4000,3500,3000,2500,2000,1500,1000")
     ap.add_argument("--good-enough-tip-lamports", type=int, default=4500)
+    ap.add_argument("--good-enough-delta-lamports", type=int, default=0)
+    ap.add_argument("--search-seconds", type=float, default=0.0)
     ap.add_argument("--min-profit-lamports", type=int, default=1)
     ap.add_argument("--min-positive-delta-lamports", type=int, default=1)
     ap.add_argument("--buy-mode", choices=["exact_quote_in", "exact_base_out"], default="exact_base_out")

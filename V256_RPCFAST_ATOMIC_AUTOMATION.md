@@ -47,3 +47,26 @@ The first V256 smoke run passed:
 - Nonzero tokens: 0
 
 V256 also patches `v246_wallet_check.py` to avoid public RPC 429 failures by using SolanaVibeStation by default and retrying transient 429s.
+
+## Profit Selector Upgrade
+
+The automation now asks V255 to keep scanning past the first tiny positive route until either:
+
+- an exact-positive route reaches the configured profit target, or
+- the internal search window expires, in which case V255 uses the best exact-positive route found so far.
+
+Default:
+
+```powershell
+-ProfitTargetLamports 3000 -SearchSeconds 70 -SendLimit 80
+```
+
+Validation:
+
+- Target wins: 1
+- Wins: 1
+- Net wallet delta: +3409 lamports
+- Token accounts: 0
+- Nonzero tokens: 0
+
+This keeps the original safety model intact while avoiding unnecessary penny-sized first-positive sends when a better exact-positive route is available in the same fresh scan.
