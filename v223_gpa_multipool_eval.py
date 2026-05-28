@@ -22,6 +22,7 @@ from solders.pubkey import Pubkey
 from pgg2_v219_atomic_route_dislocation_scanner import (
     LAMPORTS_PER_SOL,
     PUMP_AMM_PROGRAM,
+    PUMP_PROGRAM,
     WSOL_MINT,
     Pool,
     edge_lamports,
@@ -33,6 +34,13 @@ from pgg2_v219_atomic_route_dislocation_scanner import (
     rpc_url,
     short,
 )
+
+
+PUMP_FEE_PROGRAM = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+PUMP_AMM_FEE_CONFIG = Pubkey.find_program_address(
+    [b"fee_config", bytes(PUMP_AMM_PROGRAM)], PUMP_FEE_PROGRAM
+)[0]
+DEFAULT_PUBKEY = str(Pubkey.default())
 
 
 def rpc_call(method: str, params: list[Any], timeout: float = 45.0) -> Any:
@@ -80,15 +88,112 @@ def parse_pool_from_row(row: dict[str, Any]) -> Pool | None:
 
 
 def token_balance_from_account(row: dict[str, Any] | None) -> int:
+    raw = account_data_from_value(row)
+    return int.from_bytes(raw[64:72], "little") if len(raw) >= 72 else 0
+
+
+def account_data_from_value(row: dict[str, Any] | None) -> bytes:
     if not row:
-        return 0
+        return b""
     data = row.get("data") or []
     if isinstance(data, list):
         data = data[0]
     if not isinstance(data, str):
-        return 0
-    raw = base64.b64decode(data)
-    return int.from_bytes(raw[64:72], "little") if len(raw) >= 72 else 0
+        return b""
+    return base64.b64decode(data)
+
+
+def ceil_div(a: int, b: int) -> int:
+    return (int(a) + int(b) - 1) // int(b)
+
+
+def fees_from_config_data(data: bytes) -> tuple[tuple[int, int, int], list[tuple[int, tuple[int, int, int]]]]:
+    if len(data) < 69:
+        raise RuntimeError(f"fee_config_too_short len={len(data)}")
+    off = 8
+    off += 1  # bump
+    off += 32  # admin
+
+    def take_u64() -> int:
+        nonlocal off
+        v = int.from_bytes(data[off:off + 8], "little")
+        off += 8
+        return v
+
+    def take_u128() -> int:
+        nonlocal off
+        v = int.from_bytes(data[off:off + 16], "little")
+        off += 16
+        return v
+
+    flat = (take_u64(), take_u64(), take_u64())
+    n = int.from_bytes(data[off:off + 4], "little")
+    off += 4
+    tiers: list[tuple[int, tuple[int, int, int]]] = []
+    for _ in range(max(0, min(n, 128))):
+        if off + 40 > len(data):
+            break
+        threshold = take_u128()
+        fees = (take_u64(), take_u64(), take_u64())
+        tiers.append((threshold, fees))
+    return flat, tiers
+
+
+def effective_pumpswap_fees(
+    *,
+    mint: str,
+    pool: Pool,
+    mint_supply: int,
+    flat_fees: tuple[int, int, int],
+    tiers: list[tuple[int, tuple[int, int, int]]],
+    fallback: Any,
+) -> tuple[int, int, int]:
+    try:
+        mint_pk = Pubkey.from_string(mint)
+        pool_authority = Pubkey.find_program_address([b"pool-authority", bytes(mint_pk)], PUMP_PROGRAM)[0]
+        if str(pool.creator) != str(pool_authority):
+            fees = flat_fees
+        elif tiers:
+            market_cap = int(pool.quote_reserve) * int(mint_supply) // max(int(pool.base_reserve), 1)
+            fees = tiers[0][1]
+            for threshold, tier_fees in reversed(tiers):
+                if market_cap >= int(threshold):
+                    fees = tier_fees
+                    break
+        else:
+            fees = flat_fees
+        lp_bps, protocol_bps, creator_bps = (int(fees[0]), int(fees[1]), int(fees[2]))
+        if str(pool.coin_creator) == DEFAULT_PUBKEY:
+            creator_bps = 0
+        return lp_bps, protocol_bps, creator_bps
+    except Exception:
+        creator_bps = 0 if str(pool.coin_creator) == DEFAULT_PUBKEY else int(fallback.creator_fee_bps)
+        return int(fallback.lp_fee_bps), int(fallback.protocol_fee_bps), int(creator_bps)
+
+
+def pumpswap_buy_tokens_current(size: int, pool: Pool, fees: tuple[int, int, int]) -> int:
+    total = int(fees[0]) + int(fees[1]) + int(fees[2])
+    effective_quote = int(size) * 10_000 // max(10_000 + total, 1)
+    fee = (
+        ceil_div(effective_quote * int(fees[0]), 10_000)
+        + ceil_div(effective_quote * int(fees[1]), 10_000)
+        + ceil_div(effective_quote * int(fees[2]), 10_000)
+    )
+    total_with_fees = int(effective_quote) + int(fee)
+    if total_with_fees > int(size):
+        effective_quote = max(0, int(effective_quote) - (total_with_fees - int(size)))
+    input_amount = max(0, int(effective_quote) - 1)
+    return max(0, int(input_amount) * int(pool.base_reserve) // max(int(pool.quote_reserve) + int(input_amount), 1))
+
+
+def pumpswap_sell_lamports_current(tokens: int, pool: Pool, fees: tuple[int, int, int]) -> int:
+    gross = int(tokens) * int(pool.quote_reserve) // max(int(pool.base_reserve) + int(tokens), 1)
+    fee = (
+        ceil_div(gross * int(fees[0]), 10_000)
+        + ceil_div(gross * int(fees[1]), 10_000)
+        + ceil_div(gross * int(fees[2]), 10_000)
+    )
+    return max(0, int(gross) - int(fee))
 
 
 def chunks(xs: list[str], n: int):
@@ -96,11 +201,85 @@ def chunks(xs: list[str], n: int):
         yield xs[i : i + n]
 
 
+def parse_sizes_sol(raw: str) -> list[int]:
+    return [int(float(x) * LAMPORTS_PER_SOL) for x in raw.split(",") if x.strip()]
+
+
+def route_edge_for_size(
+    *,
+    size: int,
+    buy_pool: Pool,
+    sell_pool: Pool,
+    buy_fees: tuple[int, int, int],
+    sell_fees: tuple[int, int, int],
+    fee_buffer_lamports: int,
+    projection_buffer_lamports: int,
+) -> tuple[int, int, int]:
+    tokens = pumpswap_buy_tokens_current(size, buy_pool, buy_fees)
+    sell_out = pumpswap_sell_lamports_current(tokens, sell_pool, sell_fees)
+    edge = edge_lamports(sell_out, size, fee_buffer_lamports, projection_buffer_lamports)
+    return tokens, sell_out, edge
+
+
+def optimized_route_sizes(
+    *,
+    base_sizes: list[int],
+    buy_pool: Pool,
+    sell_pool: Pool,
+    buy_fees: tuple[int, int, int],
+    sell_fees: tuple[int, int, int],
+    fee_buffer_lamports: int,
+    projection_buffer_lamports: int,
+    auto_min_size: int,
+    auto_max_size: int,
+    neighborhood_bps: list[int],
+) -> list[int]:
+    sizes = {int(x) for x in base_sizes if int(x) > 0}
+    lo = max(1, int(auto_min_size))
+    hi = max(lo, int(auto_max_size))
+    if hi <= lo:
+        return sorted(sizes)
+
+    def score(amount: int) -> int:
+        return route_edge_for_size(
+            size=max(1, int(amount)),
+            buy_pool=buy_pool,
+            sell_pool=sell_pool,
+            buy_fees=buy_fees,
+            sell_fees=sell_fees,
+            fee_buffer_lamports=fee_buffer_lamports,
+            projection_buffer_lamports=projection_buffer_lamports,
+        )[2]
+
+    left, right = lo, hi
+    # PumpSwap two-pool arbitrage is effectively unimodal over useful sizes.
+    # Ternary search finds the peak instead of relying on a lucky static grid.
+    while right - left > 24:
+        m1 = left + (right - left) // 3
+        m2 = right - (right - left) // 3
+        if score(m1) < score(m2):
+            left = m1 + 1
+        else:
+            right = m2 - 1
+
+    best = max(range(left, right + 1), key=score)
+    sizes.add(best)
+    for bps in neighborhood_bps:
+        delta = max(1, best * int(bps) // 10_000)
+        sizes.add(max(lo, best - delta))
+        sizes.add(min(hi, best + delta))
+    return sorted(s for s in sizes if lo <= s <= hi)
+
+
 def main() -> int:
     load_env()
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-mints", type=int, default=int(os.environ.get("V223_MAX_MINTS", "250")))
     ap.add_argument("--sizes-sol", default=os.environ.get("V223_SIZES_SOL", "0.001,0.0015,0.002,0.003,0.005"))
+    ap.add_argument("--auto-optimize-sizes", type=int, default=int(os.environ.get("V223_AUTO_OPTIMIZE_SIZES", "0")))
+    ap.add_argument("--auto-min-size-sol", default=os.environ.get("V223_AUTO_MIN_SIZE_SOL", "0.00005"))
+    ap.add_argument("--auto-max-size-sol", default=os.environ.get("V223_AUTO_MAX_SIZE_SOL", ""))
+    ap.add_argument("--auto-neighborhood-bps", default=os.environ.get("V223_AUTO_NEIGHBORHOOD_BPS", "25,50,100,200,500,1000"))
     ap.add_argument("--fee-buffer-lamports", type=int, default=int(os.environ.get("V223_FEE_BUFFER_LAMPORTS", "90000")))
     ap.add_argument("--projection-buffer-lamports", type=int, default=int(os.environ.get("V223_PROJECTION_BUFFER_LAMPORTS", "30000")))
     ap.add_argument("--min-edge-lamports", type=int, default=int(os.environ.get("V223_MIN_EDGE_LAMPORTS", "30000")))
@@ -109,7 +288,16 @@ def main() -> int:
     args = ap.parse_args()
 
     started = time.time()
-    sizes = [int(float(x) * LAMPORTS_PER_SOL) for x in args.sizes_sol.split(",") if x.strip()]
+    sizes = parse_sizes_sol(args.sizes_sol)
+    auto_min_size = int(float(args.auto_min_size_sol) * LAMPORTS_PER_SOL)
+    auto_max_size = (
+        int(float(args.auto_max_size_sol) * LAMPORTS_PER_SOL)
+        if str(args.auto_max_size_sol).strip()
+        else max(sizes or [1])
+    )
+    auto_neighborhood_bps = [
+        int(x) for x in str(args.auto_neighborhood_bps).split(",") if str(x).strip()
+    ]
     fees = parse_pumpswap_fees()
     out_path = Path(args.out_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +351,54 @@ def main() -> int:
         p.base_reserve = int(balances.get(p.base_token_account, 0))
         p.quote_reserve = int(balances.get(p.quote_token_account, 0))
 
+    mint_supply: dict[str, int] = {}
+    for batch in chunks([m for m, _ps in selected], int(os.environ.get("V223_GETMULTIPLE_BATCH", "75") or 75)):
+        res = rpc_call(
+            "getMultipleAccounts",
+            [batch, {"encoding": "base64", "commitment": "processed"}],
+            timeout=20.0,
+        )
+        vals = (res or {}).get("value") or []
+        for mint, val in zip(batch, vals):
+            raw = account_data_from_value(val)
+            mint_supply[mint] = int.from_bytes(raw[36:44], "little") if len(raw) >= 44 else 0
+        time.sleep(float(os.environ.get("V223_BATCH_SLEEP_SEC", "0.035") or 0.035))
+
+    fee_config_ok = False
+    flat_fees = (int(fees.lp_fee_bps), int(fees.protocol_fee_bps), int(fees.creator_fee_bps))
+    fee_tiers: list[tuple[int, tuple[int, int, int]]] = []
+    try:
+        res = rpc_call(
+            "getAccountInfo",
+            [str(PUMP_AMM_FEE_CONFIG), {"encoding": "base64", "commitment": "processed"}],
+            timeout=8.0,
+        )
+        raw = account_data_from_value((res or {}).get("value"))
+        flat_fees, fee_tiers = fees_from_config_data(raw)
+        fee_config_ok = True
+        log(
+            f"PGG2-V223-FEE-CONFIG ok=1 flat={flat_fees[0]},{flat_fees[1]},{flat_fees[2]} "
+            f"tiers={len(fee_tiers)}"
+        )
+    except Exception as exc:
+        log(
+            f"PGG2-V223-FEE-CONFIG ok=0 fallback={fees.lp_fee_bps},{fees.protocol_fee_bps},{fees.creator_fee_bps} "
+            f"err={type(exc).__name__}:{str(exc)[:80]}"
+        )
+
+    pool_fees: dict[str, tuple[int, int, int]] = {}
+    for mint, pools in selected:
+        supply = int(mint_supply.get(mint, 0))
+        for pool in pools:
+            pool_fees[pool.key] = effective_pumpswap_fees(
+                mint=mint,
+                pool=pool,
+                mint_supply=supply,
+                flat_fees=flat_fees,
+                tiers=fee_tiers if fee_config_ok else [],
+                fallback=fees,
+            )
+
     checks = 0
     passes = 0
     best_global: dict[str, Any] | None = None
@@ -179,14 +415,39 @@ def main() -> int:
                 for sell_pool in usable:
                     if buy_pool.key == sell_pool.key:
                         continue
-                    for size in sizes:
-                        tokens = pumpswap_buy_tokens(size, buy_pool, fees)
-                        sell_out = pumpswap_sell_lamports(tokens, sell_pool, fees)
-                        edge = edge_lamports(
-                            sell_out,
-                            size,
-                            int(args.fee_buffer_lamports),
-                            int(args.projection_buffer_lamports),
+                    buy_fees = pool_fees.get(
+                        buy_pool.key,
+                        (int(fees.lp_fee_bps), int(fees.protocol_fee_bps), int(fees.creator_fee_bps)),
+                    )
+                    sell_fees = pool_fees.get(
+                        sell_pool.key,
+                        (int(fees.lp_fee_bps), int(fees.protocol_fee_bps), int(fees.creator_fee_bps)),
+                    )
+                    pair_sizes = (
+                        optimized_route_sizes(
+                            base_sizes=sizes,
+                            buy_pool=buy_pool,
+                            sell_pool=sell_pool,
+                            buy_fees=buy_fees,
+                            sell_fees=sell_fees,
+                            fee_buffer_lamports=int(args.fee_buffer_lamports),
+                            projection_buffer_lamports=int(args.projection_buffer_lamports),
+                            auto_min_size=auto_min_size,
+                            auto_max_size=auto_max_size,
+                            neighborhood_bps=auto_neighborhood_bps,
+                        )
+                        if int(args.auto_optimize_sizes)
+                        else sizes
+                    )
+                    for size in pair_sizes:
+                        tokens, sell_out, edge = route_edge_for_size(
+                            size=size,
+                            buy_pool=buy_pool,
+                            sell_pool=sell_pool,
+                            buy_fees=buy_fees,
+                            sell_fees=sell_fees,
+                            fee_buffer_lamports=int(args.fee_buffer_lamports),
+                            projection_buffer_lamports=int(args.projection_buffer_lamports),
                         )
                         checks += 1
                         row = {
@@ -203,6 +464,10 @@ def main() -> int:
                             "buy_pool_quote": buy_pool.quote_reserve,
                             "sell_pool_base": sell_pool.base_reserve,
                             "sell_pool_quote": sell_pool.quote_reserve,
+                            "buy_fee_bps": sum(int(x) for x in buy_fees),
+                            "sell_fee_bps": sum(int(x) for x in sell_fees),
+                            "fee_config_ok": bool(fee_config_ok),
+                            "auto_optimized_sizes": bool(int(args.auto_optimize_sizes)),
                             "passed": bool(edge >= int(args.min_edge_lamports)),
                         }
                         if best_global is None or edge > int(best_global["edge_lamports"]):

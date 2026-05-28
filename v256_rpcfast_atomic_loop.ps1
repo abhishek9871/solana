@@ -117,7 +117,7 @@ set -e
 cd $WslProject
 source ~/pgg2-local-venv/bin/activate
 rm -f data/v223_v246_broad.jsonl data/v256_scan_last.log
-timeout ${ScanTimeoutSec}s python -u v223_gpa_multipool_eval.py --max-mints 500 --sizes-sol '$sizes' --fee-buffer-lamports 0 --projection-buffer-lamports 0 --min-edge-lamports 1 --min-quote-reserve-lamports 0 --out-jsonl /home/vasurajput1996/pgg2-local/data/v223_v246_broad.jsonl > data/v256_scan_last.log 2>&1 || true
+timeout ${ScanTimeoutSec}s python -u v223_gpa_multipool_eval.py --max-mints 500 --sizes-sol '$sizes' --auto-optimize-sizes 1 --auto-min-size-sol 0.00005 --fee-buffer-lamports 0 --projection-buffer-lamports 0 --min-edge-lamports 1 --min-quote-reserve-lamports 0 --out-jsonl /home/vasurajput1996/pgg2-local/data/v223_v246_broad.jsonl > data/v256_scan_last.log 2>&1 || true
 tail -8 data/v256_scan_last.log || true
 if [ -s /home/vasurajput1996/pgg2-local/data/v223_v246_broad.jsonl ]; then
   cp /home/vasurajput1996/pgg2-local/data/v223_v246_broad.jsonl /mnt/c/Users/VASU/Desktop/tradingMahadevjiwin/$CandidateFile
