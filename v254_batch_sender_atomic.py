@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""V254 exact-positive batched PumpSwap single-transaction Sender runner.
+"""V254 exact-positive batched PumpSwap single-transaction runner.
 
 This is a frequency patch for V252/V253: several PumpSwap pool-dislocation
 routes can be just below the fixed one-transaction cost by themselves. V254
 tries to pack two independent buy->sell atomic routes into one transaction so
-they share one base fee and one 5000-lamport Sender tip.
+they share one base fee. Live sends are opt-in only.
 
 It still fails closed:
 - no send unless exact simulateTransaction payer wallet delta is positive;
@@ -22,6 +22,7 @@ import struct
 import time
 import urllib.error
 import urllib.request
+import argparse
 from typing import Any
 
 from solders.instruction import AccountMeta, Instruction
@@ -61,6 +62,7 @@ SENDER_URL = "https://sender.helius-rpc.com/fast?swqos_only=true"
 WALLET = "Cw4G8XLcw89VJp734U6noPpfQbTosvQQuaDKu9jdL7M7"
 HELIUS_TIP_ACCOUNT = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE"
 MAX_TX_RAW_LEN = 1232
+LIVE_CONFIRMATION = "I_ACCEPT_V254_BATCH_ATOMIC_RISK"
 
 
 def rpc(url: str, method: str, params: list[Any], timeout: float = 20.0) -> Any:
@@ -82,7 +84,7 @@ def rpc(url: str, method: str, params: list[Any], timeout: float = 20.0) -> Any:
     return out.get("result")
 
 
-def _setup_env() -> None:
+def _setup_env(*, tip_account: str = HELIUS_TIP_ACCOUNT) -> None:
     _load_env()
     os.environ["HELIUS_RPC_URL"] = READ_RPC
     os.environ["SOLANA_RPC_URL"] = READ_RPC
@@ -92,7 +94,7 @@ def _setup_env() -> None:
     os.environ["V224_ADDRESS_LOOKUP_TABLE_JSON"] = "/root/piggy/data/v244_static_lut.json"
     os.environ["PGG2_DIRECT_TRACK_VOLUME"] = "0"
     os.environ["V224_CLOSE_USER_VOLUME"] = "1"
-    os.environ["PGG2_JITO_TIP_ACCOUNT"] = HELIUS_TIP_ACCOUNT
+    os.environ["PGG2_JITO_TIP_ACCOUNT"] = tip_account
 
 
 def _fee_accounts(broker: Any, global_cfg: Any, pool: Any) -> tuple[Pubkey, Pubkey, Pubkey, Pubkey]:
@@ -403,7 +405,84 @@ def candidate_batches(rows: list[dict[str, Any]], max_rows: int) -> list[list[di
     return out
 
 
+def _rpcfast_url() -> str:
+    _load_env()
+    explicit = os.environ.get("RPCFAST_RPC_URL", "").strip()
+    if explicit:
+        return explicit
+    key = os.environ.get("RPCFAST_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("missing_rpcfast_api_key")
+    return "https://solana-rpc.rpcfast.com/?api_key=" + key
+
+
+def _send_rpcfast(tx_b64: str) -> str:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000) & 0xFFFF,
+        "method": "sendTransaction",
+        "params": [
+            tx_b64,
+            {
+                "encoding": "base64",
+                "skipPreflight": True,
+                "maxRetries": 0,
+                "preflightCommitment": "processed",
+            },
+        ],
+    }
+    req = urllib.request.Request(
+        _rpcfast_url(),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    out = json.loads(urllib.request.urlopen(req, timeout=8).read().decode("utf-8"))
+    print(f"PGG2-V254-BATCH-RPCFAST-SEND-RAW {out}", flush=True)
+    if out.get("error"):
+        raise RuntimeError(out["error"])
+    return str(out.get("result") or "")
+
+
+def _send_sender(tx_b64: str) -> str:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000) & 0xFFFF,
+        "method": "sendTransaction",
+        "params": [
+            tx_b64,
+            {"encoding": "base64", "skipPreflight": True, "maxRetries": 0},
+        ],
+    }
+    req = urllib.request.Request(
+        SENDER_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        out = json.loads(urllib.request.urlopen(req, timeout=8).read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:300]
+        print(f"PGG2-V254-BATCH-SEND-HTTP-ERR code={exc.code} body={body}", flush=True)
+        raise
+    print(f"PGG2-V254-BATCH-SENDER-SEND-RAW {out}", flush=True)
+    if out.get("error"):
+        raise RuntimeError(out["error"])
+    return str(out.get("result") or "")
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--candidates-jsonl", default="/root/piggy/data/v223_v246_broad.jsonl")
+    ap.add_argument("--scan-limit", type=int, default=int(os.environ.get("V254_BATCH_SCAN_LIMIT", "80") or "80"))
+    ap.add_argument("--combo-limit", type=int, default=int(os.environ.get("V254_BATCH_COMBO_LIMIT", "60") or "60"))
+    ap.add_argument("--min-projected-edge-lamports", type=int, default=int(os.environ.get("V254_MIN_PROJECTED_EDGE_LAMPORTS", "1") or "1"))
+    ap.add_argument("--min-positive-delta-lamports", type=int, default=int(os.environ.get("V254_MIN_POSITIVE_DELTA_LAMPORTS", "1") or "1"))
+    ap.add_argument("--tip-lamports", type=int, default=int(os.environ.get("V254_TIP_LAMPORTS", "0") or "0"))
+    ap.add_argument("--transport", choices=["rpcfast_rpc", "helius_sender_swqos"], default=os.environ.get("V254_TRANSPORT", "rpcfast_rpc"))
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--confirm-live", default="")
+    args = ap.parse_args()
+
     _setup_env()
     pre = int(rpc(READ_RPC, "getBalance", [WALLET, {"commitment": "processed"}])["value"])
     print(f"PGG2-V254-BATCH-PREFLIGHT-WALLET pre_lamports={pre}", flush=True)
@@ -414,16 +493,17 @@ def main() -> int:
 
     rows = [
         json.loads(line)
-        for line in open("/root/piggy/data/v223_v246_broad.jsonl", encoding="utf-8")
+        for line in open(args.candidates_jsonl, encoding="utf-8")
         if line.strip()
     ]
     rows.sort(key=lambda row: int(row.get("edge_lamports", 0)), reverse=True)
-    scan_limit = max(2, int(os.environ.get("V254_BATCH_SCAN_LIMIT", "80") or "80"))
-    combo_limit = max(1, int(os.environ.get("V254_BATCH_COMBO_LIMIT", "60") or "60"))
-    min_projected = int(os.environ.get("V254_MIN_PROJECTED_EDGE_LAMPORTS", "7000") or "7000")
+    scan_limit = max(2, int(args.scan_limit))
+    combo_limit = max(1, int(args.combo_limit))
+    min_projected = int(args.min_projected_edge_lamports)
     print(
         f"PGG2-V254-BATCH-CONFIG scan_limit={scan_limit} combo_limit={combo_limit} "
-        f"min_projected={min_projected}",
+        f"min_projected={min_projected} tip_lamports={args.tip_lamports} "
+        f"transport={args.transport} live={int(args.live)}",
         flush=True,
     )
 
@@ -436,7 +516,7 @@ def main() -> int:
                 broker=broker,
                 cands=batch,
                 min_profit_lamports_per_leg=1,
-                tip_lamports=5000,
+                tip_lamports=int(args.tip_lamports),
             )
         except Exception as exc:
             print(
@@ -466,7 +546,7 @@ def main() -> int:
             f"delta={sim['delta']} err={sim['err']} rpc={sim['rpc']}",
             flush=True,
         )
-        if sim["err"] is None and int(sim["delta"]) > 0:
+        if sim["err"] is None and int(sim["delta"]) >= int(args.min_positive_delta_lamports):
             best = (meta, sim)
             break
     if not best:
@@ -479,33 +559,18 @@ def main() -> int:
     print(
         f"PGG2-V254-BATCH-EXACT-POSITIVE legs={meta['leg_count']} "
         f"delta={sim['delta']} projected={meta['projected_edge_lamports']} "
-        f"sig={sig_preview} endpoint=sender_swqos",
+        f"sig={sig_preview} transport={args.transport}",
         flush=True,
     )
-    payload = {
-        "jsonrpc": "2.0",
-        "id": int(time.time() * 1000) & 0xFFFF,
-        "method": "sendTransaction",
-        "params": [
-            tx_b64,
-            {"encoding": "base64", "skipPreflight": True, "maxRetries": 0},
-        ],
-    }
-    req = urllib.request.Request(
-        SENDER_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        out = json.loads(urllib.request.urlopen(req, timeout=8).read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:300]
-        print(f"PGG2-V254-BATCH-SEND-HTTP-ERR code={exc.code} body={body}", flush=True)
-        raise
-    print(f"PGG2-V254-BATCH-SEND-RAW {out}", flush=True)
-    if out.get("error"):
-        raise RuntimeError(out["error"])
-    sig = str(out.get("result") or "")
+    if not args.live:
+        print("PGG2-V254-BATCH-DRYRUN-NO-SEND", flush=True)
+        return 0
+    if args.confirm_live != LIVE_CONFIRMATION:
+        raise RuntimeError("missing_live_confirmation")
+    if args.transport == "rpcfast_rpc":
+        sig = _send_rpcfast(tx_b64)
+    else:
+        sig = _send_sender(tx_b64)
     print(f"PGG2-V254-BATCH-SEND sig={sig}", flush=True)
 
     status = None
