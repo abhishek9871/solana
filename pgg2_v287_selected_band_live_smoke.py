@@ -335,6 +335,8 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_FRESH_IMPULSE_PREV_CARRY_MIN_SOL", "2.00")
     os.environ.setdefault("V287_ALLOW_PREPLAN_REARM_CREDIT", "1")
     os.environ.setdefault("V287_PREPLAN_REARM_CREDIT_MAX_WAIT_MS", "850")
+    os.environ.setdefault("V287_ALLOW_FROZEN_INBAND_REARM_AFTER_PLAN_READY", "1")
+    os.environ.setdefault("V287_FROZEN_INBAND_REARM_MAX_AGE_MS", "850")
     os.environ.setdefault("V287_VERIFIED_CONTINUATION_MIN_REARM_DELAY_MS", "75")
     os.environ.setdefault("V287_VERIFIED_CONTINUATION_MAX_REARM_DELAY_MS", "350")
     os.environ.setdefault("V287_VERIFIED_STRONG_FRESH_REARM_MIN_SOL", "3.80")
@@ -1787,10 +1789,57 @@ def main() -> int:
                     cand_rearm_min_lamports = int(cand.get("rearm_min_lamports") or int(float(args.rearm_min_sol) * LAMPORTS_PER_SOL))
                     cand_rearm_max_lamports = int(cand.get("rearm_max_lamports") or 0)
                     if cand_rearm_max_lamports > 0 and cand["pre_entry_buy_lamports"] > cand_rearm_max_lamports:
+                        frozen_rearm_lamports = int(
+                            cand.get("last_inband_rearm_lamports") or 0
+                        )
+                        frozen_rearm_ts_ms = int(
+                            cand.get("last_inband_rearm_ts_ms") or 0
+                        )
+                        frozen_rearm_age_ms = (
+                            now - frozen_rearm_ts_ms if frozen_rearm_ts_ms > 0 else 10**9
+                        )
+                        allow_frozen_rearm = (
+                            os.environ.get(
+                                "V287_ALLOW_FROZEN_INBAND_REARM_AFTER_PLAN_READY",
+                                "1",
+                            )
+                            != "0"
+                            and bool(cand.get("post_plan_rearm_required"))
+                            and frozen_rearm_lamports >= cand_rearm_min_lamports
+                            and frozen_rearm_lamports <= cand_rearm_max_lamports
+                            and frozen_rearm_age_ms
+                            <= int(
+                                os.environ.get(
+                                    "V287_FROZEN_INBAND_REARM_MAX_AGE_MS",
+                                    os.environ.get(
+                                        "V287_PREPLAN_REARM_CREDIT_MAX_WAIT_MS",
+                                        "850",
+                                    ),
+                                )
+                            )
+                        )
+                        if allow_frozen_rearm:
+                            counters["frozen_inband_rearm_after_plan_allow"] += 1
+                            cand["post_plan_rearm_required"] = 0
+                            cand["frozen_inband_rearm_after_plan"] = 1
+                            _log(
+                                "PGG2-V287-FROZEN-INBAND-REARM-AFTER-PLAN-ALLOW "
+                                f"mint={_short(mint)} full_mint={mint} "
+                                f"top_lane={cand.get('top_lane', 'unknown')} "
+                                f"frozen_rearm_sol={frozen_rearm_lamports/LAMPORTS_PER_SOL:.6f} "
+                                f"current_train_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                f"rearm_min_sol={cand_rearm_min_lamports/LAMPORTS_PER_SOL:.6f} "
+                                f"rearm_max_sol={cand_rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
+                                f"frozen_rearm_age_ms={frozen_rearm_age_ms} "
+                                f"delay_ms={now-int(cand['start_ms'])} "
+                                "source=plan_latency_bridge"
+                            )
+                        else:
+                            allow_frozen_rearm = False
                         if str(cand.get("top_lane", "")) in {
                             "single_prior_buy_continuation",
                             "two_prior_buy_continuation",
-                        }:
+                        } and not allow_frozen_rearm:
                             counters["lane_rearm_max_block"] += 1
                             _log(
                                 "PGG2-V287-LANE-REARM-MAX-BLOCK "
@@ -1803,7 +1852,8 @@ def main() -> int:
                             active.pop(mint, None)
                             continue
                         train_ok = (
-                            bool(args.enable_oversize_train_lane)
+                            not allow_frozen_rearm
+                            and bool(args.enable_oversize_train_lane)
                             and now - int(cand["start_ms"]) <= int(args.oversize_train_max_age_ms)
                             and int(cand["pre_entry_buys"]) >= int(args.oversize_train_min_buys)
                             and int(cand["pre_entry_buy_lamports"])
@@ -1820,7 +1870,7 @@ def main() -> int:
                                 f"rearm_max_sol={cand_rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
                                 f"delay_ms={now-int(cand['start_ms'])}"
                             )
-                        else:
+                        elif not allow_frozen_rearm:
                             hot_train_min_buys = int(
                                 os.environ.get("V287_VERIFIED_HOT_TRAIN_MIN_BUYS", "4")
                             )
@@ -1908,6 +1958,18 @@ def main() -> int:
                             rearm_pass_delay_ms,
                         )
                         counters["rearm_pass"] += 1
+                        if (
+                            cand_rearm_max_lamports <= 0
+                            or cand["pre_entry_buy_lamports"] <= cand_rearm_max_lamports
+                        ):
+                            cand["last_inband_rearm_lamports"] = int(
+                                cand["pre_entry_buy_lamports"]
+                            )
+                            cand["last_inband_rearm_buys"] = int(
+                                cand["pre_entry_buys"]
+                            )
+                            cand["last_inband_rearm_ts_ms"] = now
+                            cand["last_inband_rearm_delay_ms"] = rearm_pass_delay_ms
                         _log(
                             "PGG2-V287-REARM-PASS "
                             f"mint={_short(mint)} pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
