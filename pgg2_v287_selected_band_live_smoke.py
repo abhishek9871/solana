@@ -348,6 +348,7 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MIN_SOL", "4.00")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS", "350")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_PREV_MAX_SOL", "0.10")
+    os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS", "650")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH", "1")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "350")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
@@ -1843,6 +1844,8 @@ def main() -> int:
                             if hot_train_ok:
                                 counters["verified_hot_train_pass"] += 1
                                 cand["verified_hot_train"] = 1
+                                cand["verified_hot_train_ts_ms"] = now
+                                cand["verified_hot_train_delay_ms"] = now - int(cand["start_ms"])
                                 _log(
                                     "PGG2-V287-VERIFIED-HOT-TRAIN-PASS "
                                     f"mint={_short(mint)} full_mint={mint} "
@@ -2221,6 +2224,15 @@ def main() -> int:
                                             )
                                         )
                                     )
+                                    hot_train_observed = bool(cand.get("verified_hot_train"))
+                                    hot_train_observed_age_ms = int(
+                                        cand.get("verified_hot_train_delay_ms") or age_ms
+                                    )
+                                    hot_train_send_lag_ms = max(
+                                        0,
+                                        _now_ms()
+                                        - int(cand.get("verified_hot_train_ts_ms") or _now_ms()),
+                                    )
                                     verified_hot_train = (
                                         os.environ.get("V287_ENABLE_VERIFIED_HOT_TRAIN", "1")
                                         != "0"
@@ -2247,11 +2259,30 @@ def main() -> int:
                                                 "4.00",
                                             )
                                         )
-                                        and age_ms
-                                        <= int(
-                                            os.environ.get(
-                                                "V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS",
-                                                "350",
+                                        and (
+                                            age_ms
+                                            <= int(
+                                                os.environ.get(
+                                                    "V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS",
+                                                    "350",
+                                                )
+                                            )
+                                            or (
+                                                hot_train_observed
+                                                and hot_train_observed_age_ms
+                                                <= int(
+                                                    os.environ.get(
+                                                        "V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS",
+                                                        "350",
+                                                    )
+                                                )
+                                                and hot_train_send_lag_ms
+                                                <= int(
+                                                    os.environ.get(
+                                                        "V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS",
+                                                        "650",
+                                                    )
+                                                )
                                             )
                                         )
                                     )
