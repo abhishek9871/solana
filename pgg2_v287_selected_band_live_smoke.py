@@ -44,7 +44,9 @@ from pgg2_direct_pump import (  # type: ignore  # noqa: E402
     PUMP_FEE_PROGRAM_ID,
     PUMP_PROGRAM_ID,
     PumpBuybackPair,
+    TOKEN_PROGRAM_ID as DIRECT_TOKEN_PROGRAM_ID,
     as_pubkey,
+    get_associated_token_address,
     pda,
 )
 from pgg2_v74_sender_adapter import install_into_broker, make_sender  # type: ignore  # noqa: E402
@@ -314,6 +316,14 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ["PGG2_DIRECT_BLOCKHASH_COMMITMENT"] = "processed"
     os.environ.setdefault("PGG2_DIRECT_BLOCKHASH_CACHE_MS", "30000")
     os.environ.setdefault("PGG2_DIRECT_BLOCKHASH_CACHE_LOG", "1")
+    os.environ.setdefault("V287_SELL_BEFORE_BUY_CONFIRMED", "1")
+    os.environ.setdefault("V287_EARLY_TOKEN_COMMITMENT", "processed")
+    os.environ.setdefault("V287_EARLY_TOKEN_WAIT_SEC", "1.25")
+    os.environ.setdefault("V287_EARLY_TOKEN_POLL_MS", "25")
+    os.environ.setdefault("V287_SELL_BALANCE_COMMITMENT", "processed")
+    os.environ.setdefault("V287_SELL_FLOOR_COMMITMENT", "processed")
+    os.environ.setdefault("V287_EARLY_SELL_POLL_MS", "25")
+    os.environ.setdefault("V287_EXTENDED_SCRATCH_MAX_MS", "900")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
@@ -902,16 +912,36 @@ def _prewarm_pair_from_sigs(broker: Any, mint: str, sigs: list[str], attempts: i
     return False
 
 
-def _wait_token_balance_raw(broker: Any, mint: str, timeout_sec: float) -> int:
+def _token_balance_raw_for_commitment(broker: Any, mint: str, commitment: str) -> int:
+    if commitment == "confirmed":
+        return int(broker.token_balance_raw(as_pubkey(mint)))
+    mint_pk = as_pubkey(mint)
+    try:
+        token_program = broker.mint_owner(mint_pk)
+    except Exception:
+        token_program = DIRECT_TOKEN_PROGRAM_ID
+    ata = get_associated_token_address(as_pubkey(broker.public_key), mint_pk, token_program)
+    out = broker.rpc("getTokenAccountBalance", [str(ata), {"commitment": commitment}])
+    return int(((out or {}).get("value") or {}).get("amount") or 0)
+
+
+def _wait_token_balance_raw(
+    broker: Any,
+    mint: str,
+    timeout_sec: float,
+    *,
+    commitment: str = "confirmed",
+    poll_ms: int = 80,
+) -> int:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         try:
-            bal = int(broker.token_balance_raw(as_pubkey(mint)))
+            bal = int(_token_balance_raw_for_commitment(broker, mint, commitment))
             if bal > 0:
                 return bal
         except Exception:
             pass
-        time.sleep(0.08)
+        time.sleep(max(0.01, float(poll_ms) / 1000.0))
     return 0
 
 
@@ -934,11 +964,23 @@ def _sell_all_for_target(
     failed_exit_fee_spend = 0
     floor_wallet_now: int | None = None
     floor_recoverable_rent: int | None = None
+    balance_commitment = os.environ.get("V287_SELL_BALANCE_COMMITMENT", "processed")
+    floor_commitment = os.environ.get("V287_SELL_FLOOR_COMMITMENT", "processed")
+    sell_poll_sec = max(
+        0.01,
+        float(os.environ.get("V287_EARLY_SELL_POLL_MS", str(args.sell_poll_ms))) / 1000.0,
+    )
+    _log(
+        "PGG2-V287-EARLY-SELL-WORKER-START "
+        f"mint={_short(mint)} buy_sig={buy_sig[:24]} "
+        f"balance_commitment={balance_commitment} floor_commitment={floor_commitment} "
+        f"poll_ms={int(sell_poll_sec * 1000)}"
+    )
 
     def _floor_inputs() -> tuple[int, int]:
         nonlocal floor_wallet_now, floor_recoverable_rent
         if floor_wallet_now is None:
-            floor_wallet_now = int(_wallet_lamports(str(args.rpc_url), "processed"))
+            floor_wallet_now = int(_wallet_lamports(str(args.rpc_url), floor_commitment))
         if floor_recoverable_rent is None:
             floor_recoverable_rent = int(_mint_token_account_lamports(str(args.rpc_url), mint, "processed"))
             if floor_recoverable_rent <= 0:
@@ -978,16 +1020,16 @@ def _sell_all_for_target(
 
     while time.time() < entry_deadline:
         try:
-            token_raw = int(broker.token_balance_raw(as_pubkey(mint)))
+            token_raw = int(_token_balance_raw_for_commitment(broker, mint, balance_commitment))
         except Exception as exc:
             _log(
                 "PGG2-V287-SELL-BALANCE-ERROR "
                 f"mint={_short(mint)} err={type(exc).__name__}:{str(exc)[:180]}"
             )
-            time.sleep(float(args.sell_poll_ms) / 1000.0)
+            time.sleep(sell_poll_sec)
             continue
         if token_raw <= 0:
-            time.sleep(0.06)
+            time.sleep(sell_poll_sec)
             continue
         token_ui = broker.raw_to_ui(as_pubkey(mint), token_raw)
         try:
@@ -1015,7 +1057,7 @@ def _sell_all_for_target(
                 fallback_min = max(100, last_quote_min_out)
                 sig = _send_protected_sell(last_quote, fallback_min, "quote_error_low_guard", last_expected)
                 return sig, last_expected, fallback_min
-            time.sleep(float(args.sell_poll_ms) / 1000.0)
+            time.sleep(sell_poll_sec)
             continue
         expected_out = int(float((quote.get("rate") or {}).get("amountOut") or 0.0) * LAMPORTS_PER_SOL)
         quote_min_out = int(float((quote.get("rate") or {}).get("minAmountOut") or 0.0) * LAMPORTS_PER_SOL)
@@ -1070,11 +1112,11 @@ def _sell_all_for_target(
                     f"mint={_short(mint)} guard=scratch_immediate exc={type(exc).__name__}:{exc} "
                     f"failed_exit_fees={failed_exit_fee_spend}"
                 )
-        time.sleep(float(args.sell_poll_ms) / 1000.0)
+        time.sleep(sell_poll_sec)
 
     # Bounded safety exit. It is still protected by an explicit rent-aware
     # min_out, so a bad close fails instead of realizing a negative wallet delta.
-    token_raw = int(broker.token_balance_raw(as_pubkey(mint)))
+    token_raw = int(_token_balance_raw_for_commitment(broker, mint, balance_commitment))
     if token_raw <= 0:
         return "", last_expected, last_min
     token_ui = broker.raw_to_ui(as_pubkey(mint), token_raw)
@@ -1111,8 +1153,8 @@ def _sell_all_for_target(
                 f"target_min={target_min} quote_min_out={quote_min_out} action=extend_no_low_guard"
             )
             while time.time() < extended_deadline:
-                time.sleep(float(args.sell_poll_ms) / 1000.0)
-                token_raw = int(broker.token_balance_raw(as_pubkey(mint)))
+                time.sleep(sell_poll_sec)
+                token_raw = int(_token_balance_raw_for_commitment(broker, mint, balance_commitment))
                 if token_raw <= 0:
                     return "", expected_out, scratch_min
                 token_ui = broker.raw_to_ui(as_pubkey(mint), token_raw)
@@ -1175,7 +1217,7 @@ def _sell_all_for_target(
             f"failed_exit_fees={failed_exit_fee_spend}"
         )
         try:
-            token_raw_after = int(broker.token_balance_raw(as_pubkey(mint)))
+            token_raw_after = int(_token_balance_raw_for_commitment(broker, mint, balance_commitment))
         except Exception as bal_exc:
             if "could not find account" in str(bal_exc).lower() or "invalid param" in str(bal_exc).lower():
                 token_raw_after = 0
@@ -1256,7 +1298,7 @@ def _sell_all_for_target(
                     f"failed_exit_fees={failed_exit_fee_spend}"
                 )
                 try:
-                    remaining_raw = int(broker.token_balance_raw(as_pubkey(mint)))
+                    remaining_raw = int(_token_balance_raw_for_commitment(broker, mint, balance_commitment))
                 except Exception as bal_exc:
                     if "could not find account" in str(bal_exc).lower() or "invalid param" in str(bal_exc).lower():
                         remaining_raw = 0
@@ -1265,6 +1307,35 @@ def _sell_all_for_target(
                 if remaining_raw <= 0:
                     return sig if "sig" in locals() else "", expected_out, scratch_retry_min
         raise RuntimeError(f"maxhold_protected_sell_failed_token_still_open:{mint}")
+
+
+def _maybe_sell_before_buy_confirm(
+    broker: Any,
+    mint: str,
+    wallet_before_buy_lamports: int,
+    buy_sig: str,
+    args: argparse.Namespace,
+) -> tuple[str, int, int] | None:
+    if os.environ.get("V287_SELL_BEFORE_BUY_CONFIRMED", "1") == "0":
+        return None
+    commitment = os.environ.get("V287_EARLY_TOKEN_COMMITMENT", "processed")
+    wait_sec = float(os.environ.get("V287_EARLY_TOKEN_WAIT_SEC", "1.25"))
+    poll_ms = int(os.environ.get("V287_EARLY_TOKEN_POLL_MS", "25"))
+    token_raw = _wait_token_balance_raw(
+        broker,
+        mint,
+        wait_sec,
+        commitment=commitment,
+        poll_ms=poll_ms,
+    )
+    _log(
+        "PGG2-V287-EARLY-TOKEN-BALANCE "
+        f"mint={_short(mint)} buy_sig={buy_sig[:24]} token_raw={token_raw} "
+        f"commitment={commitment} wait_ms={int(wait_sec * 1000)} poll_ms={poll_ms}"
+    )
+    if token_raw <= 0:
+        return None
+    return _sell_all_for_target(broker, mint, wallet_before_buy_lamports, buy_sig, args)
 
 
 def main() -> int:
@@ -2107,21 +2178,35 @@ def main() -> int:
                                     f"snapshot_age_ms={buy_snapshot_age_ms} quote_source={buy_quote_source}"
                                 )
                                 buy_sig = broker.send_signed(signed_b64)
+                                early_sell = _maybe_sell_before_buy_confirm(
+                                    broker, mint, wallet_before_buy, buy_sig, args
+                                )
                                 ok = broker.wait_confirmed(buy_sig)
-                                if not ok:
+                                if not ok and early_sell is None:
                                     counters["buy_failed_safe"] += 1
                                     _log(f"PGG2-V287-BUY-FAILED-SAFE mint={_short(mint)} sig={buy_sig}")
                                     active.pop(mint, None)
                                     continue
-                                counters["buy_confirmed"] += 1
-                                _log(f"PGG2-V287-BUY-CONFIRMED mint={_short(mint)} sig={buy_sig}")
-                                token_raw = _wait_token_balance_raw(broker, mint, 2.5)
-                                _log(f"PGG2-V287-TOKEN-BALANCE mint={_short(mint)} token_raw={token_raw}")
-                                if token_raw <= 0:
-                                    raise RuntimeError("buy_confirmed_but_no_token_balance")
-                                sell_sig, expected_out, min_needed = _sell_all_for_target(
-                                    broker, mint, wallet_before_buy, buy_sig, args
-                                )
+                                if ok:
+                                    counters["buy_confirmed"] += 1
+                                    _log(f"PGG2-V287-BUY-CONFIRMED mint={_short(mint)} sig={buy_sig}")
+                                elif early_sell is not None:
+                                    _log(
+                                        "PGG2-V287-BUY-CONFIRM-LATE-AFTER-EARLY-SELL "
+                                        f"mint={_short(mint)} sig={buy_sig}"
+                                    )
+                                if early_sell is not None:
+                                    sell_sig, expected_out, min_needed = early_sell
+                                else:
+                                    token_raw = _wait_token_balance_raw(
+                                        broker, mint, 2.5, commitment="confirmed"
+                                    )
+                                    _log(f"PGG2-V287-TOKEN-BALANCE mint={_short(mint)} token_raw={token_raw}")
+                                    if token_raw <= 0:
+                                        raise RuntimeError("buy_confirmed_but_no_token_balance")
+                                    sell_sig, expected_out, min_needed = _sell_all_for_target(
+                                        broker, mint, wallet_before_buy, buy_sig, args
+                                    )
                                 time.sleep(1.0)
                                 final_wallet = _wallet_lamports(str(args.rpc_url))
                                 nonzero2, rent2 = _token_accounts(str(args.rpc_url))
@@ -2296,21 +2381,35 @@ def main() -> int:
                                 f"sig_preview={sig_preview[:24]} slippage={args.buy_slippage_pct:.2f}"
                             )
                             buy_sig = broker.send_signed(signed_b64)
+                            early_sell = _maybe_sell_before_buy_confirm(
+                                broker, mint, wallet_before_buy, buy_sig, args
+                            )
                             ok = broker.wait_confirmed(buy_sig)
-                            if not ok:
+                            if not ok and early_sell is None:
                                 counters["buy_failed_safe"] += 1
                                 _log(f"PGG2-V287-BUY-FAILED-SAFE mint={_short(mint)} sig={buy_sig}")
                                 active.pop(mint, None)
                                 continue
-                            counters["buy_confirmed"] += 1
-                            _log(f"PGG2-V287-BUY-CONFIRMED mint={_short(mint)} sig={buy_sig}")
-                            token_raw = _wait_token_balance_raw(broker, mint, 2.5)
-                            _log(f"PGG2-V287-TOKEN-BALANCE mint={_short(mint)} token_raw={token_raw}")
-                            if token_raw <= 0:
-                                raise RuntimeError("buy_confirmed_but_no_token_balance")
-                            sell_sig, expected_out, min_needed = _sell_all_for_target(
-                                broker, mint, wallet_before_buy, buy_sig, args
-                            )
+                            if ok:
+                                counters["buy_confirmed"] += 1
+                                _log(f"PGG2-V287-BUY-CONFIRMED mint={_short(mint)} sig={buy_sig}")
+                            elif early_sell is not None:
+                                _log(
+                                    "PGG2-V287-BUY-CONFIRM-LATE-AFTER-EARLY-SELL "
+                                    f"mint={_short(mint)} sig={buy_sig}"
+                                )
+                            if early_sell is not None:
+                                sell_sig, expected_out, min_needed = early_sell
+                            else:
+                                token_raw = _wait_token_balance_raw(
+                                    broker, mint, 2.5, commitment="confirmed"
+                                )
+                                _log(f"PGG2-V287-TOKEN-BALANCE mint={_short(mint)} token_raw={token_raw}")
+                                if token_raw <= 0:
+                                    raise RuntimeError("buy_confirmed_but_no_token_balance")
+                                sell_sig, expected_out, min_needed = _sell_all_for_target(
+                                    broker, mint, wallet_before_buy, buy_sig, args
+                                )
                             time.sleep(1.0)
                             final_wallet = _wallet_lamports(str(args.rpc_url))
                             nonzero2, rent2 = _token_accounts(str(args.rpc_url))
