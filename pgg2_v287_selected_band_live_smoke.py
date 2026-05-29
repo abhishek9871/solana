@@ -369,6 +369,7 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_SELECTED_NORMAL_REARM_MAX_SOL", "2.05")
     os.environ.setdefault("V287_SELECTED_NORMAL_MIN_DELAY_MS", "75")
     os.environ.setdefault("V287_SELECTED_NORMAL_MAX_DELAY_MS", "150")
+    os.environ.setdefault("V287_SELECTED_MAX_NEG_REFRESH_DRIFT_PCT", "1.25")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH", "1")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "1000")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
@@ -2890,6 +2891,33 @@ def main() -> int:
                                         f"drift_pct={final_refresh_drift_pct:+.3f} "
                                         f"min_abs_drift_pct={min_abs_refresh_drift_pct:.3f}"
                                     )
+                                    selected_negative_reason_allowed = (
+                                        _v287_selected_negative_reason_allowed(
+                                            continuation_reason or ""
+                                        )
+                                    )
+                                    max_selected_neg_drift_pct = float(
+                                        os.environ.get(
+                                            "V287_SELECTED_MAX_NEG_REFRESH_DRIFT_PCT",
+                                            "1.25",
+                                        )
+                                    )
+                                    if (
+                                        selected_negative_reason_allowed
+                                        and final_refresh_drift_pct
+                                        < -abs(max_selected_neg_drift_pct)
+                                    ):
+                                        counters["selected_refresh_adverse_drift_block"] += 1
+                                        _log(
+                                            "PGG2-V287-SELECTED-REFRESH-ADVERSE-DRIFT-BLOCK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason} "
+                                            f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                            f"max_neg_drift_pct={-abs(max_selected_neg_drift_pct):+.3f} "
+                                            "source=final_refresh_before_sender"
+                                        )
+                                        active.pop(mint, None)
+                                        continue
                                     if (
                                         min_abs_refresh_drift_pct > 0
                                         and abs(final_refresh_drift_pct)
