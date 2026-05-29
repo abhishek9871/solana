@@ -329,6 +329,11 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_BACKGROUND_BLOCKHASH_WARM_MS", "20000")
     os.environ.setdefault("V287_BACKGROUND_GLOBAL_WARM_MS", "4000")
     os.environ.setdefault("V287_MIN_FINAL_REFRESH_ABS_DRIFT_PCT", "0.05")
+    os.environ.setdefault("V287_PREBUY_MIN_PROJECTED_DELTA_LAMPORTS", "0")
+    os.environ.setdefault("V287_FRESH_IMPULSE_ZERO_PREV_MIN_REARM_SOL", "1.50")
+    os.environ.setdefault("V287_FRESH_IMPULSE_PREV_CARRY_MIN_SOL", "2.00")
+    os.environ.setdefault("V287_ALLOW_PREPLAN_REARM_CREDIT", "1")
+    os.environ.setdefault("V287_PREPLAN_REARM_CREDIT_MAX_WAIT_MS", "850")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
@@ -1902,23 +1907,53 @@ def main() -> int:
                                     * LAMPORTS_PER_SOL
                                 )
                                 if post_plan_buys < 1 or post_plan_lamports < post_plan_min_lamports:
-                                    counters["post_plan_rearm_delta_wait"] += 1
-                                    _log(
-                                        "PGG2-V287-POST-PLAN-REARM-WAIT "
-                                        f"mint={_short(mint)} full_mint={mint} "
-                                        f"top_lane={cand.get('top_lane', 'unknown')} "
-                                        "plan_ready=1 plan_state=ready "
-                                        f"pre_entry_buys={int(cand['pre_entry_buys'])} "
-                                        f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
-                                        f"post_plan_buys={post_plan_buys} "
-                                        f"post_plan_buy_sol={post_plan_lamports/LAMPORTS_PER_SOL:.6f} "
-                                        f"post_plan_min_sol={post_plan_min_lamports/LAMPORTS_PER_SOL:.6f} "
-                                        f"delay_ms={now-int(cand['start_ms'])} "
-                                        f"ttl_ms={_candidate_live_ttl_ms(cand)} "
-                                        "reason=post_plan_delta_below_rearm_min"
+                                    credit_wait_ms = now - int(
+                                        cand.get("post_plan_rearm_wait_start_ms") or now
                                     )
-                                    hist[mint].append(rec)
-                                    continue
+                                    allow_preplan_credit = (
+                                        os.environ.get("V287_ALLOW_PREPLAN_REARM_CREDIT", "1") != "0"
+                                        and str(cand.get("top_lane", "")) == "fresh_impulse"
+                                        and int(cand.get("pre_entry_buys") or 0) >= 1
+                                        and int(cand.get("pre_entry_buy_lamports") or 0)
+                                        >= cand_rearm_min_lamports
+                                        and credit_wait_ms
+                                        <= int(os.environ.get("V287_PREPLAN_REARM_CREDIT_MAX_WAIT_MS", "850"))
+                                    )
+                                    if allow_preplan_credit:
+                                        counters["post_plan_preplan_credit_pass"] += 1
+                                        _log(
+                                            "PGG2-V287-POST-PLAN-REARM-CREDIT-PASS "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"top_lane={cand.get('top_lane', 'unknown')} "
+                                            "plan_ready=1 plan_state=ready "
+                                            f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                            f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                            f"post_plan_buys={post_plan_buys} "
+                                            f"post_plan_buy_sol={post_plan_lamports/LAMPORTS_PER_SOL:.6f} "
+                                            f"post_plan_min_sol={post_plan_min_lamports/LAMPORTS_PER_SOL:.6f} "
+                                            f"credit_wait_ms={credit_wait_ms} "
+                                            f"credit_max_wait_ms={int(os.environ.get('V287_PREPLAN_REARM_CREDIT_MAX_WAIT_MS', '850'))} "
+                                            f"adaptive_rearm_reason={cand.get('adaptive_rearm_reason', '-')}"
+                                        )
+                                        cand["post_plan_rearm_required"] = 0
+                                    else:
+                                        counters["post_plan_rearm_delta_wait"] += 1
+                                        _log(
+                                            "PGG2-V287-POST-PLAN-REARM-WAIT "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"top_lane={cand.get('top_lane', 'unknown')} "
+                                            "plan_ready=1 plan_state=ready "
+                                            f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                            f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                            f"post_plan_buys={post_plan_buys} "
+                                            f"post_plan_buy_sol={post_plan_lamports/LAMPORTS_PER_SOL:.6f} "
+                                            f"post_plan_min_sol={post_plan_min_lamports/LAMPORTS_PER_SOL:.6f} "
+                                            f"delay_ms={now-int(cand['start_ms'])} "
+                                            f"ttl_ms={_candidate_live_ttl_ms(cand)} "
+                                            "reason=post_plan_delta_below_rearm_min"
+                                        )
+                                        hist[mint].append(rec)
+                                        continue
                                 counters["post_plan_rearm_pass"] += 1
                                 _log(
                                     "PGG2-V287-POST-PLAN-REARM-PASS "
@@ -2823,7 +2858,21 @@ def main() -> int:
                 )
                 if fresh_impulse_ok:
                     top_lane = "fresh_impulse"
-                    rearm_min_lamports = int(float(args.fresh_impulse_rearm_min_sol) * LAMPORTS_PER_SOL)
+                    configured_rearm_min_sol = float(args.fresh_impulse_rearm_min_sol)
+                    adaptive_rearm_min_sol = configured_rearm_min_sol
+                    adaptive_rearm_reason = "configured"
+                    prev_carry_min_sol = float(
+                        os.environ.get("V287_FRESH_IMPULSE_PREV_CARRY_MIN_SOL", "2.00")
+                    )
+                    zero_prev_min_sol = float(
+                        os.environ.get("V287_FRESH_IMPULSE_ZERO_PREV_MIN_REARM_SOL", "1.50")
+                    )
+                    if prev_buy_sol + 1e-12 < prev_carry_min_sol:
+                        adaptive_rearm_min_sol = max(configured_rearm_min_sol, zero_prev_min_sol)
+                        adaptive_rearm_reason = "zero_or_weak_prev_live_loss_floor"
+                    else:
+                        adaptive_rearm_reason = "prior_carry_live_win_floor"
+                    rearm_min_lamports = int(adaptive_rearm_min_sol * LAMPORTS_PER_SOL)
                     rearm_max_lamports = int(float(args.fresh_impulse_rearm_max_sol) * LAMPORTS_PER_SOL)
                     candidate_pair_ok = _remember_pair_from_feed_rec(broker, rec)
                     active[mint] = {
@@ -2833,8 +2882,10 @@ def main() -> int:
                         "candidate_pair_ok": candidate_pair_ok,
                         "current_buy_sol": current_buy_sol,
                         "prev_buy_sol": prev_buy_sol,
+                        "prev_buys": len(prev_buys),
                         "top_share": top_share,
                         "top_lane": top_lane,
+                        "adaptive_rearm_reason": adaptive_rearm_reason,
                         "rearm_min_lamports": rearm_min_lamports,
                         "rearm_max_lamports": rearm_max_lamports,
                         "pre_entry_buys": 0,
@@ -2874,8 +2925,10 @@ def main() -> int:
                         f"mint={_short(mint)} full_mint={mint} current_buy_sol={current_buy_sol:.6f} "
                         f"prev_buys_1s={len(prev_buys)} prev_buy_sol_1s={prev_buy_sol:.6f} "
                         f"prev_sells_1s={len(prev_sells)} "
+                        f"configured_rearm_min_sol={configured_rearm_min_sol:.6f} "
                         f"rearm_min_sol={rearm_min_lamports/LAMPORTS_PER_SOL:.6f} "
-                        f"rearm_max_sol={rearm_max_lamports/LAMPORTS_PER_SOL:.6f}"
+                        f"rearm_max_sol={rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
+                        f"adaptive_rearm_reason={adaptive_rearm_reason}"
                     )
                     continue
                 counters["block_prev_buys"] += 1
