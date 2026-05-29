@@ -326,6 +326,8 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_EXTENDED_SCRATCH_MAX_MS", "900")
     os.environ.setdefault("V287_REQUIRE_POST_PLAN_REARM", "1")
     os.environ.setdefault("V287_POST_PLAN_REARM_TTL_MS", "1100")
+    os.environ.setdefault("V287_BACKGROUND_BLOCKHASH_WARM_MS", "20000")
+    os.environ.setdefault("V287_BACKGROUND_GLOBAL_WARM_MS", "4000")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
@@ -426,6 +428,7 @@ def _decode_pump(update: geyser_pb2.SubscribeUpdate) -> dict[str, Any] | None:
             "fee_recipient": acct(1),
             "mint": acct(2),
             "curve": acct(3),
+            "token_program": acct(8),
             "creator_vault": acct(9),
             "buyback_recipient": buyback_recipient,
             "social_fee_pda": social_fee_pda,
@@ -479,7 +482,18 @@ def _remember_static_accounts_from_feed_rec(broker: Any, rec: dict[str, Any]) ->
     stored = False
     creator_vault = str(rec.get("creator_vault") or "")
     fee_recipient = str(rec.get("fee_recipient") or "")
+    token_program = str(rec.get("token_program") or "")
     try:
+        if token_program:
+            as_pubkey(token_program)
+            # mint_owner() only needs the account owner. The Geyser Pump ix
+            # already carries the token program at account index 8, so cache it
+            # and avoid a per-candidate getAccountInfo RPC in the hot path.
+            getattr(broker, "_account_cache", {})[mint] = (
+                time.time(),
+                {"owner": token_program, "data": ["", "base64"]},
+            )
+            stored = True
         if creator_vault:
             as_pubkey(creator_vault)
             getattr(broker, "_pump_creator_vault_override", {})[mint] = creator_vault
@@ -492,7 +506,8 @@ def _remember_static_accounts_from_feed_rec(broker: Any, rec: dict[str, Any]) ->
             _log(
                 "PGG2-V287-STATIC-ACCOUNT-PREWARM "
                 f"mint={_short(mint)} creator_vault={_short(creator_vault)} "
-                f"fee_recipient={_short(fee_recipient)}"
+                f"fee_recipient={_short(fee_recipient)} "
+                f"token_program={_short(token_program)}"
             )
     except Exception as exc:
         _log(
@@ -1597,6 +1612,16 @@ def main() -> int:
         return 2
 
     broker, sender = _build_broker(args)
+    try:
+        warm_start = _now_ms()
+        broker.pump_global()
+        broker.latest_blockhash(force=True)
+        _log(f"PGG2-V287-HOT-PATH-WARM-STARTUP ms={_now_ms()-warm_start}")
+    except Exception as exc:
+        _log(
+            "PGG2-V287-HOT-PATH-WARM-STARTUP-FAIL "
+            f"err={type(exc).__name__}:{str(exc)[:160]}"
+        )
     _log(
         "PGG2-V287-SELECTED-BAND-CONFIG "
         f"lane=c5_j3_winner_fingerprint current=[{float(args.current_min_sol):.2f},{float(args.current_max_sol):.2f}] "
@@ -1644,10 +1669,32 @@ def main() -> int:
     counters: Counter[str] = Counter()
     start_time = time.time()
     prewarm_pool = ThreadPoolExecutor(max_workers=4)
+    last_blockhash_warm_ms = 0
+    blockhash_warm_future: Any = None
+    last_global_warm_ms = 0
+    global_warm_future: Any = None
 
     try:
         for update in stub.Subscribe(_request_iter(args), metadata=metadata):
             now = _now_ms()
+            blockhash_warm_ms = int(os.environ.get("V287_BACKGROUND_BLOCKHASH_WARM_MS", "20000"))
+            if (
+                blockhash_warm_ms > 0
+                and now - last_blockhash_warm_ms >= blockhash_warm_ms
+                and (blockhash_warm_future is None or blockhash_warm_future.done())
+            ):
+                last_blockhash_warm_ms = now
+                blockhash_warm_future = prewarm_pool.submit(broker.latest_blockhash, True)
+                counters["background_blockhash_warm"] += 1
+            global_warm_ms = int(os.environ.get("V287_BACKGROUND_GLOBAL_WARM_MS", "4000"))
+            if (
+                global_warm_ms > 0
+                and now - last_global_warm_ms >= global_warm_ms
+                and (global_warm_future is None or global_warm_future.done())
+            ):
+                last_global_warm_ms = now
+                global_warm_future = prewarm_pool.submit(broker.pump_global)
+                counters["background_global_warm"] += 1
             if time.time() - start_time > int(args.seconds):
                 counters["timeout"] += 1
                 break
