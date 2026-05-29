@@ -1898,9 +1898,12 @@ def main() -> int:
                             "reason=verified_hot_train"
                         )
                     if cand["pre_entry_buys"] >= 1 and cand["pre_entry_buy_lamports"] >= cand_rearm_min_lamports:
+                        rearm_pass_delay_ms = max(0, now - int(cand["start_ms"]))
+                        cand["last_rearm_pass_delay_ms"] = rearm_pass_delay_ms
+                        cand["last_rearm_pass_ts_ms"] = now
                         cand.setdefault(
                             "first_rearm_pass_delay_ms",
-                            max(0, now - int(cand["start_ms"])),
+                            rearm_pass_delay_ms,
                         )
                         counters["rearm_pass"] += 1
                         _log(
@@ -1909,7 +1912,7 @@ def main() -> int:
                             f"rearm_min_sol={cand_rearm_min_lamports/LAMPORTS_PER_SOL:.6f} "
                             f"rearm_max_sol={cand_rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
                             f"top_lane={cand.get('top_lane', 'unknown')} "
-                            f"delay_ms={now-int(cand['start_ms'])}"
+                            f"delay_ms={rearm_pass_delay_ms}"
                         )
                         require_post_plan_rearm = (
                             os.environ.get("V287_REQUIRE_POST_PLAN_REARM", "1") != "0"
@@ -2123,6 +2126,15 @@ def main() -> int:
                                     first_rearm_delay_ms = int(
                                         cand.get("first_rearm_pass_delay_ms") or age_ms
                                     )
+                                    last_rearm_delay_ms = int(
+                                        cand.get("last_rearm_pass_delay_ms")
+                                        or first_rearm_delay_ms
+                                    )
+                                    last_rearm_lag_ms = max(
+                                        0,
+                                        _now_ms()
+                                        - int(cand.get("last_rearm_pass_ts_ms") or _now_ms()),
+                                    )
                                     min_verified_delay_ms = int(
                                         os.environ.get(
                                             "V287_VERIFIED_CONTINUATION_MIN_REARM_DELAY_MS",
@@ -2144,7 +2156,14 @@ def main() -> int:
                                         top_lane == "fresh_impulse"
                                         and 2.80 <= current_buy_sol <= 3.25
                                         and 1 <= pre_entry_buys <= int(args.fresh_impulse_max_rearm_buys)
-                                        and age_ms <= 350
+                                        and last_rearm_delay_ms <= 350
+                                        and last_rearm_lag_ms
+                                        <= int(
+                                            os.environ.get(
+                                                "V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS",
+                                                "650",
+                                            )
+                                        )
                                         and paced_rearm
                                     )
                                     verified_low_rearm_continuation = (
@@ -2260,7 +2279,7 @@ def main() -> int:
                                             )
                                         )
                                         and (
-                                            age_ms
+                                            last_rearm_delay_ms
                                             <= int(
                                                 os.environ.get(
                                                     "V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS",
@@ -2423,7 +2442,7 @@ def main() -> int:
                                             )
                                             != "0"
                                             and top_lane == "fresh_impulse"
-                                            and age_ms
+                                            and last_rearm_delay_ms
                                             < int(
                                                 os.environ.get(
                                                     "V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS",
