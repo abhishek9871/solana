@@ -328,6 +328,7 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_POST_PLAN_REARM_TTL_MS", "1100")
     os.environ.setdefault("V287_BACKGROUND_BLOCKHASH_WARM_MS", "20000")
     os.environ.setdefault("V287_BACKGROUND_GLOBAL_WARM_MS", "4000")
+    os.environ.setdefault("V287_MIN_FINAL_REFRESH_ABS_DRIFT_PCT", "0.05")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
@@ -2189,6 +2190,7 @@ def main() -> int:
                                     "V287_REFRESH_CURVE_AFTER_PLAN_RECHECK",
                                     "1",
                                 ) != "0":
+                                    pre_refresh_quote_tokens = float(quote_tokens)
                                     fast_start_ms = _now_ms()
                                     curve = broker.bonding_curve(as_pubkey(mint))
                                     curve_ts_ms = _now_ms()
@@ -2228,6 +2230,43 @@ def main() -> int:
                                         0.0,
                                         1.0 - (float(args.buy_slippage_pct) / 100.0),
                                     )
+                                    final_refresh_drift_pct = (
+                                        (
+                                            (float(quote_tokens) - pre_refresh_quote_tokens)
+                                            / pre_refresh_quote_tokens
+                                        )
+                                        * 100.0
+                                        if pre_refresh_quote_tokens > 0
+                                        else 0.0
+                                    )
+                                    min_abs_refresh_drift_pct = float(
+                                        os.environ.get(
+                                            "V287_MIN_FINAL_REFRESH_ABS_DRIFT_PCT",
+                                            "0.05",
+                                        )
+                                    )
+                                    _log(
+                                        "PGG2-V287-FINAL-REFRESH-DRIFT-CHECK "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"first_tokens={pre_refresh_quote_tokens:.6f} "
+                                        f"refresh_tokens={float(quote_tokens):.6f} "
+                                        f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                        f"min_abs_drift_pct={min_abs_refresh_drift_pct:.3f}"
+                                    )
+                                    if (
+                                        min_abs_refresh_drift_pct > 0
+                                        and abs(final_refresh_drift_pct)
+                                        < min_abs_refresh_drift_pct
+                                    ):
+                                        counters["final_refresh_no_movement_block"] += 1
+                                        _log(
+                                            "PGG2-V287-FINAL-REFRESH-DRIFT-BLOCK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                            "reason=no_curve_movement_before_sender"
+                                        )
+                                        active.pop(mint, None)
+                                        continue
                                 if (
                                     not plan_ready
                                     and os.environ.get(
