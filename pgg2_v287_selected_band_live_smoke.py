@@ -324,6 +324,8 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_SELL_FLOOR_COMMITMENT", "processed")
     os.environ.setdefault("V287_EARLY_SELL_POLL_MS", "25")
     os.environ.setdefault("V287_EXTENDED_SCRATCH_MAX_MS", "900")
+    os.environ.setdefault("V287_REQUIRE_POST_PLAN_REARM", "1")
+    os.environ.setdefault("V287_POST_PLAN_REARM_TTL_MS", "1100")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
@@ -524,6 +526,24 @@ def _prepare_static_buy_plan_from_feed_rec(
             f"mint={_short(mint)} err={type(exc).__name__}:{str(exc)[:160]}"
         )
         return False
+
+
+def _static_plan_future_done_ok(plan_fut: Any) -> tuple[bool, bool, str]:
+    if plan_fut is None:
+        return False, False, "missing"
+    try:
+        if not plan_fut.done():
+            return False, False, "pending"
+        return True, bool(plan_fut.result(timeout=0)), ""
+    except Exception as exc:
+        return True, False, f"{type(exc).__name__}:{str(exc)[:120]}"
+
+
+def _candidate_live_ttl_ms(cand: dict[str, Any]) -> int:
+    base = int(os.environ.get("V287_CANDIDATE_TTL_MS", "350"))
+    if cand.get("post_plan_rearm_required"):
+        return max(base, int(os.environ.get("V287_POST_PLAN_REARM_TTL_MS", "1100")))
+    return base
 
 
 def _prebuy_postbuy_sell_projection_from_curve(
@@ -1650,7 +1670,7 @@ def main() -> int:
             # watches on every event so one dead mint cannot suppress fresh
             # impulse opportunities until that same mint happens to trade again.
             for active_mint, active_cand in list(active.items()):
-                if now - int(active_cand["start_ms"]) <= 350:
+                if now - int(active_cand["start_ms"]) <= _candidate_live_ttl_ms(active_cand):
                     continue
                 counters["candidate_expired"] += 1
                 active_rearm_min = int(
@@ -1664,6 +1684,7 @@ def main() -> int:
                     f"{active_cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
                     f"rearm_min_sol={active_rearm_min/LAMPORTS_PER_SOL:.6f} "
                     f"rearm_max_sol={active_rearm_max/LAMPORTS_PER_SOL:.6f} "
+                    f"ttl_ms={_candidate_live_ttl_ms(active_cand)} "
                     "reason=global_stale_flush"
                 )
                 active.pop(active_mint, None)
@@ -1671,7 +1692,7 @@ def main() -> int:
             # Manage one active pre-entry candidate.
             cand = active.get(mint)
             if cand:
-                if now - int(cand["start_ms"]) > 350:
+                if now - int(cand["start_ms"]) > _candidate_live_ttl_ms(cand):
                     counters["candidate_expired"] += 1
                     cand_rearm_min_lamports = int(
                         cand.get("rearm_min_lamports") or int(float(args.rearm_min_sol) * LAMPORTS_PER_SOL)
@@ -1679,7 +1700,8 @@ def main() -> int:
                     _log(
                         "PGG2-V287-CANDIDATE-EXPIRE "
                         f"mint={_short(mint)} pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
-                        f"rearm_min_sol={cand_rearm_min_lamports/LAMPORTS_PER_SOL:.6f}"
+                        f"rearm_min_sol={cand_rearm_min_lamports/LAMPORTS_PER_SOL:.6f} "
+                        f"ttl_ms={_candidate_live_ttl_ms(cand)}"
                     )
                     active.pop(mint, None)
                 elif rec["kind"] == "sell":
@@ -1762,6 +1784,54 @@ def main() -> int:
                             f"top_lane={cand.get('top_lane', 'unknown')} "
                             f"delay_ms={now-int(cand['start_ms'])}"
                         )
+                        require_post_plan_rearm = (
+                            os.environ.get("V287_REQUIRE_POST_PLAN_REARM", "1") != "0"
+                            and os.environ.get("V287_FAST_STATIC_FINAL_BUY", "1") != "0"
+                        )
+                        if require_post_plan_rearm:
+                            plan_done, plan_ok_now, plan_err = _static_plan_future_done_ok(
+                                cand.get("static_plan_future")
+                            )
+                            if not plan_ok_now:
+                                if not plan_done:
+                                    cand["post_plan_rearm_required"] = 1
+                                    cand.setdefault("post_plan_rearm_wait_start_ms", now)
+                                    cand["post_plan_rearm_wait_last_ms"] = now
+                                    counters["post_plan_rearm_wait"] += 1
+                                    _log(
+                                        "PGG2-V287-POST-PLAN-REARM-WAIT "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"top_lane={cand.get('top_lane', 'unknown')} "
+                                        f"plan_ready=0 plan_state={plan_err} "
+                                        f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                        f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                        f"delay_ms={now-int(cand['start_ms'])} "
+                                        f"ttl_ms={_candidate_live_ttl_ms(cand)} "
+                                        "reason=require_fresh_buy_after_static_plan_ready"
+                                    )
+                                    hist[mint].append(rec)
+                                    continue
+                                counters["post_plan_rearm_plan_fail"] += 1
+                                _log(
+                                    "PGG2-V287-POST-PLAN-REARM-BLOCK "
+                                    f"mint={_short(mint)} full_mint={mint} "
+                                    f"plan_ready=0 plan_state={plan_err or 'done_false'} "
+                                    "reason=static_plan_failed"
+                                )
+                                active.pop(mint, None)
+                                continue
+                            if cand.get("post_plan_rearm_required"):
+                                counters["post_plan_rearm_pass"] += 1
+                                _log(
+                                    "PGG2-V287-POST-PLAN-REARM-PASS "
+                                    f"mint={_short(mint)} full_mint={mint} "
+                                    f"top_lane={cand.get('top_lane', 'unknown')} "
+                                    f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                    f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                    f"wait_ms={now-int(cand.get('post_plan_rearm_wait_start_ms') or now)} "
+                                    f"delay_ms={now-int(cand['start_ms'])}"
+                                )
+                                cand["post_plan_rearm_required"] = 0
                         pair_ok = bool(cand.get("candidate_pair_ok"))
                         pair_ok = _remember_pair_from_feed_rec(broker, rec) or pair_ok
                         fut = cand.get("prewarm_future")
