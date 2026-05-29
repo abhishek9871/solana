@@ -1796,6 +1796,12 @@ def main() -> int:
                                 if not plan_done:
                                     cand["post_plan_rearm_required"] = 1
                                     cand.setdefault("post_plan_rearm_wait_start_ms", now)
+                                    cand["post_plan_rearm_base_lamports"] = int(
+                                        cand.get("pre_entry_buy_lamports") or 0
+                                    )
+                                    cand["post_plan_rearm_base_buys"] = int(
+                                        cand.get("pre_entry_buys") or 0
+                                    )
                                     cand["post_plan_rearm_wait_last_ms"] = now
                                     counters["post_plan_rearm_wait"] += 1
                                     _log(
@@ -1805,6 +1811,7 @@ def main() -> int:
                                         f"plan_ready=0 plan_state={plan_err} "
                                         f"pre_entry_buys={int(cand['pre_entry_buys'])} "
                                         f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                        "post_plan_buy_sol=0.000000 "
                                         f"delay_ms={now-int(cand['start_ms'])} "
                                         f"ttl_ms={_candidate_live_ttl_ms(cand)} "
                                         "reason=require_fresh_buy_after_static_plan_ready"
@@ -1821,6 +1828,49 @@ def main() -> int:
                                 active.pop(mint, None)
                                 continue
                             if cand.get("post_plan_rearm_required"):
+                                post_plan_base_lamports = int(
+                                    cand.get("post_plan_rearm_base_lamports") or 0
+                                )
+                                post_plan_base_buys = int(
+                                    cand.get("post_plan_rearm_base_buys") or 0
+                                )
+                                post_plan_lamports = max(
+                                    0,
+                                    int(cand.get("pre_entry_buy_lamports") or 0)
+                                    - post_plan_base_lamports,
+                                )
+                                post_plan_buys = max(
+                                    0,
+                                    int(cand.get("pre_entry_buys") or 0)
+                                    - post_plan_base_buys,
+                                )
+                                post_plan_min_lamports = int(
+                                    float(
+                                        os.environ.get(
+                                            "V287_POST_PLAN_REARM_MIN_SOL",
+                                            f"{cand_rearm_min_lamports / LAMPORTS_PER_SOL:.9f}",
+                                        )
+                                    )
+                                    * LAMPORTS_PER_SOL
+                                )
+                                if post_plan_buys < 1 or post_plan_lamports < post_plan_min_lamports:
+                                    counters["post_plan_rearm_delta_wait"] += 1
+                                    _log(
+                                        "PGG2-V287-POST-PLAN-REARM-WAIT "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"top_lane={cand.get('top_lane', 'unknown')} "
+                                        "plan_ready=1 plan_state=ready "
+                                        f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                        f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                        f"post_plan_buys={post_plan_buys} "
+                                        f"post_plan_buy_sol={post_plan_lamports/LAMPORTS_PER_SOL:.6f} "
+                                        f"post_plan_min_sol={post_plan_min_lamports/LAMPORTS_PER_SOL:.6f} "
+                                        f"delay_ms={now-int(cand['start_ms'])} "
+                                        f"ttl_ms={_candidate_live_ttl_ms(cand)} "
+                                        "reason=post_plan_delta_below_rearm_min"
+                                    )
+                                    hist[mint].append(rec)
+                                    continue
                                 counters["post_plan_rearm_pass"] += 1
                                 _log(
                                     "PGG2-V287-POST-PLAN-REARM-PASS "
@@ -1828,6 +1878,9 @@ def main() -> int:
                                     f"top_lane={cand.get('top_lane', 'unknown')} "
                                     f"pre_entry_buys={int(cand['pre_entry_buys'])} "
                                     f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                    f"post_plan_buys={post_plan_buys} "
+                                    f"post_plan_buy_sol={post_plan_lamports/LAMPORTS_PER_SOL:.6f} "
+                                    f"post_plan_min_sol={post_plan_min_lamports/LAMPORTS_PER_SOL:.6f} "
                                     f"wait_ms={now-int(cand.get('post_plan_rearm_wait_start_ms') or now)} "
                                     f"delay_ms={now-int(cand['start_ms'])}"
                                 )
