@@ -334,6 +334,16 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_FRESH_IMPULSE_PREV_CARRY_MIN_SOL", "2.00")
     os.environ.setdefault("V287_ALLOW_PREPLAN_REARM_CREDIT", "1")
     os.environ.setdefault("V287_PREPLAN_REARM_CREDIT_MAX_WAIT_MS", "850")
+    os.environ.setdefault("V287_VERIFIED_CONTINUATION_MIN_REARM_DELAY_MS", "75")
+    os.environ.setdefault("V287_VERIFIED_CONTINUATION_MAX_REARM_DELAY_MS", "350")
+    os.environ.setdefault("V287_VERIFIED_STRONG_FRESH_REARM_MIN_SOL", "3.80")
+    os.environ.setdefault("V287_VERIFIED_PRIOR_CARRY_PREV_MIN_SOL", "2.00")
+    os.environ.setdefault("V287_VERIFIED_PRIOR_CARRY_REARM_MIN_SOL", "0.70")
+    os.environ.setdefault("V287_VERIFIED_PRIOR_CARRY_REARM_MAX_SOL", "1.20")
+    os.environ.setdefault("V287_VERIFIED_MID_CARRY_PREV_MIN_SOL", "1.00")
+    os.environ.setdefault("V287_VERIFIED_MID_CARRY_PREV_MAX_SOL", "2.00")
+    os.environ.setdefault("V287_VERIFIED_MID_CARRY_REARM_MIN_SOL", "2.00")
+    os.environ.setdefault("V287_VERIFIED_MID_CARRY_REARM_MAX_SOL", "3.20")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
@@ -1829,6 +1839,10 @@ def main() -> int:
                         active.pop(mint, None)
                         continue
                     if cand["pre_entry_buys"] >= 1 and cand["pre_entry_buy_lamports"] >= cand_rearm_min_lamports:
+                        cand.setdefault(
+                            "first_rearm_pass_delay_ms",
+                            max(0, now - int(cand["start_ms"])),
+                        )
                         counters["rearm_pass"] += 1
                         _log(
                             "PGG2-V287-REARM-PASS "
@@ -2027,6 +2041,8 @@ def main() -> int:
                                 curve = broker.bonding_curve(as_pubkey(mint))
                                 curve_ts_ms = _now_ms()
                                 curve_ms = curve_ts_ms - fast_start_ms
+                                continuation_model_ok = False
+                                continuation_reason = ""
                                 ok_proj, quote_tokens, _expected_raw = _prebuy_postbuy_sell_projection_from_curve(
                                     broker,
                                     mint,
@@ -2042,13 +2058,35 @@ def main() -> int:
                                     observed_rearm_sol = observed_rearm_lamports / LAMPORTS_PER_SOL
                                     pre_entry_buys = int(cand.get("pre_entry_buys") or 0)
                                     current_buy_sol = float(cand.get("current_buy_sol") or 0.0)
+                                    prev_buy_sol = float(cand.get("prev_buy_sol") or 0.0)
                                     top_lane = str(cand.get("top_lane") or "")
                                     age_ms = _now_ms() - int(cand.get("start_ms") or _now_ms())
+                                    first_rearm_delay_ms = int(
+                                        cand.get("first_rearm_pass_delay_ms") or age_ms
+                                    )
+                                    min_verified_delay_ms = int(
+                                        os.environ.get(
+                                            "V287_VERIFIED_CONTINUATION_MIN_REARM_DELAY_MS",
+                                            "75",
+                                        )
+                                    )
+                                    max_verified_delay_ms = int(
+                                        os.environ.get(
+                                            "V287_VERIFIED_CONTINUATION_MAX_REARM_DELAY_MS",
+                                            "350",
+                                        )
+                                    )
+                                    paced_rearm = (
+                                        min_verified_delay_ms
+                                        <= first_rearm_delay_ms
+                                        <= max_verified_delay_ms
+                                    )
                                     verified_fresh_base = (
                                         top_lane == "fresh_impulse"
                                         and 2.80 <= current_buy_sol <= 3.25
                                         and 1 <= pre_entry_buys <= int(args.fresh_impulse_max_rearm_buys)
                                         and age_ms <= 350
+                                        and paced_rearm
                                     )
                                     verified_low_rearm_continuation = (
                                         os.environ.get(
@@ -2059,6 +2097,74 @@ def main() -> int:
                                         and verified_fresh_base
                                         and 0.70 <= observed_rearm_sol <= 1.65
                                     )
+                                    verified_strong_fresh_rearm = (
+                                        verified_fresh_base
+                                        and prev_buy_sol <= 1e-12
+                                        and observed_rearm_sol
+                                        >= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_STRONG_FRESH_REARM_MIN_SOL",
+                                                "3.80",
+                                            )
+                                        )
+                                        and observed_rearm_sol
+                                        <= float(args.fresh_impulse_rearm_max_sol)
+                                    )
+                                    verified_prior_carry_rearm = (
+                                        verified_fresh_base
+                                        and prev_buy_sol
+                                        >= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_PRIOR_CARRY_PREV_MIN_SOL",
+                                                "2.00",
+                                            )
+                                        )
+                                        and observed_rearm_sol
+                                        >= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_PRIOR_CARRY_REARM_MIN_SOL",
+                                                "0.70",
+                                            )
+                                        )
+                                        and observed_rearm_sol
+                                        <= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_PRIOR_CARRY_REARM_MAX_SOL",
+                                                "1.20",
+                                            )
+                                        )
+                                    )
+                                    verified_mid_carry_rearm = (
+                                        verified_fresh_base
+                                        and prev_buy_sol
+                                        >= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_MID_CARRY_PREV_MIN_SOL",
+                                                "1.00",
+                                            )
+                                        )
+                                        and prev_buy_sol
+                                        < float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_MID_CARRY_PREV_MAX_SOL",
+                                                "2.00",
+                                            )
+                                        )
+                                        and observed_rearm_sol
+                                        >= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_MID_CARRY_REARM_MIN_SOL",
+                                                "2.00",
+                                            )
+                                        )
+                                        and observed_rearm_sol
+                                        <= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_MID_CARRY_REARM_MAX_SOL",
+                                                "3.20",
+                                            )
+                                        )
+                                    )
                                     verified_high_current_rearm = (
                                         os.environ.get(
                                             "V287_ENABLE_HIGH_CURRENT_REARM_LANE",
@@ -2068,18 +2174,54 @@ def main() -> int:
                                         and verified_fresh_base
                                         and pre_entry_buys >= int(args.high_current_rearm_min_buys)
                                         and 1.65 < observed_rearm_sol <= 4.50
+                                        and (
+                                            verified_strong_fresh_rearm
+                                            or verified_mid_carry_rearm
+                                        )
                                     )
                                     if verified_high_current_rearm:
                                         continuation_ok = True
+                                        continuation_model_ok = True
+                                        continuation_reason = "high_current_rearm"
                                         counters["high_current_rearm_lane_pass"] += 1
                                         _log(
                                             "PGG2-V287-HIGH-CURRENT-REARM-LANE-PASS "
                                             f"mint={_short(mint)} full_mint={mint} "
                                             f"current_buy_sol={current_buy_sol:.6f} "
+                                            f"prev_buy_sol={prev_buy_sol:.6f} "
                                             f"pre_entry_buys={pre_entry_buys} "
                                             f"min_pre_entry_buys={int(args.high_current_rearm_min_buys)} "
                                             f"pre_entry_buy_sol={observed_rearm_sol:.6f} "
+                                            f"first_rearm_delay_ms={first_rearm_delay_ms} "
                                             f"age_ms={age_ms} source=live_replay_separator"
+                                        )
+                                    if (
+                                        not continuation_ok
+                                        and (
+                                            verified_strong_fresh_rearm
+                                            or verified_prior_carry_rearm
+                                            or verified_mid_carry_rearm
+                                        )
+                                    ):
+                                        continuation_ok = True
+                                        continuation_model_ok = True
+                                        if verified_strong_fresh_rearm:
+                                            continuation_reason = "strong_fresh_rearm"
+                                        elif verified_prior_carry_rearm:
+                                            continuation_reason = "prior_carry_rearm"
+                                        else:
+                                            continuation_reason = "mid_carry_rearm"
+                                        counters["verified_flow_continuation_pass"] += 1
+                                        _log(
+                                            "PGG2-V287-VERIFIED-FLOW-CONTINUATION-PASS "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason} "
+                                            f"current_buy_sol={current_buy_sol:.6f} "
+                                            f"prev_buy_sol={prev_buy_sol:.6f} "
+                                            f"pre_entry_buys={pre_entry_buys} "
+                                            f"pre_entry_buy_sol={observed_rearm_sol:.6f} "
+                                            f"first_rearm_delay_ms={first_rearm_delay_ms} "
+                                            f"age_ms={age_ms}"
                                         )
                                     if os.environ.get("V287_ENABLE_CONTINUATION_CREDIT", "0") != "0":
                                         credit_fraction = float(
@@ -2105,6 +2247,8 @@ def main() -> int:
                                             )
                                             )
                                         if continuation_ok:
+                                            continuation_model_ok = True
+                                            continuation_reason = "modeled_credit"
                                             counters["continuation_credit_pass"] += 1
                                             _log(
                                                 "PGG2-V287-CONTINUATION-CREDIT-PASS "
@@ -2134,6 +2278,8 @@ def main() -> int:
                                             )
                                         )
                                         if continuation_ok:
+                                            continuation_model_ok = True
+                                            continuation_reason = "verified_low_rearm_credit"
                                             counters["verified_low_rearm_continuation_pass"] += 1
                                             _log(
                                                 "PGG2-V287-VERIFIED-LOW-REARM-CONTINUATION-PASS "
@@ -2150,6 +2296,9 @@ def main() -> int:
                                             os.environ.get("V287_ENABLE_CONTINUATION_CREDIT", "0") == "0"
                                             and not verified_low_rearm_continuation
                                             and not verified_high_current_rearm
+                                            and not verified_strong_fresh_rearm
+                                            and not verified_prior_carry_rearm
+                                            and not verified_mid_carry_rearm
                                         ):
                                             _log(
                                                 "PGG2-V287-CONTINUATION-CREDIT-DISABLED "
@@ -2239,13 +2388,22 @@ def main() -> int:
                                         log_tag="PGG2-V287-FAST-FINAL-PREBUY-REFRESH-CHECK",
                                     )
                                     if not ok_proj:
-                                        counters["prebuy_refresh_projection_block"] += 1
-                                        _log(
-                                            "PGG2-V287-PREBUY-REFRESH-BLOCK "
-                                            f"mint={_short(mint)} full_mint={mint} reason=projection"
-                                        )
-                                        active.pop(mint, None)
-                                        continue
+                                        if continuation_model_ok and quote_tokens > 0:
+                                            counters["prebuy_refresh_projection_continuation_pass"] += 1
+                                            _log(
+                                                "PGG2-V287-PREBUY-REFRESH-CONTINUATION-PASS "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"reason={continuation_reason or 'verified_flow'} "
+                                                "self_roundtrip_negative=1"
+                                            )
+                                        else:
+                                            counters["prebuy_refresh_projection_block"] += 1
+                                            _log(
+                                                "PGG2-V287-PREBUY-REFRESH-BLOCK "
+                                                f"mint={_short(mint)} full_mint={mint} reason=projection"
+                                            )
+                                            active.pop(mint, None)
+                                            continue
                                     _log(
                                         "PGG2-V287-BUY-QUOTE-VIABILITY-REFRESH "
                                         f"mint={_short(mint)} full_mint={mint} "
