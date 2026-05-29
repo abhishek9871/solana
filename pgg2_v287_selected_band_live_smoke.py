@@ -350,6 +350,7 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS", "1000")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_PREV_MAX_SOL", "0.10")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS", "650")
+    os.environ.setdefault("V287_ALLOW_NEGATIVE_SELF_ROUNDTRIP_CONTINUATION", "0")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH", "1")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "1000")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
@@ -2502,6 +2503,32 @@ def main() -> int:
                                         )
                                         active.pop(mint, None)
                                         continue
+                                    if (
+                                        os.environ.get(
+                                            "V287_ALLOW_NEGATIVE_SELF_ROUNDTRIP_CONTINUATION",
+                                            "0",
+                                        )
+                                        != "1"
+                                    ):
+                                        counters[
+                                            "negative_self_roundtrip_continuation_block"
+                                        ] += 1
+                                        _log(
+                                            "PGG2-V287-NEGATIVE-SELF-ROUNDTRIP-CONTINUATION-BLOCK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason or 'verified_flow'} "
+                                            f"current_buy_sol={current_buy_sol:.6f} "
+                                            f"prev_buy_sol={prev_buy_sol:.6f} "
+                                            f"pre_entry_buys={pre_entry_buys} "
+                                            f"pre_entry_buy_sol={observed_rearm_sol:.6f} "
+                                            f"first_rearm_delay_ms={first_rearm_delay_ms} "
+                                            f"last_rearm_delay_ms={last_rearm_delay_ms} "
+                                            f"last_rearm_lag_ms={last_rearm_lag_ms} "
+                                            f"quote_tokens={quote_tokens:.6f} "
+                                            "source=final_projection_negative"
+                                        )
+                                        active.pop(mint, None)
+                                        continue
                                 min_quote_tokens = float(args.min_buy_quote_tokens)
                                 _log(
                                     "PGG2-V287-BUY-QUOTE-VIABILITY "
@@ -2578,7 +2605,15 @@ def main() -> int:
                                         log_tag="PGG2-V287-FAST-FINAL-PREBUY-REFRESH-CHECK",
                                     )
                                     if not ok_proj:
-                                        if continuation_model_ok and quote_tokens > 0:
+                                        if (
+                                            continuation_model_ok
+                                            and quote_tokens > 0
+                                            and os.environ.get(
+                                                "V287_ALLOW_NEGATIVE_SELF_ROUNDTRIP_CONTINUATION",
+                                                "0",
+                                            )
+                                            == "1"
+                                        ):
                                             counters["prebuy_refresh_projection_continuation_pass"] += 1
                                             _log(
                                                 "PGG2-V287-PREBUY-REFRESH-CONTINUATION-PASS "
@@ -2590,7 +2625,8 @@ def main() -> int:
                                             counters["prebuy_refresh_projection_block"] += 1
                                             _log(
                                                 "PGG2-V287-PREBUY-REFRESH-BLOCK "
-                                                f"mint={_short(mint)} full_mint={mint} reason=projection"
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                "reason=projection_negative_continuation_disabled"
                                             )
                                             active.pop(mint, None)
                                             continue
