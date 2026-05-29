@@ -200,6 +200,34 @@ class PumpBuybackPair:
     source: str
 
 
+@dataclass(frozen=True)
+class PumpBuyStaticPlan:
+    mint: Pubkey
+    spend_lamports: int
+    token_program: Pubkey
+    curve_key: Pubkey
+    user: Pubkey
+    user_ata: Pubkey
+    associated_curve: Pubkey
+    creator: Pubkey
+    creator_vault: Pubkey
+    user_volume: Pubkey
+    fee_recipient: Pubkey
+    base_metas: tuple[AccountMeta, ...]
+    remaining_metas: tuple[AccountMeta, ...]
+    ata_ix: Instruction
+    header: Any
+    account_keys: tuple[Pubkey, ...]
+    address_table_lookups: tuple[Any, ...]
+    compiled_instructions: tuple[CompiledInstruction, ...]
+    pump_ix_index: int
+    recent_blockhash: Hash
+    pair_source: str
+    pair_recipient: str
+    pair_social: str
+    created_ts_ms: int
+
+
 class DirectPumpQuoteBroker(RaptorLiveBroker):
     """Direct Pump/PumpSwap broker.
 
@@ -236,8 +264,11 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         self._last_pair_source: dict[str, str] = {}
         self._last_pair_recipient: dict[str, str] = {}
         self._last_pair_social: dict[str, str] = {}
+        self._pump_creator_vault_override: dict[str, str] = {}
+        self._pump_fee_recipient_override: dict[str, str] = {}
         self._mint_decimals: dict[str, int] = {}
         self._latest_blockhash_cache: tuple[float, Optional[Hash]] = (0.0, None)
+        self._pump_buy_static_plans: dict[str, PumpBuyStaticPlan] = {}
         # V47B in-flight quote tracker (restored 2026-05-19 V58 broker recovery)
         self._inflight_quotes: dict[str, int] = {}
         log(
@@ -852,6 +883,394 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         if soc:
             out["pair_social_fee_pda"] = soc
         return out
+
+    def _pump_buy_static_plan_key(self, mint: Pubkey, spend_lamports: int) -> str:
+        return f"{str(mint)}:{int(spend_lamports)}"
+
+    def prepare_pump_buy_static_plan(
+        self,
+        mint_any: Any,
+        amount_sol: Optional[float] = None,
+        *,
+        creator: str = "",
+    ) -> PumpBuyStaticPlan:
+        """Precompile the static Pump buy transaction shape for a mint.
+
+        V165 keeps the hot callback out of MessageV0.try_compile and V75 tip
+        injection. The READY/prewarm path compiles a placeholder buy with the
+        same account list and SWQOS tip; the live send path only patches the
+        Pump buy instruction data with the fresh min-token guard and signs.
+        """
+        t0 = time.time()
+        mint = as_pubkey(mint_any)
+        if amount_sol is None:
+            amount_sol = env_float(
+                "V116C_TRADE_SIZE_SOL",
+                env_float("V102_SCOUT_SIZE_SOL", env_float("PGG2_LIVE_MIN_TRADE_SOL", 0.0015)),
+            )
+        spend_lamports = max(1, int(float(amount_sol) * LAMPORTS_PER_SOL))
+        key = self._pump_buy_static_plan_key(mint, spend_lamports)
+        cached = self._pump_buy_static_plans.get(key)
+        if cached:
+            return cached
+
+        t_accounts0 = time.time()
+        token_program = self.mint_owner(mint)
+        user = as_pubkey(self.public_key)
+        curve_key = pda(PUMP_PROGRAM_ID, b"bonding-curve", bytes(mint))
+        associated_curve = get_associated_token_address(curve_key, mint, token_program)
+        user_ata = get_associated_token_address(user, mint, token_program)
+        creator_pk = as_pubkey(creator) if creator else Pubkey.default()
+        creator_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(creator_pk))
+        user_volume = pda(PUMP_PROGRAM_ID, b"user_volume_accumulator", bytes(user))
+        global_cfg = self.pump_global()
+        placeholder_curve = PumpBondingCurve(
+            key=curve_key,
+            virtual_token_reserves=1,
+            virtual_sol_reserves=1,
+            real_token_reserves=1,
+            real_sol_reserves=0,
+            token_total_supply=0,
+            complete=False,
+            creator=creator_pk,
+            is_mayhem=False,
+            cashback_enabled=False,
+        )
+        fee_recipient = self.pump_fee_recipient(global_cfg, placeholder_curve)
+        creator_vault_override = self._pump_creator_vault_override.get(str(mint), "")
+        if creator_vault_override:
+            creator_vault = as_pubkey(creator_vault_override)
+        fee_recipient_override = self._pump_fee_recipient_override.get(str(mint), "")
+        if fee_recipient_override:
+            fee_recipient = as_pubkey(fee_recipient_override)
+        remaining_metas = tuple(self.pump_buy_remaining_metas(mint))
+        pair_source = self._last_pair_source.get(str(mint), "unknown")
+        pair_recipient = self._last_pair_recipient.get(str(mint), "")
+        pair_social = self._last_pair_social.get(str(mint), "")
+        base_metas = (
+            AccountMeta(self.pump_global_key, False, False),
+            AccountMeta(fee_recipient, False, True),
+            AccountMeta(mint, False, False),
+            AccountMeta(curve_key, False, True),
+            AccountMeta(associated_curve, False, True),
+            AccountMeta(user_ata, False, True),
+            AccountMeta(user, True, True),
+            AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+            AccountMeta(token_program, False, False),
+            AccountMeta(creator_vault, False, True),
+            AccountMeta(self.pump_event_authority, False, False),
+            AccountMeta(PUMP_PROGRAM_ID, False, False),
+            AccountMeta(self.pump_global_volume_accumulator, False, False),
+            AccountMeta(user_volume, False, True),
+            AccountMeta(self.pump_fee_config, False, False),
+            AccountMeta(PUMP_FEE_PROGRAM_ID, False, False),
+        )
+        ata_ix = create_idempotent_associated_token_account(user, user, mint, token_program)
+        account_ms = int((time.time() - t_accounts0) * 1000)
+
+        t_compile0 = time.time()
+        track_volume = b"\x01" if env_bool("PGG2_DIRECT_TRACK_VOLUME", True) else b"\x00"
+        placeholder_data = DISC_PUMP_BUY_EXACT_SOL_IN + u64(spend_lamports) + u64(0) + track_volume
+        placeholder_b64 = self.compile_tx([
+            *self.compute_budget_ixs(),
+            ata_ix,
+            Instruction(PUMP_PROGRAM_ID, placeholder_data, [*base_metas, *remaining_metas]),
+        ])
+        tx = VersionedTransaction.from_bytes(base64.b64decode(placeholder_b64))
+        msg = tx.message
+        pump_ix_index = -1
+        for idx, cix in enumerate(msg.instructions):
+            try:
+                program_key = msg.account_keys[int(cix.program_id_index)]
+            except Exception:
+                continue
+            if program_key == PUMP_PROGRAM_ID and bytes(cix.data).startswith(DISC_PUMP_BUY_EXACT_SOL_IN):
+                pump_ix_index = idx
+                break
+        if pump_ix_index < 0:
+            raise RuntimeError("v165_precompiled_pump_ix_not_found")
+        compile_ms = int((time.time() - t_compile0) * 1000)
+
+        plan = PumpBuyStaticPlan(
+            mint=mint,
+            spend_lamports=spend_lamports,
+            token_program=token_program,
+            curve_key=curve_key,
+            user=user,
+            user_ata=user_ata,
+            associated_curve=associated_curve,
+            creator=creator_pk,
+            creator_vault=creator_vault,
+            user_volume=user_volume,
+            fee_recipient=fee_recipient,
+            base_metas=base_metas,
+            remaining_metas=remaining_metas,
+            ata_ix=ata_ix,
+            header=msg.header,
+            account_keys=tuple(msg.account_keys),
+            address_table_lookups=tuple(msg.address_table_lookups),
+            compiled_instructions=tuple(msg.instructions),
+            pump_ix_index=pump_ix_index,
+            recent_blockhash=msg.recent_blockhash,
+            pair_source=pair_source,
+            pair_recipient=pair_recipient,
+            pair_social=pair_social,
+            created_ts_ms=int(time.time() * 1000),
+        )
+        self._pump_buy_static_plans[key] = plan
+        log(
+            f"PGG2-V165-PUMP-BUY-STATIC-PLAN-READY mint={short_addr(str(mint))} "
+            f"amount_sol={float(amount_sol):.6f} pair_source={pair_source} "
+            f"account_ms={account_ms} compile_ms={compile_ms} "
+            f"total_ms={int((time.time() - t0) * 1000)} pump_ix_index={pump_ix_index}"
+        )
+        return plan
+
+    def build_fast_signed_buy_with_min_tokens_from_curve_snapshot(
+        self,
+        mint_str: str,
+        amount_sol: float,
+        min_tokens_ui: float,
+        *,
+        virtual_token_reserves: int,
+        virtual_sol_reserves: int,
+        real_token_reserves: int,
+        real_sol_reserves: int,
+        token_total_supply: int = 0,
+        complete: bool = False,
+        creator: str = "",
+        is_mayhem: bool = False,
+        cashback_enabled: bool = False,
+        snapshot_ts_ms: int = 0,
+    ) -> dict[str, Any]:
+        if env_bool("PGG2_V165_REQUIRE_PRECOMPILED_BUY_PLAN", True):
+            mint = as_pubkey(mint_str)
+            spend_lamports = max(1, int(float(amount_sol) * LAMPORTS_PER_SOL))
+            key = self._pump_buy_static_plan_key(mint, spend_lamports)
+            plan = self._pump_buy_static_plans.get(key)
+            if plan is None:
+                raise RuntimeError("v165_precompiled_buy_plan_missing")
+        else:
+            plan = self.prepare_pump_buy_static_plan(mint_str, amount_sol, creator=creator)
+
+        _qstart_ms = int(time.time() * 1000)
+        t0 = time.time()
+        mint = plan.mint
+        creator_pk = as_pubkey(creator) if creator else plan.creator
+        creator_vault_override = self._pump_creator_vault_override.get(str(mint), "")
+        has_creator_vault_override = bool(
+            creator_vault_override and str(plan.creator_vault) == creator_vault_override
+        )
+        if env_bool("PGG2_V165_REJECT_DEFAULT_CREATOR_PLAN", True):
+            default_creator = Pubkey.default()
+            if (plan.creator == default_creator or creator_pk == default_creator) and not has_creator_vault_override:
+                raise RuntimeError("v165_precompiled_creator_missing")
+            if creator and plan.creator != creator_pk:
+                raise RuntimeError(
+                    f"v165_precompiled_creator_mismatch plan={short_addr(str(plan.creator))} "
+                    f"creator={short_addr(str(creator_pk))}"
+                )
+        curve = PumpBondingCurve(
+            key=plan.curve_key,
+            virtual_token_reserves=int(virtual_token_reserves),
+            virtual_sol_reserves=int(virtual_sol_reserves),
+            real_token_reserves=int(real_token_reserves),
+            real_sol_reserves=int(real_sol_reserves),
+            token_total_supply=int(token_total_supply),
+            complete=bool(complete),
+            creator=creator_pk,
+            is_mayhem=bool(is_mayhem),
+            cashback_enabled=bool(cashback_enabled),
+        )
+        if curve.complete:
+            raise RuntimeError("v165_fast_snapshot_only_supports_pump_bc")
+        global_cfg = self.pump_global()
+        token_out, fee_lamports = self.quote_pump_buy_tokens(plan.spend_lamports, curve, global_cfg)
+        if env_bool("PGG2_V165_FAST_ASSUME_PUMP_DECIMALS", True):
+            scale = 10 ** env_int("V102_PUMP_TOKEN_DECIMALS", 6)
+            min_tokens_out = max(0, int(float(min_tokens_ui) * scale))
+            out_ui = token_out / float(scale)
+            min_ui = min_tokens_out / float(scale)
+        else:
+            min_tokens_out = max(0, self.ui_to_raw(mint, min_tokens_ui))
+            out_ui = self.raw_to_ui(mint, token_out)
+            min_ui = self.raw_to_ui(mint, min_tokens_out)
+
+        patch_data = (
+            DISC_PUMP_BUY_EXACT_SOL_IN
+            + u64(plan.spend_lamports)
+            + u64(min_tokens_out)
+            + (b"\x01" if env_bool("PGG2_DIRECT_TRACK_VOLUME", True) else b"\x00")
+        )
+        old_ix = plan.compiled_instructions[plan.pump_ix_index]
+        insts = list(plan.compiled_instructions)
+        insts[plan.pump_ix_index] = CompiledInstruction(
+            old_ix.program_id_index,
+            patch_data,
+            old_ix.accounts,
+        )
+        t_msg0 = time.time()
+        plan_age_ms_before_build = max(0, int(time.time() * 1000) - int(plan.created_ts_ms or 0))
+        plan_blockhash_max_age_ms = max(
+            0,
+            env_int("PGG2_V165_FAST_PLAN_BLOCKHASH_MAX_AGE_MS", 30000),
+        )
+        if plan.recent_blockhash and plan_age_ms_before_build <= plan_blockhash_max_age_ms:
+            recent_blockhash = plan.recent_blockhash
+            blockhash_source = "static_plan"
+        else:
+            recent_blockhash = self.latest_blockhash()
+            blockhash_source = "cache_or_rpc"
+        msg = MessageV0(
+            plan.header,
+            list(plan.account_keys),
+            recent_blockhash,
+            insts,
+            list(plan.address_table_lookups),
+        )
+        signer = self.keypair if self.keypair else NullSigner(plan.user)
+        tx = VersionedTransaction(msg, [signer])
+        raw = bytes(tx)
+        verify_ok = True
+        verify_detail = "unavailable"
+        try:
+            verify_results = tx.verify_with_results()
+            verify_ok = all(bool(v) for v in verify_results)
+            verify_detail = ",".join("1" if bool(v) else "0" for v in verify_results)
+        except Exception as exc:
+            verify_ok = False
+            verify_detail = f"{type(exc).__name__}:{str(exc)[:80]}"
+        encoded_spend_lamports = -1
+        encoded_min_tokens_raw = -1
+        encoded_pump_ix_count = 0
+        tip_ix_count = 0
+        tip_lamports = 0
+        tip_to = ""
+        try:
+            verify_tx = VersionedTransaction.from_bytes(raw)
+            for ix in verify_tx.message.instructions:
+                program_id = verify_tx.message.account_keys[ix.program_id_index]
+                data = bytes(ix.data)
+                if program_id == PUMP_PROGRAM_ID and data.startswith(DISC_PUMP_BUY_EXACT_SOL_IN):
+                    encoded_pump_ix_count += 1
+                    if len(data) >= len(DISC_PUMP_BUY_EXACT_SOL_IN) + 16:
+                        encoded_spend_lamports = struct.unpack(
+                            "<Q",
+                            data[
+                                len(DISC_PUMP_BUY_EXACT_SOL_IN):
+                                len(DISC_PUMP_BUY_EXACT_SOL_IN) + 8
+                            ],
+                        )[0]
+                        encoded_min_tokens_raw = struct.unpack(
+                            "<Q",
+                            data[
+                                len(DISC_PUMP_BUY_EXACT_SOL_IN) + 8:
+                                len(DISC_PUMP_BUY_EXACT_SOL_IN) + 16
+                            ],
+                        )[0]
+                    break
+            for ix in verify_tx.message.instructions:
+                program_id = verify_tx.message.account_keys[ix.program_id_index]
+                data = bytes(ix.data)
+                if (
+                    program_id == SYSTEM_PROGRAM_ID
+                    and len(data) >= 12
+                    and int.from_bytes(data[:4], "little") == 2
+                    and len(ix.accounts) >= 2
+                ):
+                    lamports = int.from_bytes(data[4:12], "little")
+                    to_pk = verify_tx.message.account_keys[int(ix.accounts[1])]
+                    if lamports >= env_int("PGG2_V75_TIP_LAMPORTS", 5000):
+                        tip_ix_count += 1
+                        tip_lamports = lamports
+                        tip_to = str(to_pk)
+        except Exception as exc:
+            verify_ok = False
+            verify_detail = f"{verify_detail}|decode:{type(exc).__name__}:{str(exc)[:80]}"
+        guard_match = (
+            encoded_pump_ix_count == 1
+            and encoded_spend_lamports == int(plan.spend_lamports)
+            and encoded_min_tokens_raw == int(min_tokens_out)
+        )
+        tip_ok = tip_ix_count >= 1 and tip_lamports >= env_int("PGG2_V75_TIP_LAMPORTS", 5000)
+        if env_bool("PGG2_V165_REQUIRE_FAST_TX_VERIFY", True) and (
+            not verify_ok
+            or not guard_match
+            or (
+                env_bool("PGG2_V165_REQUIRE_FAST_TIP_VERIFY", True)
+                and not tip_ok
+            )
+        ):
+            log(
+                f"PGG2-V165-FAST-TX-VERIFY mint={short_addr(mint_str)} "
+                f"verify_ok={int(verify_ok)} guard_match={int(guard_match)} "
+                f"tip_ok={int(tip_ok)} tip_ix_count={tip_ix_count} "
+                f"tip_lamports={tip_lamports} tip_to={tip_to or '-'} "
+                f"verify_detail={verify_detail!r} pump_ix_count={encoded_pump_ix_count} "
+                f"encoded_spend_lamports={encoded_spend_lamports} "
+                f"expected_spend_lamports={int(plan.spend_lamports)} "
+                f"encoded_min_tokens_raw={encoded_min_tokens_raw} "
+                f"expected_min_tokens_raw={int(min_tokens_out)} tx_bytes={len(raw)}"
+            )
+            raise RuntimeError("v165_fast_tx_verify_failed")
+        signed_b64 = base64.b64encode(raw).decode("ascii")
+        sign_compile_ms = int((time.time() - t_msg0) * 1000)
+        _qend_ms = int(time.time() * 1000)
+        self._last_pair_source[str(mint)] = plan.pair_source
+        if plan.pair_recipient:
+            self._last_pair_recipient[str(mint)] = plan.pair_recipient
+        if plan.pair_social:
+            self._last_pair_social[str(mint)] = plan.pair_social
+        fee_sol = fee_lamports / LAMPORTS_PER_SOL
+        log(
+            f"PGG2-V165-FAST-SNAPSHOT-BUY-BUILD mint={short_addr(mint_str)} "
+            f"plan_age_ms={max(0, _qend_ms - int(plan.created_ts_ms or 0))} "
+            f"patch_sign_ms={sign_compile_ms} total_ms={int((time.time() - t0) * 1000)} "
+            f"out={out_ui:.6f} min={min_ui:.6f} pair_source={plan.pair_source} "
+            f"blockhash_source={blockhash_source} "
+            f"snapshot_age_ms={max(0, _qend_ms - int(snapshot_ts_ms or 0)) if snapshot_ts_ms else -1}"
+        )
+        log(
+            f"PGG2-V165-FAST-TX-VERIFY mint={short_addr(mint_str)} "
+            f"verify_ok={int(verify_ok)} guard_match={int(guard_match)} "
+            f"tip_ok={int(tip_ok)} tip_ix_count={tip_ix_count} "
+            f"tip_lamports={tip_lamports} tip_to={tip_to or '-'} "
+            f"verify_detail={verify_detail!r} pump_ix_count={encoded_pump_ix_count} "
+            f"encoded_spend_lamports={encoded_spend_lamports} "
+            f"encoded_min_tokens_raw={encoded_min_tokens_raw} tx_bytes={len(raw)}"
+        )
+        try:
+            self.record_quote_latency(
+                side="buy",
+                mint=mint_str,
+                route="pump_bc",
+                source="v165_fast_precompiled_snapshot",
+                start_ms=_qstart_ms,
+                end_ms=_qend_ms,
+                success=True,
+                pair_source=plan.pair_source,
+                was_simulation_needed=False,
+            )
+        except Exception:
+            pass
+        return {
+            "txn": signed_b64,
+            "signed_txn": signed_b64,
+            "sig_preview": str(tx.signatures[0]) if tx.signatures else b58encode(raw),
+            "route": "pump_bc",
+            "quote_network_latency_ms": max(0, _qend_ms - _qstart_ms),
+            "quote_returned_ts_ms": _qend_ms,
+            "quote_source": "v165_fast_precompiled_snapshot",
+            "snapshot_ts_ms": int(snapshot_ts_ms or 0),
+            "v165_fast_signed": True,
+            "rate": {
+                "amountOut": out_ui,
+                "minAmountOut": min_ui,
+                "priceImpact": plan.spend_lamports / max(curve.virtual_sol_reserves, 1),
+                "fee": fee_sol,
+                "feeBps": global_cfg.fee_bps + global_cfg.creator_fee_bps,
+            },
+        }
 
     def pump_sell_remaining_metas(self, mint: Pubkey, curve: PumpBondingCurve, user: Pubkey) -> list[AccountMeta]:
         buyback = self.pump_buyback_remaining_metas(mint)
