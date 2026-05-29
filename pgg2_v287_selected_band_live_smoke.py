@@ -1340,7 +1340,7 @@ def main() -> int:
     ap.add_argument(
         "--enable-two-prior-buy-lane",
         action="store_true",
-        default=os.environ.get("V287_ENABLE_TWO_PRIOR_BUY_LANE", "1") == "1",
+        default=os.environ.get("V287_ENABLE_TWO_PRIOR_BUY_LANE", "0") == "1",
     )
     ap.add_argument(
         "--two-prior-current-min-sol",
