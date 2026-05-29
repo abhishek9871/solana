@@ -1400,6 +1400,7 @@ def main() -> int:
     ap.add_argument("--top-share-max", type=float, default=float(os.environ.get("V287_TOP_SHARE_MAX", "0.80")))
     ap.add_argument("--low-top-rearm-min-sol", type=float, default=float(os.environ.get("V287_LOW_TOP_REARM_MIN_SOL", "1.00")))
     ap.add_argument("--low-top-rearm-max-sol", type=float, default=float(os.environ.get("V287_LOW_TOP_REARM_MAX_SOL", "1.65")))
+    ap.add_argument("--fresh-impulse-current-min-sol", type=float, default=float(os.environ.get("V287_FRESH_IMPULSE_CURRENT_MIN_SOL", "2.80")))
     ap.add_argument("--fresh-impulse-current-max-sol", type=float, default=float(os.environ.get("V287_FRESH_IMPULSE_CURRENT_MAX_SOL", "3.25")))
     ap.add_argument("--fresh-impulse-prev-buy-max-sol", type=float, default=float(os.environ.get("V287_FRESH_IMPULSE_PREV_BUY_MAX_SOL", "3.00")))
     ap.add_argument("--fresh-impulse-rearm-min-sol", type=float, default=float(os.environ.get("V287_FRESH_IMPULSE_REARM_MIN_SOL", "3.00")))
@@ -1638,7 +1639,7 @@ def main() -> int:
         f"low_top_enabled={int(bool(args.enable_low_top_lane))} "
         f"low_top_rearm_buy_sol=[{float(args.low_top_rearm_min_sol):.2f},{float(args.low_top_rearm_max_sol):.2f}] "
         f"fresh_impulse_enabled={int(bool(args.enable_fresh_impulse_lane))} "
-        f"fresh_current_max={float(args.fresh_impulse_current_max_sol):.2f} "
+        f"fresh_current=[{float(args.fresh_impulse_current_min_sol):.2f},{float(args.fresh_impulse_current_max_sol):.2f}] "
         f"fresh_prev_buy_max={float(args.fresh_impulse_prev_buy_max_sol):.2f} "
         f"fresh_rearm_buy_sol=[{float(args.fresh_impulse_rearm_min_sol):.2f},{float(args.fresh_impulse_rearm_max_sol):.2f}] "
         f"fresh_max_rearm_buys={int(args.fresh_impulse_max_rearm_buys)} "
@@ -2853,6 +2854,7 @@ def main() -> int:
                     and not active
                     and len(prev_sells) == 0
                     and current_ok_main
+                    and current_buy_sol >= float(args.fresh_impulse_current_min_sol)
                     and current_buy_sol <= float(args.fresh_impulse_current_max_sol)
                     and prev_buy_sol <= float(args.fresh_impulse_prev_buy_max_sol)
                 )
