@@ -325,6 +325,7 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_EARLY_SELL_POLL_MS", "25")
     os.environ.setdefault("V287_EXTENDED_SCRATCH_MAX_MS", "900")
     os.environ.setdefault("V287_REQUIRE_POST_PLAN_REARM", "1")
+    os.environ.setdefault("V287_CANDIDATE_TTL_MS", "1000")
     os.environ.setdefault("V287_POST_PLAN_REARM_TTL_MS", "1100")
     os.environ.setdefault("V287_BACKGROUND_BLOCKHASH_WARM_MS", "20000")
     os.environ.setdefault("V287_BACKGROUND_GLOBAL_WARM_MS", "4000")
@@ -346,11 +347,11 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_VERIFIED_MID_CARRY_REARM_MAX_SOL", "3.50")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MIN_BUYS", "4")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MIN_SOL", "4.00")
-    os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS", "350")
+    os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS", "1000")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_PREV_MAX_SOL", "0.10")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS", "650")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH", "1")
-    os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "350")
+    os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "1000")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
