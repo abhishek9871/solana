@@ -353,6 +353,22 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_PREV_MAX_SOL", "0.10")
     os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS", "650")
     os.environ.setdefault("V287_ALLOW_NEGATIVE_SELF_ROUNDTRIP_CONTINUATION", "0")
+    os.environ.setdefault("V287_ALLOW_SELECTED_NEGATIVE_ROUNDTRIP_FINGERPRINT", "1")
+    os.environ.setdefault("V287_SELECTED_FRESH_LOW_MULTI_MIN_BUYS", "3")
+    os.environ.setdefault("V287_SELECTED_FRESH_LOW_MULTI_MIN_DELAY_MS", "175")
+    os.environ.setdefault("V287_SELECTED_FRESH_LOW_MULTI_MAX_DELAY_MS", "350")
+    os.environ.setdefault("V287_SELECTED_FRESH_LOW_MULTI_MAX_SOL", "1.05")
+    os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MIN_SOL", "1.45")
+    os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MAX_SOL", "2.25")
+    os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MAX_DELAY_MS", "25")
+    os.environ.setdefault("V287_SELECTED_FRESH_STRONG_MIN_SOL", "3.80")
+    os.environ.setdefault("V287_SELECTED_FRESH_STRONG_MAX_SOL", "4.50")
+    os.environ.setdefault("V287_SELECTED_FRESH_STRONG_MIN_DELAY_MS", "75")
+    os.environ.setdefault("V287_SELECTED_FRESH_STRONG_MAX_DELAY_MS", "150")
+    os.environ.setdefault("V287_SELECTED_NORMAL_REARM_MIN_SOL", "0.70")
+    os.environ.setdefault("V287_SELECTED_NORMAL_REARM_MAX_SOL", "2.05")
+    os.environ.setdefault("V287_SELECTED_NORMAL_MIN_DELAY_MS", "75")
+    os.environ.setdefault("V287_SELECTED_NORMAL_MAX_DELAY_MS", "150")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH", "1")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "1000")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
@@ -712,6 +728,89 @@ def _prebuy_continuation_credit_projection_from_curve(
             f"mint={_short(mint)} full_mint={mint} err={type(exc).__name__}:{str(exc)[:180]}"
         )
         return False, -10**18
+
+
+def _v287_selected_negative_roundtrip_fingerprint(
+    *,
+    top_lane: str,
+    current_buy_sol: float,
+    prev_buy_sol: float,
+    pre_entry_buys: int,
+    observed_rearm_sol: float,
+    first_rearm_delay_ms: int,
+    last_rearm_delay_ms: int,
+    last_rearm_lag_ms: int,
+) -> tuple[bool, str]:
+    """Allow only replay-backed V287 fast-lane negative self-roundtrip cases.
+
+    The broad negative self-roundtrip override produced mPaf-class losses. The
+    winning fast lane still needs a narrow exception because Pump self-roundtrip
+    is structurally negative before external continuation arrives. These
+    fingerprints are intentionally small and derived from the live win/loss
+    split in the V287 logs.
+    """
+    if os.environ.get("V287_ALLOW_SELECTED_NEGATIVE_ROUNDTRIP_FINGERPRINT", "1") == "0":
+        return False, "selected_fingerprint_disabled"
+    if last_rearm_lag_ms > int(os.environ.get("V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS", "650")):
+        return False, "selected_rearm_lag_stale"
+    if last_rearm_delay_ms > 350:
+        return False, "selected_rearm_delay_stale"
+
+    if top_lane == "fresh_impulse":
+        if not (2.80 <= current_buy_sol <= 3.25):
+            return False, "selected_fresh_current_out_of_band"
+        if prev_buy_sol > 1e-12:
+            return False, "selected_fresh_prev_buy_present"
+
+        low_multi_min_buys = int(os.environ.get("V287_SELECTED_FRESH_LOW_MULTI_MIN_BUYS", "3"))
+        low_multi_min_delay = int(os.environ.get("V287_SELECTED_FRESH_LOW_MULTI_MIN_DELAY_MS", "175"))
+        low_multi_max_delay = int(os.environ.get("V287_SELECTED_FRESH_LOW_MULTI_MAX_DELAY_MS", "350"))
+        low_multi_max_sol = float(os.environ.get("V287_SELECTED_FRESH_LOW_MULTI_MAX_SOL", "1.05"))
+        if (
+            0.70 <= observed_rearm_sol <= low_multi_max_sol
+            and pre_entry_buys >= low_multi_min_buys
+            and low_multi_min_delay <= first_rearm_delay_ms <= low_multi_max_delay
+        ):
+            return True, "selected_fresh_paced_low_multi_rearm"
+
+        mid_min_sol = float(os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_MIN_SOL", "1.45"))
+        mid_max_sol = float(os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_MAX_SOL", "2.25"))
+        mid_max_delay = int(os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_MAX_DELAY_MS", "25"))
+        if (
+            mid_min_sol <= observed_rearm_sol <= mid_max_sol
+            and 1 <= pre_entry_buys <= 2
+            and first_rearm_delay_ms <= mid_max_delay
+        ):
+            return True, "selected_fresh_single_mid_rearm"
+
+        strong_min_sol = float(os.environ.get("V287_SELECTED_FRESH_STRONG_MIN_SOL", "3.80"))
+        strong_max_sol = float(os.environ.get("V287_SELECTED_FRESH_STRONG_MAX_SOL", "4.50"))
+        strong_min_delay = int(os.environ.get("V287_SELECTED_FRESH_STRONG_MIN_DELAY_MS", "75"))
+        strong_max_delay = int(os.environ.get("V287_SELECTED_FRESH_STRONG_MAX_DELAY_MS", "150"))
+        if (
+            strong_min_sol <= observed_rearm_sol <= strong_max_sol
+            and 2 <= pre_entry_buys <= 3
+            and strong_min_delay <= first_rearm_delay_ms <= strong_max_delay
+        ):
+            return True, "selected_fresh_strong_multi_rearm"
+
+    if top_lane == "normal_top":
+        normal_min_sol = float(os.environ.get("V287_SELECTED_NORMAL_REARM_MIN_SOL", "0.70"))
+        normal_max_sol = float(os.environ.get("V287_SELECTED_NORMAL_REARM_MAX_SOL", "2.05"))
+        normal_min_delay = int(os.environ.get("V287_SELECTED_NORMAL_MIN_DELAY_MS", "75"))
+        normal_max_delay = int(os.environ.get("V287_SELECTED_NORMAL_MAX_DELAY_MS", "150"))
+        if (
+            normal_min_sol <= observed_rearm_sol <= normal_max_sol
+            and pre_entry_buys >= 1
+            and normal_min_delay <= first_rearm_delay_ms <= normal_max_delay
+        ):
+            return True, "selected_normal_top_rearm"
+
+    return False, "selected_no_match"
+
+
+def _v287_selected_negative_reason_allowed(reason: str) -> bool:
+    return bool(reason.startswith("selected_")) and reason != "selected_no_match"
 
 
 def _prebuy_postbuy_sell_projection_pass(
@@ -2498,6 +2597,35 @@ def main() -> int:
                                                 f"projected_delta={continuation_delta:+} "
                                                 f"age_ms={age_ms}"
                                             )
+                                    selected_negative_ok, selected_negative_reason = (
+                                        _v287_selected_negative_roundtrip_fingerprint(
+                                            top_lane=top_lane,
+                                            current_buy_sol=current_buy_sol,
+                                            prev_buy_sol=prev_buy_sol,
+                                            pre_entry_buys=pre_entry_buys,
+                                            observed_rearm_sol=observed_rearm_sol,
+                                            first_rearm_delay_ms=first_rearm_delay_ms,
+                                            last_rearm_delay_ms=last_rearm_delay_ms,
+                                            last_rearm_lag_ms=last_rearm_lag_ms,
+                                        )
+                                    )
+                                    if not continuation_ok and selected_negative_ok:
+                                        continuation_ok = True
+                                        continuation_model_ok = True
+                                        continuation_reason = selected_negative_reason
+                                        counters["selected_negative_roundtrip_fingerprint_pass"] += 1
+                                        _log(
+                                            "PGG2-V287-SELECTED-NEGATIVE-ROUNDTRIP-FINGERPRINT-PASS "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={selected_negative_reason} "
+                                            f"top_lane={top_lane} current_buy_sol={current_buy_sol:.6f} "
+                                            f"prev_buy_sol={prev_buy_sol:.6f} "
+                                            f"pre_entry_buys={pre_entry_buys} "
+                                            f"pre_entry_buy_sol={observed_rearm_sol:.6f} "
+                                            f"first_rearm_delay_ms={first_rearm_delay_ms} "
+                                            f"last_rearm_delay_ms={last_rearm_delay_ms} "
+                                            f"last_rearm_lag_ms={last_rearm_lag_ms}"
+                                        )
                                     if not continuation_ok:
                                         keep_unverified_fresh_watch = (
                                             os.environ.get(
@@ -2565,12 +2693,16 @@ def main() -> int:
                                         )
                                         active.pop(mint, None)
                                         continue
+                                    selected_negative_reason_allowed = (
+                                        _v287_selected_negative_reason_allowed(continuation_reason or "")
+                                    )
                                     if (
                                         os.environ.get(
                                             "V287_ALLOW_NEGATIVE_SELF_ROUNDTRIP_CONTINUATION",
                                             "0",
                                         )
                                         != "1"
+                                        and not selected_negative_reason_allowed
                                     ):
                                         counters[
                                             "negative_self_roundtrip_continuation_block"
@@ -2591,6 +2723,21 @@ def main() -> int:
                                         )
                                         active.pop(mint, None)
                                         continue
+                                    if selected_negative_reason_allowed:
+                                        counters["selected_negative_roundtrip_send_allow"] += 1
+                                        _log(
+                                            "PGG2-V287-SELECTED-NEGATIVE-ROUNDTRIP-SEND-ALLOW "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason} "
+                                            f"current_buy_sol={current_buy_sol:.6f} "
+                                            f"prev_buy_sol={prev_buy_sol:.6f} "
+                                            f"pre_entry_buys={pre_entry_buys} "
+                                            f"pre_entry_buy_sol={observed_rearm_sol:.6f} "
+                                            f"first_rearm_delay_ms={first_rearm_delay_ms} "
+                                            f"last_rearm_delay_ms={last_rearm_delay_ms} "
+                                            f"last_rearm_lag_ms={last_rearm_lag_ms} "
+                                            "source=final_projection_negative"
+                                        )
                                 min_quote_tokens = float(args.min_buy_quote_tokens)
                                 _log(
                                     "PGG2-V287-BUY-QUOTE-VIABILITY "
@@ -2667,14 +2814,22 @@ def main() -> int:
                                         log_tag="PGG2-V287-FAST-FINAL-PREBUY-REFRESH-CHECK",
                                     )
                                     if not ok_proj:
+                                        selected_negative_reason_allowed = (
+                                            _v287_selected_negative_reason_allowed(
+                                                continuation_reason or ""
+                                            )
+                                        )
                                         if (
                                             continuation_model_ok
                                             and quote_tokens > 0
-                                            and os.environ.get(
-                                                "V287_ALLOW_NEGATIVE_SELF_ROUNDTRIP_CONTINUATION",
-                                                "0",
+                                            and (
+                                                os.environ.get(
+                                                    "V287_ALLOW_NEGATIVE_SELF_ROUNDTRIP_CONTINUATION",
+                                                    "0",
+                                                )
+                                                == "1"
+                                                or selected_negative_reason_allowed
                                             )
-                                            == "1"
                                         ):
                                             counters["prebuy_refresh_projection_continuation_pass"] += 1
                                             _log(
