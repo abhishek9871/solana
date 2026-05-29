@@ -340,10 +340,16 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_VERIFIED_PRIOR_CARRY_PREV_MIN_SOL", "2.00")
     os.environ.setdefault("V287_VERIFIED_PRIOR_CARRY_REARM_MIN_SOL", "0.70")
     os.environ.setdefault("V287_VERIFIED_PRIOR_CARRY_REARM_MAX_SOL", "1.20")
-    os.environ.setdefault("V287_VERIFIED_MID_CARRY_PREV_MIN_SOL", "1.00")
+    os.environ.setdefault("V287_VERIFIED_MID_CARRY_PREV_MIN_SOL", "0.90")
     os.environ.setdefault("V287_VERIFIED_MID_CARRY_PREV_MAX_SOL", "2.00")
     os.environ.setdefault("V287_VERIFIED_MID_CARRY_REARM_MIN_SOL", "2.00")
-    os.environ.setdefault("V287_VERIFIED_MID_CARRY_REARM_MAX_SOL", "3.20")
+    os.environ.setdefault("V287_VERIFIED_MID_CARRY_REARM_MAX_SOL", "3.50")
+    os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MIN_BUYS", "4")
+    os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MIN_SOL", "4.00")
+    os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS", "350")
+    os.environ.setdefault("V287_VERIFIED_HOT_TRAIN_PREV_MAX_SOL", "0.10")
+    os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH", "1")
+    os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "350")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
@@ -1812,21 +1818,58 @@ def main() -> int:
                                 f"delay_ms={now-int(cand['start_ms'])}"
                             )
                         else:
-                            counters["oversize_train_wait"] += 1
-                            _log(
-                                "PGG2-V287-OVERSIZE-TRAIN-WAIT "
-                                f"mint={_short(mint)} pre_entry_buys={int(cand['pre_entry_buys'])} "
-                                f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
-                                f"need_buys={int(args.oversize_train_min_buys)} "
-                                f"need_sol={float(args.oversize_train_min_sol):.6f} "
-                                f"rearm_max_sol={cand_rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
-                                f"delay_ms={now-int(cand['start_ms'])}"
+                            hot_train_min_buys = int(
+                                os.environ.get("V287_VERIFIED_HOT_TRAIN_MIN_BUYS", "4")
                             )
-                            continue
+                            hot_train_min_sol = float(
+                                os.environ.get("V287_VERIFIED_HOT_TRAIN_MIN_SOL", "4.00")
+                            )
+                            hot_train_max_age_ms = int(
+                                os.environ.get("V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS", "350")
+                            )
+                            hot_train_prev_max_sol = float(
+                                os.environ.get("V287_VERIFIED_HOT_TRAIN_PREV_MAX_SOL", "0.10")
+                            )
+                            hot_train_ok = (
+                                os.environ.get("V287_ENABLE_VERIFIED_HOT_TRAIN", "1") != "0"
+                                and str(cand.get("top_lane", "")) == "fresh_impulse"
+                                and float(cand.get("prev_buy_sol") or 0.0)
+                                <= hot_train_prev_max_sol
+                                and now - int(cand["start_ms"]) <= hot_train_max_age_ms
+                                and int(cand["pre_entry_buys"]) >= hot_train_min_buys
+                                and cand["pre_entry_buy_lamports"]
+                                >= int(hot_train_min_sol * LAMPORTS_PER_SOL)
+                            )
+                            if hot_train_ok:
+                                counters["verified_hot_train_pass"] += 1
+                                cand["verified_hot_train"] = 1
+                                _log(
+                                    "PGG2-V287-VERIFIED-HOT-TRAIN-PASS "
+                                    f"mint={_short(mint)} full_mint={mint} "
+                                    f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                    f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                    f"prev_buy_sol={float(cand.get('prev_buy_sol') or 0.0):.6f} "
+                                    f"min_buys={hot_train_min_buys} min_sol={hot_train_min_sol:.6f} "
+                                    f"delay_ms={now-int(cand['start_ms'])} source=live_shadow_miss_separator"
+                                )
+                            else:
+                                counters["oversize_train_wait"] += 1
+                                _log(
+                                    "PGG2-V287-OVERSIZE-TRAIN-WAIT "
+                                    f"mint={_short(mint)} pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                    f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                    f"need_buys={int(args.oversize_train_min_buys)} "
+                                    f"need_sol={float(args.oversize_train_min_sol):.6f} "
+                                    f"rearm_max_sol={cand_rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
+                                    f"delay_ms={now-int(cand['start_ms'])}"
+                                )
+                                continue
+                    hot_train_flag = bool(cand.get("verified_hot_train"))
                     if (
                         str(cand.get("top_lane", "")) == "fresh_impulse"
                         and int(cand.get("pre_entry_buys") or 0)
                         > int(args.fresh_impulse_max_rearm_buys)
+                        and not hot_train_flag
                     ):
                         counters["fresh_impulse_rearm_buys_block"] += 1
                         _log(
@@ -1838,6 +1881,19 @@ def main() -> int:
                         )
                         active.pop(mint, None)
                         continue
+                    if (
+                        str(cand.get("top_lane", "")) == "fresh_impulse"
+                        and int(cand.get("pre_entry_buys") or 0)
+                        > int(args.fresh_impulse_max_rearm_buys)
+                        and hot_train_flag
+                    ):
+                        _log(
+                            "PGG2-V287-FRESH-IMPULSE-REARM-BUYS-ALLOW "
+                            f"mint={_short(mint)} full_mint={mint} "
+                            f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                            f"max_rearm_buys={int(args.fresh_impulse_max_rearm_buys)} "
+                            "reason=verified_hot_train"
+                        )
                     if cand["pre_entry_buys"] >= 1 and cand["pre_entry_buy_lamports"] >= cand_rearm_min_lamports:
                         cand.setdefault(
                             "first_rearm_pass_delay_ms",
@@ -2165,6 +2221,40 @@ def main() -> int:
                                             )
                                         )
                                     )
+                                    verified_hot_train = (
+                                        os.environ.get("V287_ENABLE_VERIFIED_HOT_TRAIN", "1")
+                                        != "0"
+                                        and top_lane == "fresh_impulse"
+                                        and 2.80 <= current_buy_sol <= 3.25
+                                        and prev_buy_sol
+                                        <= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_HOT_TRAIN_PREV_MAX_SOL",
+                                                "0.10",
+                                            )
+                                        )
+                                        and pre_entry_buys
+                                        >= int(
+                                            os.environ.get(
+                                                "V287_VERIFIED_HOT_TRAIN_MIN_BUYS",
+                                                "4",
+                                            )
+                                        )
+                                        and observed_rearm_sol
+                                        >= float(
+                                            os.environ.get(
+                                                "V287_VERIFIED_HOT_TRAIN_MIN_SOL",
+                                                "4.00",
+                                            )
+                                        )
+                                        and age_ms
+                                        <= int(
+                                            os.environ.get(
+                                                "V287_VERIFIED_HOT_TRAIN_MAX_AGE_MS",
+                                                "350",
+                                            )
+                                        )
+                                    )
                                     verified_high_current_rearm = (
                                         os.environ.get(
                                             "V287_ENABLE_HIGH_CURRENT_REARM_LANE",
@@ -2201,6 +2291,7 @@ def main() -> int:
                                             verified_strong_fresh_rearm
                                             or verified_prior_carry_rearm
                                             or verified_mid_carry_rearm
+                                            or verified_hot_train
                                         )
                                     ):
                                         continuation_ok = True
@@ -2209,6 +2300,8 @@ def main() -> int:
                                             continuation_reason = "strong_fresh_rearm"
                                         elif verified_prior_carry_rearm:
                                             continuation_reason = "prior_carry_rearm"
+                                        elif verified_hot_train:
+                                            continuation_reason = "hot_train"
                                         else:
                                             continuation_reason = "mid_carry_rearm"
                                         counters["verified_flow_continuation_pass"] += 1
@@ -2292,6 +2385,51 @@ def main() -> int:
                                                 f"age_ms={age_ms}"
                                             )
                                     if not continuation_ok:
+                                        keep_unverified_fresh_watch = (
+                                            os.environ.get(
+                                                "V287_KEEP_UNVERIFIED_FRESH_WATCH",
+                                                "1",
+                                            )
+                                            != "0"
+                                            and top_lane == "fresh_impulse"
+                                            and age_ms
+                                            < int(
+                                                os.environ.get(
+                                                    "V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS",
+                                                    "350",
+                                                )
+                                            )
+                                            and (
+                                                pre_entry_buys
+                                                < int(
+                                                    os.environ.get(
+                                                        "V287_VERIFIED_HOT_TRAIN_MIN_BUYS",
+                                                        "4",
+                                                    )
+                                                )
+                                                or observed_rearm_sol
+                                                < float(
+                                                    os.environ.get(
+                                                        "V287_VERIFIED_HOT_TRAIN_MIN_SOL",
+                                                        "4.00",
+                                                    )
+                                                )
+                                            )
+                                        )
+                                        if keep_unverified_fresh_watch:
+                                            counters["unverified_fresh_watch_keep"] += 1
+                                            _log(
+                                                "PGG2-V287-UNVERIFIED-FRESH-WATCH-KEEP "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"current_buy_sol={current_buy_sol:.6f} "
+                                                f"prev_buy_sol={prev_buy_sol:.6f} "
+                                                f"pre_entry_buys={pre_entry_buys} "
+                                                f"pre_entry_buy_sol={observed_rearm_sol:.6f} "
+                                                f"age_ms={age_ms} "
+                                                "reason=wait_for_verified_hot_train_or_carry"
+                                            )
+                                            hist[mint].append(rec)
+                                            continue
                                         if (
                                             os.environ.get("V287_ENABLE_CONTINUATION_CREDIT", "0") == "0"
                                             and not verified_low_rearm_continuation
@@ -2299,6 +2437,7 @@ def main() -> int:
                                             and not verified_strong_fresh_rearm
                                             and not verified_prior_carry_rearm
                                             and not verified_mid_carry_rearm
+                                            and not verified_hot_train
                                         ):
                                             _log(
                                                 "PGG2-V287-CONTINUATION-CREDIT-DISABLED "
