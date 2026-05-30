@@ -358,18 +358,48 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_SELECTED_FRESH_LOW_MULTI_MIN_DELAY_MS", "175")
     os.environ.setdefault("V287_SELECTED_FRESH_LOW_MULTI_MAX_DELAY_MS", "350")
     os.environ.setdefault("V287_SELECTED_FRESH_LOW_MULTI_MAX_SOL", "1.05")
-    os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MIN_SOL", "1.45")
+    os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MIN_SOL", "1.35")
     os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MAX_SOL", "2.25")
     os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MAX_DELAY_MS", "25")
     os.environ.setdefault("V287_SELECTED_FRESH_STRONG_MIN_SOL", "3.80")
     os.environ.setdefault("V287_SELECTED_FRESH_STRONG_MAX_SOL", "4.50")
     os.environ.setdefault("V287_SELECTED_FRESH_STRONG_MIN_DELAY_MS", "75")
     os.environ.setdefault("V287_SELECTED_FRESH_STRONG_MAX_DELAY_MS", "150")
+    os.environ.setdefault("V287_SELECTED_FRESH_DENSE_TRAIN_MIN_BUYS", "4")
+    os.environ.setdefault("V287_SELECTED_FRESH_DENSE_TRAIN_MAX_BUYS", "5")
+    os.environ.setdefault("V287_SELECTED_FRESH_DENSE_TRAIN_MIN_SOL", "2.30")
+    os.environ.setdefault("V287_SELECTED_FRESH_DENSE_TRAIN_MAX_SOL", "3.60")
+    os.environ.setdefault("V287_SELECTED_FRESH_DENSE_TRAIN_MAX_DELAY_MS", "75")
+    os.environ.setdefault("V287_SELECTED_FRESH_INSTANT_DENSE_MIN_BUYS", "4")
+    os.environ.setdefault("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_BUYS", "5")
+    os.environ.setdefault("V287_SELECTED_FRESH_INSTANT_DENSE_MIN_SOL", "1.50")
+    os.environ.setdefault("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_SOL", "4.50")
+    os.environ.setdefault("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_DELAY_MS", "75")
+    os.environ.setdefault("V287_NORMAL_TOP_CURRENT_MIN_SOL", "2.00")
+    os.environ.setdefault("V287_NORMAL_TOP_CURRENT_MAX_SOL", "3.25")
+    os.environ.setdefault("V287_EDGE_TOP_ENABLED", "1")
+    os.environ.setdefault("V287_EDGE_TOP_MIN_SHARE", "0.50")
+    os.environ.setdefault("V287_EDGE_TOP_REARM_MIN_SOL", "1.80")
+    os.environ.setdefault("V287_EDGE_TOP_REARM_MAX_SOL", "3.20")
     os.environ.setdefault("V287_SELECTED_NORMAL_REARM_MIN_SOL", "0.70")
     os.environ.setdefault("V287_SELECTED_NORMAL_REARM_MAX_SOL", "2.05")
     os.environ.setdefault("V287_SELECTED_NORMAL_MIN_DELAY_MS", "75")
     os.environ.setdefault("V287_SELECTED_NORMAL_MAX_DELAY_MS", "150")
     os.environ.setdefault("V287_SELECTED_MAX_NEG_REFRESH_DRIFT_PCT", "1.25")
+    os.environ.setdefault("V287_SELECTED_BLOCK_ANY_NEG_REFRESH_DRIFT", "1")
+    os.environ.setdefault("V287_SELECTED_ACCELERATION_NEG_REFRESH_DRIFT_PCT", "8.00")
+    os.environ.setdefault("V287_SELECTED_POSTPLAN_FOLLOWTHROUGH_MIN_SOL", "0.70")
+    os.environ.setdefault("V287_SELECTED_NO_MOVEMENT_FOLLOWTHROUGH", "1")
+    os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MIN_SOL", "4.50")
+    os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_SOL", "10.00")
+    os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_DELAY_MS", "1200")
+    os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_BUYS", "6")
+    os.environ.setdefault("V287_SELECTED_SINGLE_MID_MIN_QUOTE_TOKENS", "680000")
+    os.environ.setdefault("V287_SELECTED_STRONG_MIN_QUOTE_TOKENS", "660000")
+    os.environ.setdefault("V287_SELECTED_UPPER_MID_MULTI_MIN_QUOTE_TOKENS", "700000")
+    os.environ.setdefault("V287_SELECTED_WEAK_DRIFT_KEEP_WATCH", "1")
+    os.environ.setdefault("V287_SELECTED_WEAK_DRIFT_WATCH_MAX_AGE_MS", "900")
+    os.environ.setdefault("V287_EVENT_BUY_MAX_SOL_SANITY", "20.00")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH", "1")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "1000")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
@@ -600,8 +630,19 @@ def _static_plan_future_done_ok(plan_fut: Any) -> tuple[bool, bool, str]:
 
 def _candidate_live_ttl_ms(cand: dict[str, Any]) -> int:
     base = int(os.environ.get("V287_CANDIDATE_TTL_MS", "350"))
+    base = max(base, int(cand.get("candidate_ttl_ms") or 0))
     if cand.get("post_plan_rearm_required"):
-        return max(base, int(os.environ.get("V287_POST_PLAN_REARM_TTL_MS", "1100")))
+        base = max(base, int(os.environ.get("V287_POST_PLAN_REARM_TTL_MS", "1100")))
+    if cand.get("weak_drift_watch_keep"):
+        base = max(
+            base,
+            int(os.environ.get("V287_SELECTED_WEAK_DRIFT_WATCH_MAX_AGE_MS", "900")),
+        )
+    if cand.get("no_movement_watch_keeps"):
+        base = max(
+            base,
+            int(os.environ.get("V287_SELECTED_NO_MOVEMENT_WATCH_MAX_AGE_MS", "1200")),
+        )
     return base
 
 
@@ -736,6 +777,7 @@ def _v287_selected_negative_roundtrip_fingerprint(
     top_lane: str,
     current_buy_sol: float,
     prev_buy_sol: float,
+    top_share: float,
     pre_entry_buys: int,
     observed_rearm_sol: float,
     first_rearm_delay_ms: int,
@@ -754,7 +796,10 @@ def _v287_selected_negative_roundtrip_fingerprint(
         return False, "selected_fingerprint_disabled"
     if last_rearm_lag_ms > int(os.environ.get("V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS", "650")):
         return False, "selected_rearm_lag_stale"
-    if last_rearm_delay_ms > 350:
+    generic_max_rearm_delay_ms = int(
+        os.environ.get("V287_SELECTED_GENERIC_MAX_REARM_DELAY_MS", "1000")
+    )
+    if last_rearm_delay_ms > generic_max_rearm_delay_ms:
         return False, "selected_rearm_delay_stale"
 
     if top_lane == "fresh_impulse":
@@ -762,6 +807,19 @@ def _v287_selected_negative_roundtrip_fingerprint(
             return False, "selected_fresh_current_out_of_band"
         if prev_buy_sol > 1e-12:
             return False, "selected_fresh_prev_buy_present"
+
+        instant_dense_min_buys = int(os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MIN_BUYS", "4"))
+        instant_dense_max_buys = int(os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_BUYS", "5"))
+        instant_dense_min_sol = float(os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MIN_SOL", "1.50"))
+        instant_dense_max_sol = float(os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_SOL", "4.50"))
+        instant_dense_max_delay = int(os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_DELAY_MS", "75"))
+        if (
+            instant_dense_min_sol <= observed_rearm_sol <= instant_dense_max_sol
+            and instant_dense_min_buys <= pre_entry_buys <= instant_dense_max_buys
+            and first_rearm_delay_ms <= instant_dense_max_delay
+            and last_rearm_delay_ms <= instant_dense_max_delay
+        ):
+            return True, "selected_fresh_instant_dense_train"
 
         low_multi_min_buys = int(os.environ.get("V287_SELECTED_FRESH_LOW_MULTI_MIN_BUYS", "3"))
         low_multi_min_delay = int(os.environ.get("V287_SELECTED_FRESH_LOW_MULTI_MIN_DELAY_MS", "175"))
@@ -774,7 +832,27 @@ def _v287_selected_negative_roundtrip_fingerprint(
         ):
             return True, "selected_fresh_paced_low_multi_rearm"
 
-        mid_min_sol = float(os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_MIN_SOL", "1.45"))
+        near_floor_min_sol = float(
+            os.environ.get("V287_SELECTED_FRESH_NEAR_FLOOR_MIN_SOL", "1.20")
+        )
+        near_floor_max_sol = float(
+            os.environ.get("V287_SELECTED_FRESH_NEAR_FLOOR_MAX_SOL", "1.50")
+        )
+        near_floor_min_buys = int(
+            os.environ.get("V287_SELECTED_FRESH_NEAR_FLOOR_MIN_BUYS", "2")
+        )
+        near_floor_max_delay = int(
+            os.environ.get("V287_SELECTED_FRESH_NEAR_FLOOR_MAX_DELAY_MS", "1000")
+        )
+        if (
+            near_floor_min_sol <= observed_rearm_sol <= near_floor_max_sol
+            and pre_entry_buys >= near_floor_min_buys
+            and first_rearm_delay_ms <= near_floor_max_delay
+            and last_rearm_delay_ms <= near_floor_max_delay
+        ):
+            return True, "selected_fresh_near_floor_multi_rearm"
+
+        mid_min_sol = float(os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_MIN_SOL", "1.35"))
         mid_max_sol = float(os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_MAX_SOL", "2.25"))
         mid_max_delay = int(os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_MAX_DELAY_MS", "25"))
         if (
@@ -784,16 +862,46 @@ def _v287_selected_negative_roundtrip_fingerprint(
         ):
             return True, "selected_fresh_single_mid_rearm"
 
+        upper_mid_min_sol = float(
+            os.environ.get("V287_SELECTED_FRESH_UPPER_MID_MULTI_MIN_SOL", "2.30")
+        )
+        upper_mid_max_sol = float(
+            os.environ.get("V287_SELECTED_FRESH_UPPER_MID_MULTI_MAX_SOL", "3.80")
+        )
+        upper_mid_max_delay = int(
+            os.environ.get("V287_SELECTED_FRESH_UPPER_MID_MULTI_MAX_DELAY_MS", "350")
+        )
+        if (
+            upper_mid_min_sol <= observed_rearm_sol <= upper_mid_max_sol
+            and 2 <= pre_entry_buys <= 3
+            and first_rearm_delay_ms <= upper_mid_max_delay
+            and last_rearm_delay_ms <= upper_mid_max_delay
+        ):
+            return True, "selected_fresh_upper_mid_multi_rearm"
+
         strong_min_sol = float(os.environ.get("V287_SELECTED_FRESH_STRONG_MIN_SOL", "3.80"))
         strong_max_sol = float(os.environ.get("V287_SELECTED_FRESH_STRONG_MAX_SOL", "4.50"))
         strong_min_delay = int(os.environ.get("V287_SELECTED_FRESH_STRONG_MIN_DELAY_MS", "75"))
         strong_max_delay = int(os.environ.get("V287_SELECTED_FRESH_STRONG_MAX_DELAY_MS", "150"))
         if (
             strong_min_sol <= observed_rearm_sol <= strong_max_sol
-            and 2 <= pre_entry_buys <= 3
+            and 1 <= pre_entry_buys <= 3
             and strong_min_delay <= first_rearm_delay_ms <= strong_max_delay
         ):
             return True, "selected_fresh_strong_multi_rearm"
+
+        dense_train_min_buys = int(os.environ.get("V287_SELECTED_FRESH_DENSE_TRAIN_MIN_BUYS", "4"))
+        dense_train_max_buys = int(os.environ.get("V287_SELECTED_FRESH_DENSE_TRAIN_MAX_BUYS", "5"))
+        dense_train_min_sol = float(os.environ.get("V287_SELECTED_FRESH_DENSE_TRAIN_MIN_SOL", "2.30"))
+        dense_train_max_sol = float(os.environ.get("V287_SELECTED_FRESH_DENSE_TRAIN_MAX_SOL", "3.60"))
+        dense_train_max_delay = int(os.environ.get("V287_SELECTED_FRESH_DENSE_TRAIN_MAX_DELAY_MS", "75"))
+        if (
+            dense_train_min_sol <= observed_rearm_sol <= dense_train_max_sol
+            and dense_train_min_buys <= pre_entry_buys <= dense_train_max_buys
+            and first_rearm_delay_ms <= dense_train_max_delay
+            and last_rearm_delay_ms <= dense_train_max_delay
+        ):
+            return True, "selected_fresh_dense_moderate_train"
 
     if top_lane == "normal_top":
         normal_min_sol = float(os.environ.get("V287_SELECTED_NORMAL_REARM_MIN_SOL", "0.70"))
@@ -807,11 +915,125 @@ def _v287_selected_negative_roundtrip_fingerprint(
         ):
             return True, "selected_normal_top_rearm"
 
+    if top_lane == "edge_top_strong_prior":
+        edge_current_min = float(os.environ.get("V287_NORMAL_TOP_CURRENT_MIN_SOL", "2.00"))
+        edge_current_max = float(os.environ.get("V287_NORMAL_TOP_CURRENT_MAX_SOL", "3.25"))
+        edge_prev_min = float(os.environ.get("V287_EDGE_TOP_PREV_MIN_SOL", "7.50"))
+        edge_prev_max = float(os.environ.get("V287_EDGE_TOP_PREV_MAX_SOL", "9.60"))
+        edge_top_min = float(os.environ.get("V287_EDGE_TOP_MIN_SHARE", "0.50"))
+        edge_top_max = float(os.environ.get("V287_EDGE_TOP_MAX_SHARE", "0.55"))
+        edge_rearm_min = float(os.environ.get("V287_EDGE_TOP_REARM_MIN_SOL", "1.80"))
+        edge_rearm_max = float(os.environ.get("V287_EDGE_TOP_REARM_MAX_SOL", "3.20"))
+        edge_max_delay = int(os.environ.get("V287_EDGE_TOP_MAX_DELAY_MS", "750"))
+        if (
+            edge_current_min <= current_buy_sol <= edge_current_max
+            and edge_prev_min <= prev_buy_sol <= edge_prev_max
+            and edge_top_min <= top_share < edge_top_max
+            and edge_rearm_min <= observed_rearm_sol <= edge_rearm_max
+            and 1 <= pre_entry_buys <= 4
+            and first_rearm_delay_ms <= edge_max_delay
+            and last_rearm_delay_ms <= edge_max_delay
+        ):
+            return True, "selected_edge_top_strong_prior_rearm"
+
+    if top_lane == "single_prior_buy_continuation":
+        single_current_min = float(os.environ.get("V287_SELECTED_SINGLE_PRIOR_CURRENT_MIN_SOL", "2.00"))
+        single_current_max = float(os.environ.get("V287_SELECTED_SINGLE_PRIOR_CURRENT_MAX_SOL", "3.25"))
+        single_prev_min = float(os.environ.get("V287_SELECTED_SINGLE_PRIOR_PREV_MIN_SOL", "1.80"))
+        single_prev_max = float(os.environ.get("V287_SELECTED_SINGLE_PRIOR_PREV_MAX_SOL", "5.60"))
+        single_top_min = float(os.environ.get("V287_SELECTED_SINGLE_PRIOR_TOP_MIN", "0.80"))
+        single_rearm_min = float(os.environ.get("V287_SELECTED_SINGLE_PRIOR_REARM_MIN_SOL", "2.00"))
+        single_rearm_max = float(os.environ.get("V287_SELECTED_SINGLE_PRIOR_REARM_MAX_SOL", "10.00"))
+        single_max_delay = int(os.environ.get("V287_SELECTED_SINGLE_PRIOR_MAX_DELAY_MS", "350"))
+        if (
+            single_current_min <= current_buy_sol <= single_current_max
+            and single_prev_min <= prev_buy_sol <= single_prev_max
+            and top_share >= single_top_min
+            and single_rearm_min <= observed_rearm_sol <= single_rearm_max
+            and 1 <= pre_entry_buys <= 6
+            and first_rearm_delay_ms <= single_max_delay
+            and last_rearm_delay_ms <= single_max_delay
+        ):
+            return True, "selected_single_prior_strong_rearm"
+
+    if top_lane == "dust_prior_clean_continuation":
+        # Repair for the 2026-05-30 frequency leak: a single tiny prior buy can
+        # be noise, not a real prior-leg requirement failure. This lane still
+        # waits for a clean follow-through buy and then uses the same projection,
+        # final refresh, min-token, and protected-sell gates as the proven path.
+        dust_current_min = float(os.environ.get("V287_DUST_PRIOR_CURRENT_MIN_SOL", "2.00"))
+        dust_current_max = float(os.environ.get("V287_DUST_PRIOR_CURRENT_MAX_SOL", "3.25"))
+        dust_prev_max = float(os.environ.get("V287_DUST_PRIOR_PREV_MAX_SOL", "0.50"))
+        dust_top_min = float(os.environ.get("V287_DUST_PRIOR_TOP_MIN", "0.95"))
+        dust_rearm_min = float(os.environ.get("V287_DUST_PRIOR_REARM_MIN_SOL", "0.35"))
+        dust_rearm_max = float(os.environ.get("V287_DUST_PRIOR_REARM_MAX_SOL", "2.00"))
+        dust_min_delay = int(os.environ.get("V287_DUST_PRIOR_MIN_REARM_DELAY_MS", "250"))
+        dust_max_delay = int(os.environ.get("V287_DUST_PRIOR_MAX_REARM_DELAY_MS", "1250"))
+        dust_max_buys = int(os.environ.get("V287_DUST_PRIOR_MAX_REARM_BUYS", "3"))
+        if (
+            dust_current_min <= current_buy_sol <= dust_current_max
+            and 0.0 <= prev_buy_sol <= dust_prev_max
+            and top_share >= dust_top_min
+            and dust_rearm_min <= observed_rearm_sol <= dust_rearm_max
+            and 1 <= pre_entry_buys <= dust_max_buys
+            and dust_min_delay <= first_rearm_delay_ms <= dust_max_delay
+            and last_rearm_delay_ms <= dust_max_delay
+        ):
+            return True, "selected_dust_prior_clean_continuation"
+
+    if top_lane == "two_prior_buy_continuation":
+        two_current_min = float(os.environ.get("V287_SELECTED_TWO_PRIOR_CURRENT_MIN_SOL", "2.80"))
+        two_current_max = float(os.environ.get("V287_SELECTED_TWO_PRIOR_CURRENT_MAX_SOL", "3.25"))
+        two_prev_min = float(os.environ.get("V287_SELECTED_TWO_PRIOR_PREV_MIN_SOL", "5.00"))
+        two_prev_max = float(os.environ.get("V287_SELECTED_TWO_PRIOR_PREV_MAX_SOL", "9.60"))
+        two_top_min = float(os.environ.get("V287_SELECTED_TWO_PRIOR_TOP_MIN", "0.45"))
+        two_top_max = float(os.environ.get("V287_SELECTED_TWO_PRIOR_TOP_MAX", "0.70"))
+        two_rearm_min = float(os.environ.get("V287_SELECTED_TWO_PRIOR_REARM_MIN_SOL", "1.80"))
+        two_rearm_max = float(os.environ.get("V287_SELECTED_TWO_PRIOR_REARM_MAX_SOL", "6.50"))
+        two_max_delay = int(os.environ.get("V287_SELECTED_TWO_PRIOR_MAX_DELAY_MS", "350"))
+        if (
+            two_current_min <= current_buy_sol <= two_current_max
+            and two_prev_min <= prev_buy_sol <= two_prev_max
+            and two_top_min <= top_share <= two_top_max
+            and two_rearm_min <= observed_rearm_sol <= two_rearm_max
+            and 1 <= pre_entry_buys <= 6
+            and first_rearm_delay_ms <= two_max_delay
+            and last_rearm_delay_ms <= two_max_delay
+        ):
+            return True, "selected_two_prior_followthrough_rearm"
+
     return False, "selected_no_match"
 
 
 def _v287_selected_negative_reason_allowed(reason: str) -> bool:
     return bool(reason.startswith("selected_")) and reason != "selected_no_match"
+
+
+def _v287_reason_min_quote_tokens(reason: str, default_min_tokens: float) -> float:
+    """Raise token-output floor only for replay-backed selected exception lanes."""
+    reason = str(reason or "")
+    floor = float(default_min_tokens)
+    if reason == "selected_fresh_single_mid_rearm":
+        floor = max(
+            floor,
+            float(os.environ.get("V287_SELECTED_SINGLE_MID_MIN_QUOTE_TOKENS", "680000")),
+        )
+    elif reason == "selected_fresh_strong_multi_rearm":
+        floor = max(
+            floor,
+            float(os.environ.get("V287_SELECTED_STRONG_MIN_QUOTE_TOKENS", "660000")),
+        )
+    elif reason == "selected_fresh_upper_mid_multi_rearm":
+        floor = max(
+            floor,
+            float(
+                os.environ.get(
+                    "V287_SELECTED_UPPER_MID_MULTI_MIN_QUOTE_TOKENS",
+                    "700000",
+                )
+            ),
+        )
+    return floor
 
 
 def _prebuy_postbuy_sell_projection_pass(
@@ -1769,6 +1991,9 @@ def main() -> int:
         f"single_prior_current=[{float(args.single_prior_current_min_sol):.2f},{float(args.single_prior_current_max_sol):.2f}] "
         f"single_prior_prev_buy_sol=[{float(args.single_prior_prev_buy_sol_min):.2f},{float(args.single_prior_prev_buy_sol_max):.2f}] "
         f"single_prior_rearm_sol=[{float(args.single_prior_rearm_min_sol):.2f},{float(args.single_prior_rearm_max_sol):.2f}] "
+        f"dust_prior_enabled={int(os.environ.get('V287_ENABLE_DUST_PRIOR_CONTINUATION_LANE', '1') != '0')} "
+        f"dust_prior_prev_max={float(os.environ.get('V287_DUST_PRIOR_PREV_MAX_SOL', '0.50')):.2f} "
+        f"dust_prior_rearm=[{float(os.environ.get('V287_DUST_PRIOR_REARM_MIN_SOL', '0.35')):.2f},{float(os.environ.get('V287_DUST_PRIOR_REARM_MAX_SOL', '2.00')):.2f}] "
         f"two_prior_enabled={int(bool(args.enable_two_prior_buy_lane))} "
         f"two_prior_current=[{float(args.two_prior_current_min_sol):.2f},{float(args.two_prior_current_max_sol):.2f}] "
         f"two_prior_prev_buy_sol=[{float(args.two_prior_prev_buy_sol_min):.2f},{float(args.two_prior_prev_buy_sol_max):.2f}] "
@@ -1884,8 +2109,23 @@ def main() -> int:
                     _log(f"PGG2-V287-CANDIDATE-ABORT mint={_short(mint)} reason=pre_entry_sell")
                     active.pop(mint, None)
                 elif rec["kind"] == "buy":
+                    rec_sol_lamports = int(rec["sol_lamports"])
+                    max_event_buy_lamports = int(
+                        float(os.environ.get("V287_EVENT_BUY_MAX_SOL_SANITY", "20.00"))
+                        * LAMPORTS_PER_SOL
+                    )
+                    if rec_sol_lamports <= 0 or rec_sol_lamports > max_event_buy_lamports:
+                        counters["event_buy_sanity_block"] += 1
+                        _log(
+                            "PGG2-V287-EVENT-BUY-SANITY-BLOCK "
+                            f"mint={_short(mint)} full_mint={mint} "
+                            f"sol_lamports={rec_sol_lamports} "
+                            f"max_lamports={max_event_buy_lamports} "
+                            "source=feed_decode_guard"
+                        )
+                        continue
                     cand["pre_entry_buys"] += 1
-                    cand["pre_entry_buy_lamports"] += int(rec["sol_lamports"])
+                    cand["pre_entry_buy_lamports"] += rec_sol_lamports
                     cand_rearm_min_lamports = int(cand.get("rearm_min_lamports") or int(float(args.rearm_min_sol) * LAMPORTS_PER_SOL))
                     cand_rearm_max_lamports = int(cand.get("rearm_max_lamports") or 0)
                     if cand_rearm_max_lamports > 0 and cand["pre_entry_buy_lamports"] > cand_rearm_max_lamports:
@@ -2026,16 +2266,104 @@ def main() -> int:
                         > int(args.fresh_impulse_max_rearm_buys)
                         and not hot_train_flag
                     ):
-                        counters["fresh_impulse_rearm_buys_block"] += 1
-                        _log(
-                            "PGG2-V287-FRESH-IMPULSE-REARM-BUYS-BLOCK "
-                            f"mint={_short(mint)} pre_entry_buys={int(cand['pre_entry_buys'])} "
-                            f"max_rearm_buys={int(args.fresh_impulse_max_rearm_buys)} "
-                            f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
-                            f"delay_ms={now-int(cand['start_ms'])}"
+                        instant_dense_min_buys = int(
+                            os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MIN_BUYS", "4")
                         )
-                        active.pop(mint, None)
-                        continue
+                        instant_dense_max_buys = int(
+                            os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_BUYS", "5")
+                        )
+                        instant_dense_min_lamports = int(
+                            float(os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MIN_SOL", "1.50"))
+                            * LAMPORTS_PER_SOL
+                        )
+                        instant_dense_max_lamports = int(
+                            float(os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_SOL", "4.50"))
+                            * LAMPORTS_PER_SOL
+                        )
+                        instant_dense_max_delay_ms = int(
+                            os.environ.get("V287_SELECTED_FRESH_INSTANT_DENSE_MAX_DELAY_MS", "75")
+                        )
+                        instant_dense_ok = (
+                            float(cand.get("prev_buy_sol") or 0.0) <= 1e-12
+                            and instant_dense_min_buys
+                            <= int(cand.get("pre_entry_buys") or 0)
+                            <= instant_dense_max_buys
+                            and instant_dense_min_lamports
+                            <= int(cand.get("pre_entry_buy_lamports") or 0)
+                            <= instant_dense_max_lamports
+                            and now - int(cand["start_ms"]) <= instant_dense_max_delay_ms
+                        )
+                        dense_train_min_buys = int(
+                            os.environ.get("V287_SELECTED_FRESH_DENSE_TRAIN_MIN_BUYS", "4")
+                        )
+                        dense_train_max_buys = int(
+                            os.environ.get("V287_SELECTED_FRESH_DENSE_TRAIN_MAX_BUYS", "5")
+                        )
+                        dense_train_min_lamports = int(
+                            float(
+                                os.environ.get(
+                                    "V287_SELECTED_FRESH_DENSE_TRAIN_MIN_SOL",
+                                    "2.30",
+                                )
+                            )
+                            * LAMPORTS_PER_SOL
+                        )
+                        dense_train_max_lamports = int(
+                            float(
+                                os.environ.get(
+                                    "V287_SELECTED_FRESH_DENSE_TRAIN_MAX_SOL",
+                                    "3.60",
+                                )
+                            )
+                            * LAMPORTS_PER_SOL
+                        )
+                        dense_train_max_delay_ms = int(
+                            os.environ.get(
+                                "V287_SELECTED_FRESH_DENSE_TRAIN_MAX_DELAY_MS",
+                                "75",
+                            )
+                        )
+                        dense_train_ok = (
+                            float(cand.get("prev_buy_sol") or 0.0) <= 1e-12
+                            and dense_train_min_buys
+                            <= int(cand.get("pre_entry_buys") or 0)
+                            <= dense_train_max_buys
+                            and dense_train_min_lamports
+                            <= int(cand.get("pre_entry_buy_lamports") or 0)
+                            <= dense_train_max_lamports
+                            and now - int(cand["start_ms"]) <= dense_train_max_delay_ms
+                        )
+                        if instant_dense_ok or dense_train_ok:
+                            if instant_dense_ok:
+                                counters["selected_instant_dense_train_pass"] += 1
+                                cand["selected_fresh_instant_dense_train"] = 1
+                                log_name = "PGG2-V287-SELECTED-INSTANT-DENSE-TRAIN-PASS "
+                                source = "fast_lane_overcap_repair"
+                            else:
+                                counters["selected_dense_moderate_train_pass"] += 1
+                                cand["selected_dense_moderate_train"] = 1
+                                log_name = "PGG2-V287-SELECTED-DENSE-MODERATE-TRAIN-PASS "
+                                source = "fast_lane_followthrough"
+                            _log(
+                                log_name +
+                                f"mint={_short(mint)} full_mint={mint} "
+                                f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                f"delay_ms={now-int(cand['start_ms'])} "
+                                f"max_rearm_buys={int(args.fresh_impulse_max_rearm_buys)} "
+                                f"source={source}"
+                            )
+                        else:
+                            counters["fresh_impulse_rearm_buys_block"] += 1
+                            _log(
+                                "PGG2-V287-FRESH-IMPULSE-REARM-BUYS-BLOCK "
+                                f"mint={_short(mint)} pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                f"max_rearm_buys={int(args.fresh_impulse_max_rearm_buys)} "
+                                f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f} "
+                                f"delay_ms={now-int(cand['start_ms'])}"
+                            )
+                            active.pop(mint, None)
+                            continue
                     if (
                         str(cand.get("top_lane", "")) == "fresh_impulse"
                         and int(cand.get("pre_entry_buys") or 0)
@@ -2088,6 +2416,137 @@ def main() -> int:
                             )
                             if not plan_ok_now:
                                 if not plan_done:
+                                    selected_wait_ok = False
+                                    selected_wait_reason = "selected_no_match"
+                                    if (
+                                        os.environ.get(
+                                            "V287_SELECTED_WAIT_FOR_PLAN_ON_REARM",
+                                            "1",
+                                        )
+                                        != "0"
+                                    ):
+                                        selected_wait_ok, selected_wait_reason = (
+                                            _v287_selected_negative_roundtrip_fingerprint(
+                                                top_lane=str(cand.get("top_lane") or ""),
+                                                current_buy_sol=float(
+                                                    cand.get("current_buy_sol") or 0.0
+                                                ),
+                                                prev_buy_sol=float(
+                                                    cand.get("prev_buy_sol") or 0.0
+                                                ),
+                                                top_share=float(
+                                                    cand.get("top_share") or 0.0
+                                                ),
+                                                pre_entry_buys=int(
+                                                    cand.get("pre_entry_buys") or 0
+                                                ),
+                                                observed_rearm_sol=(
+                                                    int(
+                                                        cand.get(
+                                                            "pre_entry_buy_lamports"
+                                                        )
+                                                        or 0
+                                                    )
+                                                    / LAMPORTS_PER_SOL
+                                                ),
+                                                first_rearm_delay_ms=int(
+                                                    cand.get(
+                                                        "first_rearm_pass_delay_ms"
+                                                    )
+                                                    or rearm_pass_delay_ms
+                                                ),
+                                                last_rearm_delay_ms=int(
+                                                    cand.get(
+                                                        "last_rearm_pass_delay_ms"
+                                                    )
+                                                    or rearm_pass_delay_ms
+                                                ),
+                                                last_rearm_lag_ms=max(
+                                                    0,
+                                                    now
+                                                    - int(
+                                                        cand.get(
+                                                            "last_rearm_pass_ts_ms"
+                                                        )
+                                                        or now
+                                                    ),
+                                                ),
+                                            )
+                                        )
+                                    if selected_wait_ok:
+                                        wait_start_ms = _now_ms()
+                                        wait_deadline_ms = wait_start_ms + int(
+                                            os.environ.get(
+                                                "V287_SELECTED_PLAN_READY_WAIT_MS",
+                                                "320",
+                                            )
+                                        )
+                                        wait_plan_err = plan_err
+                                        while _now_ms() < wait_deadline_ms:
+                                            (
+                                                wait_plan_done,
+                                                wait_plan_ok,
+                                                wait_plan_err,
+                                            ) = _static_plan_future_done_ok(
+                                                cand.get("static_plan_future")
+                                            )
+                                            if wait_plan_ok:
+                                                plan_done = True
+                                                plan_ok_now = True
+                                                plan_err = ""
+                                                counters[
+                                                    "selected_plan_ready_wait_pass"
+                                                ] += 1
+                                                _log(
+                                                    "PGG2-V287-SELECTED-PLAN-READY-WAIT-PASS "
+                                                    f"mint={_short(mint)} full_mint={mint} "
+                                                    f"reason={selected_wait_reason} "
+                                                    f"wait_ms={_now_ms()-wait_start_ms} "
+                                                    f"delay_ms={now-int(cand['start_ms'])} "
+                                                    f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                                    f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f}"
+                                                )
+                                                break
+                                            if wait_plan_done:
+                                                plan_done = True
+                                                plan_err = wait_plan_err
+                                                break
+                                            time.sleep(
+                                                max(
+                                                    0.001,
+                                                    float(
+                                                        os.environ.get(
+                                                            "V287_SELECTED_PLAN_READY_POLL_MS",
+                                                            "10",
+                                                        )
+                                                    )
+                                                    / 1000.0,
+                                                )
+                                            )
+                                        if not plan_ok_now:
+                                            counters[
+                                                "selected_plan_ready_wait_timeout"
+                                            ] += 1
+                                            _log(
+                                                "PGG2-V287-SELECTED-PLAN-READY-WAIT-TIMEOUT "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"reason={selected_wait_reason} "
+                                                f"wait_ms={_now_ms()-wait_start_ms} "
+                                                f"plan_state={wait_plan_err or plan_err or 'pending'} "
+                                                f"pre_entry_buys={int(cand['pre_entry_buys'])} "
+                                                f"pre_entry_buy_sol={cand['pre_entry_buy_lamports']/LAMPORTS_PER_SOL:.6f}"
+                                            )
+                                if not plan_ok_now:
+                                    if plan_done:
+                                        counters["post_plan_rearm_plan_fail"] += 1
+                                        _log(
+                                            "PGG2-V287-POST-PLAN-REARM-BLOCK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"plan_ready=0 plan_state={plan_err or 'done_false'} "
+                                            "reason=static_plan_failed"
+                                        )
+                                        active.pop(mint, None)
+                                        continue
                                     cand["post_plan_rearm_required"] = 1
                                     cand.setdefault("post_plan_rearm_wait_start_ms", now)
                                     cand["post_plan_rearm_base_lamports"] = int(
@@ -2112,15 +2571,6 @@ def main() -> int:
                                     )
                                     hist[mint].append(rec)
                                     continue
-                                counters["post_plan_rearm_plan_fail"] += 1
-                                _log(
-                                    "PGG2-V287-POST-PLAN-REARM-BLOCK "
-                                    f"mint={_short(mint)} full_mint={mint} "
-                                    f"plan_ready=0 plan_state={plan_err or 'done_false'} "
-                                    "reason=static_plan_failed"
-                                )
-                                active.pop(mint, None)
-                                continue
                             if cand.get("post_plan_rearm_required"):
                                 post_plan_base_lamports = int(
                                     cand.get("post_plan_rearm_base_lamports") or 0
@@ -2147,18 +2597,94 @@ def main() -> int:
                                     )
                                     * LAMPORTS_PER_SOL
                                 )
+                                post_plan_followthrough_min_lamports = int(
+                                    float(
+                                        os.environ.get(
+                                            "V287_SELECTED_POSTPLAN_FOLLOWTHROUGH_MIN_SOL",
+                                            "0.70",
+                                        )
+                                    )
+                                    * LAMPORTS_PER_SOL
+                                )
+                                if (
+                                    post_plan_buys >= 1
+                                    and post_plan_lamports
+                                    >= post_plan_followthrough_min_lamports
+                                ):
+                                    cand["post_plan_followthrough_buys"] = post_plan_buys
+                                    cand["post_plan_followthrough_lamports"] = (
+                                        post_plan_lamports
+                                    )
+                                    cand["post_plan_followthrough_ts_ms"] = now
                                 if post_plan_buys < 1 or post_plan_lamports < post_plan_min_lamports:
                                     credit_wait_ms = now - int(
                                         cand.get("post_plan_rearm_wait_start_ms") or now
                                     )
+                                    preplan_selected_ok, preplan_selected_reason = (
+                                        _v287_selected_negative_roundtrip_fingerprint(
+                                            top_lane=str(cand.get("top_lane") or ""),
+                                            current_buy_sol=float(
+                                                cand.get("current_buy_sol") or 0.0
+                                            ),
+                                            prev_buy_sol=float(
+                                                cand.get("prev_buy_sol") or 0.0
+                                            ),
+                                            top_share=float(cand.get("top_share") or 0.0),
+                                            pre_entry_buys=int(
+                                                cand.get("pre_entry_buys") or 0
+                                            ),
+                                            observed_rearm_sol=(
+                                                int(
+                                                    cand.get(
+                                                        "pre_entry_buy_lamports"
+                                                    )
+                                                    or 0
+                                                )
+                                                / LAMPORTS_PER_SOL
+                                            ),
+                                            first_rearm_delay_ms=int(
+                                                cand.get("first_rearm_pass_delay_ms")
+                                                or max(
+                                                    0,
+                                                    now
+                                                    - int(
+                                                        cand.get("start_ms") or now
+                                                    ),
+                                                )
+                                            ),
+                                            last_rearm_delay_ms=int(
+                                                cand.get("last_rearm_pass_delay_ms")
+                                                or max(
+                                                    0,
+                                                    now
+                                                    - int(
+                                                        cand.get("start_ms") or now
+                                                    ),
+                                                )
+                                            ),
+                                            last_rearm_lag_ms=max(
+                                                0,
+                                                now
+                                                - int(
+                                                    cand.get(
+                                                        "last_rearm_pass_ts_ms"
+                                                    )
+                                                    or now
+                                                ),
+                                            ),
+                                        )
+                                    )
                                     allow_preplan_credit = (
                                         os.environ.get("V287_ALLOW_PREPLAN_REARM_CREDIT", "1") != "0"
-                                        and str(cand.get("top_lane", "")) == "fresh_impulse"
                                         and int(cand.get("pre_entry_buys") or 0) >= 1
                                         and int(cand.get("pre_entry_buy_lamports") or 0)
                                         >= cand_rearm_min_lamports
                                         and credit_wait_ms
                                         <= int(os.environ.get("V287_PREPLAN_REARM_CREDIT_MAX_WAIT_MS", "850"))
+                                        and (
+                                            str(cand.get("top_lane", "")) == "fresh_impulse"
+                                            or preplan_selected_ok
+                                        )
                                     )
                                     if allow_preplan_credit:
                                         counters["post_plan_preplan_credit_pass"] += 1
@@ -2174,6 +2700,7 @@ def main() -> int:
                                             f"post_plan_min_sol={post_plan_min_lamports/LAMPORTS_PER_SOL:.6f} "
                                             f"credit_wait_ms={credit_wait_ms} "
                                             f"credit_max_wait_ms={int(os.environ.get('V287_PREPLAN_REARM_CREDIT_MAX_WAIT_MS', '850'))} "
+                                            f"selected_reason={preplan_selected_reason} "
                                             f"adaptive_rearm_reason={cand.get('adaptive_rearm_reason', '-')}"
                                         )
                                         cand["post_plan_rearm_required"] = 0
@@ -2261,10 +2788,22 @@ def main() -> int:
                                         "PGG2-V287-FAST-STATIC-PLAN-MISS "
                                         f"mint={_short(mint)} full_mint={mint} "
                                         "reason=plan_not_ready fallback=snapshot_compile"
-                                    )
+                                )
 
                                 fast_start_ms = _now_ms()
-                                curve = broker.bonding_curve(as_pubkey(mint))
+                                try:
+                                    curve = broker.bonding_curve(as_pubkey(mint))
+                                except Exception as exc:
+                                    counters["final_curve_missing_block"] += 1
+                                    _log(
+                                        "PGG2-V287-FINAL-CURVE-MISSING-BLOCK "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"err={type(exc).__name__}:{str(exc)[:160]} "
+                                        "reason=curve_unavailable_before_prebuy_check"
+                                    )
+                                    active.pop(mint, None)
+                                    hist[mint].append(rec)
+                                    continue
                                 curve_ts_ms = _now_ms()
                                 curve_ms = curve_ts_ms - fast_start_ms
                                 continuation_model_ok = False
@@ -2603,6 +3142,7 @@ def main() -> int:
                                             top_lane=top_lane,
                                             current_buy_sol=current_buy_sol,
                                             prev_buy_sol=prev_buy_sol,
+                                            top_share=float(cand.get("top_share") or 0.0),
                                             pre_entry_buys=pre_entry_buys,
                                             observed_rearm_sol=observed_rearm_sol,
                                             first_rearm_delay_ms=first_rearm_delay_ms,
@@ -2610,6 +3150,82 @@ def main() -> int:
                                             last_rearm_lag_ms=last_rearm_lag_ms,
                                         )
                                     )
+                                    no_move_followthrough_ok = (
+                                        os.environ.get(
+                                            "V287_SELECTED_NO_MOVEMENT_FOLLOWTHROUGH",
+                                            "1",
+                                        )
+                                        != "0"
+                                        and not selected_negative_ok
+                                        and int(cand.get("no_movement_watch_keeps") or 0) > 0
+                                        and top_lane == "single_prior_buy_continuation"
+                                        and 2.00 <= current_buy_sol <= 3.25
+                                        and 1.80 <= prev_buy_sol <= 5.60
+                                        and float(cand.get("top_share") or 0.0) >= 0.80
+                                        and 1
+                                        <= pre_entry_buys
+                                        <= int(
+                                            os.environ.get(
+                                                "V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_BUYS",
+                                                "6",
+                                            )
+                                        )
+                                        and float(
+                                            os.environ.get(
+                                                "V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MIN_SOL",
+                                                "4.50",
+                                            )
+                                        )
+                                        <= observed_rearm_sol
+                                        <= float(
+                                            os.environ.get(
+                                                "V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_SOL",
+                                                "10.00",
+                                            )
+                                        )
+                                        and first_rearm_delay_ms
+                                        <= int(
+                                            os.environ.get(
+                                                "V287_SELECTED_SINGLE_PRIOR_MAX_DELAY_MS",
+                                                "350",
+                                            )
+                                        )
+                                        and last_rearm_delay_ms
+                                        <= int(
+                                            os.environ.get(
+                                                "V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_DELAY_MS",
+                                                "1200",
+                                            )
+                                        )
+                                        and last_rearm_lag_ms
+                                        <= int(
+                                            os.environ.get(
+                                                "V287_VERIFIED_HOT_TRAIN_MAX_SEND_LAG_MS",
+                                                "650",
+                                            )
+                                        )
+                                    )
+                                    if no_move_followthrough_ok:
+                                        selected_negative_ok = True
+                                        selected_negative_reason = (
+                                            "selected_single_prior_no_movement_followthrough"
+                                        )
+                                        counters[
+                                            "selected_no_movement_followthrough_pass"
+                                        ] += 1
+                                        _log(
+                                            "PGG2-V287-SELECTED-NO-MOVEMENT-FOLLOWTHROUGH-PASS "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={selected_negative_reason} "
+                                            f"current_buy_sol={current_buy_sol:.6f} "
+                                            f"prev_buy_sol={prev_buy_sol:.6f} "
+                                            f"pre_entry_buys={pre_entry_buys} "
+                                            f"pre_entry_buy_sol={observed_rearm_sol:.6f} "
+                                            f"first_rearm_delay_ms={first_rearm_delay_ms} "
+                                            f"last_rearm_delay_ms={last_rearm_delay_ms} "
+                                            f"last_rearm_lag_ms={last_rearm_lag_ms} "
+                                            "source=repair_no_movement_frequency_leak"
+                                        )
                                     if not continuation_ok and selected_negative_ok:
                                         continuation_ok = True
                                         continuation_model_ok = True
@@ -2621,6 +3237,7 @@ def main() -> int:
                                             f"reason={selected_negative_reason} "
                                             f"top_lane={top_lane} current_buy_sol={current_buy_sol:.6f} "
                                             f"prev_buy_sol={prev_buy_sol:.6f} "
+                                            f"top_share={float(cand.get('top_share') or 0.0):.4f} "
                                             f"pre_entry_buys={pre_entry_buys} "
                                             f"pre_entry_buy_sol={observed_rearm_sol:.6f} "
                                             f"first_rearm_delay_ms={first_rearm_delay_ms} "
@@ -2739,7 +3356,20 @@ def main() -> int:
                                             f"last_rearm_lag_ms={last_rearm_lag_ms} "
                                             "source=final_projection_negative"
                                         )
-                                min_quote_tokens = float(args.min_buy_quote_tokens)
+                                base_min_quote_tokens = float(args.min_buy_quote_tokens)
+                                min_quote_tokens = _v287_reason_min_quote_tokens(
+                                    continuation_reason,
+                                    base_min_quote_tokens,
+                                )
+                                if min_quote_tokens > base_min_quote_tokens + 1e-9:
+                                    counters["selected_reason_token_floor_raise"] += 1
+                                    _log(
+                                        "PGG2-V287-SELECTED-REASON-TOKEN-FLOOR "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"reason={continuation_reason} "
+                                        f"base_min_tokens={base_min_quote_tokens:.6f} "
+                                        f"reason_min_tokens={min_quote_tokens:.6f}"
+                                    )
                                 _log(
                                     "PGG2-V287-BUY-QUOTE-VIABILITY "
                                     f"mint={_short(mint)} full_mint={mint} "
@@ -2747,15 +3377,40 @@ def main() -> int:
                                     f"pass={int(quote_tokens >= min_quote_tokens)} source=fast_final_curve"
                                 )
                                 if min_quote_tokens > 0 and quote_tokens < min_quote_tokens:
-                                    counters["buy_quote_token_block"] += 1
-                                    _log(
-                                        "PGG2-V287-BUY-QUOTE-TOKEN-BLOCK "
-                                        f"mint={_short(mint)} full_mint={mint} "
-                                        f"amount_out_tokens={quote_tokens:.6f} min_tokens={min_quote_tokens:.6f} "
-                                        "source=fast_final_curve"
+                                    selected_negative_reason_allowed = (
+                                        _v287_selected_negative_reason_allowed(
+                                            continuation_reason or ""
+                                        )
                                     )
-                                    active.pop(mint, None)
-                                    continue
+                                    defer_low_token_to_refresh = (
+                                        selected_negative_reason_allowed
+                                        and plan_ready
+                                        and os.environ.get(
+                                            "V287_REFRESH_CURVE_AFTER_PLAN_RECHECK",
+                                            "1",
+                                        )
+                                        != "0"
+                                    )
+                                    if defer_low_token_to_refresh:
+                                        counters["buy_quote_token_low_refresh_defer"] += 1
+                                        _log(
+                                            "PGG2-V287-BUY-QUOTE-TOKEN-LOW-REFRESH-DEFER "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason} "
+                                            f"amount_out_tokens={quote_tokens:.6f} "
+                                            f"min_tokens={min_quote_tokens:.6f} "
+                                            "source=fast_final_curve"
+                                        )
+                                    else:
+                                        counters["buy_quote_token_block"] += 1
+                                        _log(
+                                            "PGG2-V287-BUY-QUOTE-TOKEN-BLOCK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"amount_out_tokens={quote_tokens:.6f} min_tokens={min_quote_tokens:.6f} "
+                                            "source=fast_final_curve"
+                                        )
+                                        active.pop(mint, None)
+                                        continue
 
                                 min_tokens_ui = quote_tokens * max(
                                     0.0, 1.0 - (float(args.buy_slippage_pct) / 100.0)
@@ -2804,7 +3459,19 @@ def main() -> int:
                                 ) != "0":
                                     pre_refresh_quote_tokens = float(quote_tokens)
                                     fast_start_ms = _now_ms()
-                                    curve = broker.bonding_curve(as_pubkey(mint))
+                                    try:
+                                        curve = broker.bonding_curve(as_pubkey(mint))
+                                    except Exception as exc:
+                                        counters["final_refresh_curve_missing_block"] += 1
+                                        _log(
+                                            "PGG2-V287-FINAL-REFRESH-CURVE-MISSING-BLOCK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"err={type(exc).__name__}:{str(exc)[:160]} "
+                                            "reason=curve_unavailable_before_sender"
+                                        )
+                                        active.pop(mint, None)
+                                        hist[mint].append(rec)
+                                        continue
                                     curve_ts_ms = _now_ms()
                                     curve_ms = curve_ts_ms - fast_start_ms
                                     ok_proj, quote_tokens, _expected_raw = _prebuy_postbuy_sell_projection_from_curve(
@@ -2902,36 +3569,256 @@ def main() -> int:
                                             "1.25",
                                         )
                                     )
+                                    accel_selected_neg_drift_pct = float(
+                                        os.environ.get(
+                                            "V287_SELECTED_ACCELERATION_NEG_REFRESH_DRIFT_PCT",
+                                            "8.00",
+                                        )
+                                    )
+                                    if (
+                                        selected_negative_reason_allowed
+                                        and final_refresh_drift_pct
+                                        < 0.0
+                                        and os.environ.get(
+                                            "V287_SELECTED_BLOCK_ANY_NEG_REFRESH_DRIFT",
+                                            "0",
+                                        )
+                                        == "1"
+                                    ):
+                                        counters[
+                                            "selected_refresh_negative_drift_hard_block"
+                                        ] += 1
+                                        _log(
+                                            "PGG2-V287-SELECTED-REFRESH-NEGATIVE-DRIFT-HARD-BLOCK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason} "
+                                            f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                            "source=final_refresh_before_sender "
+                                            "reason_detail=prevent_pump_2006_fee_burn"
+                                        )
+                                        active.pop(mint, None)
+                                        continue
                                     if (
                                         selected_negative_reason_allowed
                                         and final_refresh_drift_pct
                                         < -abs(max_selected_neg_drift_pct)
                                     ):
-                                        counters["selected_refresh_adverse_drift_block"] += 1
-                                        _log(
-                                            "PGG2-V287-SELECTED-REFRESH-ADVERSE-DRIFT-BLOCK "
-                                            f"mint={_short(mint)} full_mint={mint} "
-                                            f"reason={continuation_reason} "
-                                            f"drift_pct={final_refresh_drift_pct:+.3f} "
-                                            f"max_neg_drift_pct={-abs(max_selected_neg_drift_pct):+.3f} "
-                                            "source=final_refresh_before_sender"
+                                        if (
+                                            os.environ.get(
+                                                "V287_SELECTED_BLOCK_ANY_NEG_REFRESH_DRIFT",
+                                                "0",
+                                            )
+                                            == "1"
+                                        ):
+                                            counters[
+                                                "selected_refresh_negative_drift_hard_block"
+                                            ] += 1
+                                            _log(
+                                                "PGG2-V287-SELECTED-REFRESH-NEGATIVE-DRIFT-HARD-BLOCK "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"reason={continuation_reason} "
+                                                f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                "source=final_refresh_before_sender "
+                                                "reason_detail=prevent_pump_2006_fee_burn"
+                                            )
+                                            active.pop(mint, None)
+                                            continue
+                                        post_plan_followthrough_min_lamports = int(
+                                            float(
+                                                os.environ.get(
+                                                    "V287_SELECTED_POSTPLAN_FOLLOWTHROUGH_MIN_SOL",
+                                                    "0.70",
+                                                )
+                                            )
+                                            * LAMPORTS_PER_SOL
                                         )
-                                        active.pop(mint, None)
-                                        continue
+                                        post_plan_followthrough_ok = (
+                                            int(
+                                                cand.get(
+                                                    "post_plan_followthrough_buys",
+                                                    0,
+                                                )
+                                            )
+                                            >= 1
+                                            and int(
+                                                cand.get(
+                                                    "post_plan_followthrough_lamports",
+                                                    0,
+                                                )
+                                            )
+                                            >= post_plan_followthrough_min_lamports
+                                        )
+                                        dense_moderate_ok = (
+                                            continuation_reason
+                                            == "selected_fresh_dense_moderate_train"
+                                        )
+                                        acceleration_refresh = (
+                                            final_refresh_drift_pct
+                                            <= -abs(accel_selected_neg_drift_pct)
+                                        )
+                                        if (
+                                            acceleration_refresh
+                                            or post_plan_followthrough_ok
+                                            or dense_moderate_ok
+                                        ):
+                                            counters[
+                                                "selected_refresh_followthrough_pass"
+                                            ] += 1
+                                            _log(
+                                                "PGG2-V287-SELECTED-REFRESH-FOLLOWTHROUGH-PASS "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"reason={continuation_reason} "
+                                                f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                f"accel_threshold_pct={-abs(accel_selected_neg_drift_pct):+.3f} "
+                                                f"post_plan_buys={int(cand.get('post_plan_followthrough_buys') or 0)} "
+                                                f"post_plan_buy_sol={int(cand.get('post_plan_followthrough_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                                f"dense_moderate={int(dense_moderate_ok)} "
+                                                "source=final_refresh_before_sender"
+                                            )
+                                        else:
+                                            weak_drift_keep_watch = (
+                                                os.environ.get(
+                                                    "V287_SELECTED_WEAK_DRIFT_KEEP_WATCH",
+                                                    "1",
+                                                )
+                                                != "0"
+                                                and str(cand.get("top_lane") or "")
+                                                == "fresh_impulse"
+                                                and float(cand.get("prev_buy_sol") or 0.0)
+                                                <= 1e-12
+                                                and (
+                                                    _now_ms()
+                                                    - int(
+                                                        cand.get("start_ms")
+                                                        or _now_ms()
+                                                    )
+                                                )
+                                                <= int(
+                                                    os.environ.get(
+                                                        "V287_SELECTED_WEAK_DRIFT_WATCH_MAX_AGE_MS",
+                                                        "900",
+                                                    )
+                                                )
+                                            )
+                                            if weak_drift_keep_watch:
+                                                cand["weak_drift_watch_keep"] = 1
+                                                counters[
+                                                    "selected_weak_drift_watch_keep"
+                                                ] += 1
+                                                _log(
+                                                    "PGG2-V287-SELECTED-WEAK-DRIFT-WATCH-KEEP "
+                                                    f"mint={_short(mint)} full_mint={mint} "
+                                                    f"reason={continuation_reason} "
+                                                    f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                    f"max_neg_drift_pct={-abs(max_selected_neg_drift_pct):+.3f} "
+                                                    f"watch_max_age_ms={int(os.environ.get('V287_SELECTED_WEAK_DRIFT_WATCH_MAX_AGE_MS', '900'))} "
+                                                    "reason_detail=wait_for_next_followthrough_buy"
+                                                )
+                                                hist[mint].append(rec)
+                                                continue
+                                            counters[
+                                                "selected_refresh_adverse_drift_block"
+                                            ] += 1
+                                            _log(
+                                                "PGG2-V287-SELECTED-REFRESH-ADVERSE-DRIFT-BLOCK "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"reason={continuation_reason} "
+                                                f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                f"max_neg_drift_pct={-abs(max_selected_neg_drift_pct):+.3f} "
+                                                f"accel_threshold_pct={-abs(accel_selected_neg_drift_pct):+.3f} "
+                                                "source=final_refresh_before_sender"
+                                            )
+                                            active.pop(mint, None)
+                                            continue
                                     if (
                                         min_abs_refresh_drift_pct > 0
                                         and abs(final_refresh_drift_pct)
                                         < min_abs_refresh_drift_pct
                                     ):
-                                        counters["final_refresh_no_movement_block"] += 1
-                                        _log(
-                                            "PGG2-V287-FINAL-REFRESH-DRIFT-BLOCK "
-                                            f"mint={_short(mint)} full_mint={mint} "
-                                            f"drift_pct={final_refresh_drift_pct:+.3f} "
-                                            "reason=no_curve_movement_before_sender"
+                                        allow_no_movement_followthrough_send = (
+                                            continuation_reason
+                                            == "selected_single_prior_no_movement_followthrough"
+                                            and final_refresh_drift_pct >= 0.0
                                         )
-                                        active.pop(mint, None)
-                                        continue
+                                        if allow_no_movement_followthrough_send:
+                                            counters[
+                                                "selected_no_movement_followthrough_send_allow"
+                                            ] += 1
+                                            _log(
+                                                "PGG2-V287-SELECTED-NO-MOVEMENT-FOLLOWTHROUGH-SEND-ALLOW "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"reason={continuation_reason} "
+                                                f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                f"pre_entry_buy_sol={float(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                                "reason_detail=observed_followthrough_after_zero_drift_watch"
+                                            )
+                                        else:
+                                            no_movement_keep_watch = (
+                                                selected_negative_reason_allowed
+                                                and os.environ.get(
+                                                    "V287_SELECTED_NO_MOVEMENT_KEEP_WATCH",
+                                                    "1",
+                                                )
+                                                != "0"
+                                                and (
+                                                    _now_ms()
+                                                    - int(
+                                                        cand.get("start_ms")
+                                                        or _now_ms()
+                                                    )
+                                                )
+                                                <= int(
+                                                    os.environ.get(
+                                                        "V287_SELECTED_NO_MOVEMENT_WATCH_MAX_AGE_MS",
+                                                        "1200",
+                                                    )
+                                                )
+                                                and int(
+                                                    cand.get(
+                                                        "no_movement_watch_keeps",
+                                                        0,
+                                                    )
+                                                )
+                                                < int(
+                                                    os.environ.get(
+                                                        "V287_SELECTED_NO_MOVEMENT_WATCH_MAX_KEEPS",
+                                                        "3",
+                                                    )
+                                                )
+                                            )
+                                            if no_movement_keep_watch:
+                                                cand["no_movement_watch_keeps"] = int(
+                                                    cand.get("no_movement_watch_keeps", 0)
+                                                ) + 1
+                                                cand["no_movement_watch_reason"] = str(
+                                                    continuation_reason or ""
+                                                )
+                                                cand["no_movement_watch_first_tokens"] = float(
+                                                    pre_refresh_quote_tokens
+                                                )
+                                                counters[
+                                                    "selected_no_movement_watch_keep"
+                                                ] += 1
+                                                _log(
+                                                    "PGG2-V287-FINAL-REFRESH-NO-MOVEMENT-WATCH-KEEP "
+                                                    f"mint={_short(mint)} full_mint={mint} "
+                                                    f"reason={continuation_reason} "
+                                                    f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                    f"keep_count={int(cand.get('no_movement_watch_keeps') or 0)} "
+                                                    f"watch_max_age_ms={int(os.environ.get('V287_SELECTED_NO_MOVEMENT_WATCH_MAX_AGE_MS', '1200'))} "
+                                                    "reason_detail=wait_for_next_real_followthrough_buy"
+                                                )
+                                                hist[mint].append(rec)
+                                                continue
+                                            counters["final_refresh_no_movement_block"] += 1
+                                            _log(
+                                                "PGG2-V287-FINAL-REFRESH-DRIFT-BLOCK "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                "reason=no_curve_movement_before_sender"
+                                            )
+                                            active.pop(mint, None)
+                                            continue
                                 if (
                                     not plan_ready
                                     and os.environ.get(
@@ -3099,7 +3986,20 @@ def main() -> int:
                             if buy_quote.get("route") != "pump_bc":
                                 raise RuntimeError(f"route_not_pump_bc:{buy_quote.get('route')}")
                             quote_tokens = _rate_float(buy_quote, "amountOut")
-                            min_quote_tokens = float(args.min_buy_quote_tokens)
+                            base_min_quote_tokens = float(args.min_buy_quote_tokens)
+                            min_quote_tokens = _v287_reason_min_quote_tokens(
+                                continuation_reason,
+                                base_min_quote_tokens,
+                            )
+                            if min_quote_tokens > base_min_quote_tokens + 1e-9:
+                                counters["selected_reason_token_floor_raise"] += 1
+                                _log(
+                                    "PGG2-V287-SELECTED-REASON-TOKEN-FLOOR "
+                                    f"mint={_short(mint)} full_mint={mint} "
+                                    f"reason={continuation_reason} "
+                                    f"base_min_tokens={base_min_quote_tokens:.6f} "
+                                    f"reason_min_tokens={min_quote_tokens:.6f}"
+                                )
                             _log(
                                 "PGG2-V287-BUY-QUOTE-VIABILITY "
                                 f"mint={_short(mint)} full_mint={mint} "
@@ -3301,9 +4201,25 @@ def main() -> int:
                             _log(f"PGG2-V287-LIVE-EXCEPTION mint={_short(mint)} err={type(exc).__name__}:{str(exc)[:240]}")
                             return 1
 
-            hist[mint].append(rec)
             if rec["kind"] != "buy":
+                hist[mint].append(rec)
                 continue
+            rec_sol_lamports = int(rec["sol_lamports"])
+            max_event_buy_lamports = int(
+                float(os.environ.get("V287_EVENT_BUY_MAX_SOL_SANITY", "20.00"))
+                * LAMPORTS_PER_SOL
+            )
+            if rec_sol_lamports <= 0 or rec_sol_lamports > max_event_buy_lamports:
+                counters["event_buy_sanity_block"] += 1
+                _log(
+                    "PGG2-V287-EVENT-BUY-SANITY-BLOCK "
+                    f"mint={_short(mint)} full_mint={mint} "
+                    f"sol_lamports={rec_sol_lamports} "
+                    f"max_lamports={max_event_buy_lamports} "
+                    "source=feed_decode_guard"
+                )
+                continue
+            hist[mint].append(rec)
             current_buy_sol = int(rec["sol_lamports"]) / LAMPORTS_PER_SOL
             recent = [x for x in hist[mint] if now - int(x["recv_ms"]) <= 1000]
             prev_buys = [x for x in recent if x["kind"] == "buy" and x["sig"] != rec["sig"]]
@@ -3315,6 +4231,12 @@ def main() -> int:
             top_share = max(by_sig.values()) / max(1, sum(by_sig.values())) if by_sig else 1.0
             current_ok_main = (
                 float(args.current_min_sol) <= current_buy_sol <= float(args.current_max_sol)
+            )
+            current_ok_normal_top = (
+                len(prev_buys) >= 3
+                and float(os.environ.get("V287_NORMAL_TOP_CURRENT_MIN_SOL", "2.00"))
+                <= current_buy_sol
+                <= float(os.environ.get("V287_NORMAL_TOP_CURRENT_MAX_SOL", "3.25"))
             )
             current_ok_single_prior = (
                 bool(args.enable_single_prior_buy_lane)
@@ -3330,7 +4252,12 @@ def main() -> int:
                 <= current_buy_sol
                 <= float(args.two_prior_current_max_sol)
             )
-            if not (current_ok_main or current_ok_single_prior or current_ok_two_prior):
+            if not (
+                current_ok_main
+                or current_ok_normal_top
+                or current_ok_single_prior
+                or current_ok_two_prior
+            ):
                 counters["block_current_band"] += 1
                 continue
             if len(prev_buys) < 3:
@@ -3478,6 +4405,90 @@ def main() -> int:
                         "source=deep_shadow_clean_cluster"
                     )
                     continue
+                dust_prior_ok = (
+                    os.environ.get("V287_ENABLE_DUST_PRIOR_CONTINUATION_LANE", "1")
+                    != "0"
+                    and not active
+                    and len(prev_buys) == 1
+                    and len(prev_sells) == 0
+                    and float(os.environ.get("V287_DUST_PRIOR_CURRENT_MIN_SOL", "2.00"))
+                    <= current_buy_sol
+                    <= float(os.environ.get("V287_DUST_PRIOR_CURRENT_MAX_SOL", "3.25"))
+                    and 0.0
+                    <= prev_buy_sol
+                    <= float(os.environ.get("V287_DUST_PRIOR_PREV_MAX_SOL", "0.50"))
+                    and top_share
+                    >= float(os.environ.get("V287_DUST_PRIOR_TOP_MIN", "0.95"))
+                )
+                if dust_prior_ok:
+                    top_lane = "dust_prior_clean_continuation"
+                    rearm_min_lamports = int(
+                        float(os.environ.get("V287_DUST_PRIOR_REARM_MIN_SOL", "0.35"))
+                        * LAMPORTS_PER_SOL
+                    )
+                    rearm_max_lamports = int(
+                        float(os.environ.get("V287_DUST_PRIOR_REARM_MAX_SOL", "2.00"))
+                        * LAMPORTS_PER_SOL
+                    )
+                    candidate_pair_ok = _remember_pair_from_feed_rec(broker, rec)
+                    active[mint] = {
+                        "mint": mint,
+                        "start_ms": now,
+                        "candidate_sig": sig,
+                        "candidate_pair_ok": candidate_pair_ok,
+                        "current_buy_sol": current_buy_sol,
+                        "prev_buy_sol": prev_buy_sol,
+                        "prev_buys": len(prev_buys),
+                        "top_share": top_share,
+                        "top_lane": top_lane,
+                        "rearm_min_lamports": rearm_min_lamports,
+                        "rearm_max_lamports": rearm_max_lamports,
+                        "candidate_ttl_ms": int(
+                            os.environ.get("V287_DUST_PRIOR_CANDIDATE_TTL_MS", "1350")
+                        ),
+                        "pre_entry_buys": 0,
+                        "pre_entry_buy_lamports": 0,
+                    }
+                    active[mint]["prewarm_future"] = (
+                        None
+                        if candidate_pair_ok
+                        else prewarm_pool.submit(_prewarm_pair_from_sigs, broker, mint, [sig])
+                    )
+                    active[mint]["static_plan_future"] = prewarm_pool.submit(
+                        _prepare_static_buy_plan_from_feed_rec,
+                        broker,
+                        dict(rec),
+                        float(args.size_sol),
+                    )
+                    counters["dust_prior_candidate_start"] += 1
+                    counters["candidate_start"] += 1
+                    _shadow_start(
+                        shadows,
+                        counters,
+                        reason="dust_prior_candidate_watch",
+                        rec=rec,
+                        now_ms=now,
+                        ttl_ms=int(args.shadow_miss_ms),
+                        max_open=int(args.shadow_miss_max),
+                        current_buy_sol=current_buy_sol,
+                        prev_buys=len(prev_buys),
+                        prev_buy_sol=prev_buy_sol,
+                        prev_sells=len(prev_sells),
+                        top_share=top_share,
+                        top_lane=top_lane,
+                        rearm_min_sol=rearm_min_lamports / LAMPORTS_PER_SOL,
+                    )
+                    _log(
+                        "PGG2-V287-DUST-PRIOR-CANDIDATE "
+                        f"mint={_short(mint)} full_mint={mint} current_buy_sol={current_buy_sol:.6f} "
+                        f"prev_buys_1s={len(prev_buys)} prev_buy_sol_1s={prev_buy_sol:.6f} "
+                        f"prev_sells_1s={len(prev_sells)} top_share_1s={top_share:.4f} "
+                        f"rearm_min_sol={rearm_min_lamports/LAMPORTS_PER_SOL:.6f} "
+                        f"rearm_max_sol={rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
+                        f"ttl_ms={_candidate_live_ttl_ms(active[mint])} "
+                        "source=last_smoke_prev_buys_frequency_repair"
+                    )
+                    continue
                 fresh_impulse_ok = (
                     bool(args.enable_fresh_impulse_lane)
                     and not active
@@ -3496,7 +4507,7 @@ def main() -> int:
                         os.environ.get("V287_FRESH_IMPULSE_PREV_CARRY_MIN_SOL", "2.00")
                     )
                     zero_prev_min_sol = float(
-                        os.environ.get("V287_FRESH_IMPULSE_ZERO_PREV_MIN_REARM_SOL", "1.50")
+                        os.environ.get("V287_FRESH_IMPULSE_ZERO_PREV_MIN_REARM_SOL", "1.35")
                     )
                     if prev_buy_sol + 1e-12 < prev_carry_min_sol:
                         adaptive_rearm_min_sol = max(configured_rearm_min_sol, zero_prev_min_sol)
@@ -3619,31 +4630,61 @@ def main() -> int:
                     top_share=top_share,
                 )
                 continue
+            edge_top_ok = (
+                os.environ.get("V287_EDGE_TOP_ENABLED", "1") != "0"
+                and len(prev_buys) >= 3
+                and float(os.environ.get("V287_EDGE_TOP_MIN_SHARE", "0.50"))
+                <= top_share
+                < float(args.top_share_min)
+                and float(os.environ.get("V287_EDGE_TOP_PREV_MIN_SOL", "7.50"))
+                <= prev_buy_sol
+                <= float(os.environ.get("V287_EDGE_TOP_PREV_MAX_SOL", "9.60"))
+            )
             if not (float(args.top_share_min) <= top_share <= float(args.top_share_max)):
-                counters["block_top_band"] += 1
+                if not edge_top_ok:
+                    counters["block_top_band"] += 1
+                    _log(
+                        "PGG2-V287-TOP-BAND-BLOCK "
+                        f"mint={_short(mint)} full_mint={mint} current_buy_sol={current_buy_sol:.6f} "
+                        f"prev_buys_1s={len(prev_buys)} prev_buy_sol_1s={prev_buy_sol:.6f} "
+                        f"top_share_1s={top_share:.4f} "
+                        f"top_min={float(args.top_share_min):.4f} top_max={float(args.top_share_max):.4f}"
+                    )
+                    _shadow_start(
+                        shadows,
+                        counters,
+                        reason="top_band",
+                        rec=rec,
+                        now_ms=now,
+                        ttl_ms=int(args.shadow_miss_ms),
+                        max_open=int(args.shadow_miss_max),
+                        current_buy_sol=current_buy_sol,
+                        prev_buys=len(prev_buys),
+                        prev_buy_sol=prev_buy_sol,
+                        prev_sells=len(prev_sells),
+                        top_share=top_share,
+                    )
+                    continue
+                counters["edge_top_candidate_start"] += 1
                 _log(
-                    "PGG2-V287-TOP-BAND-BLOCK "
+                    "PGG2-V287-EDGE-TOP-CANDIDATE "
                     f"mint={_short(mint)} full_mint={mint} current_buy_sol={current_buy_sol:.6f} "
                     f"prev_buys_1s={len(prev_buys)} prev_buy_sol_1s={prev_buy_sol:.6f} "
                     f"top_share_1s={top_share:.4f} "
-                    f"top_min={float(args.top_share_min):.4f} top_max={float(args.top_share_max):.4f}"
+                    f"top_min={float(args.top_share_min):.4f} "
+                    "source=near_top_shadow_clean_bucket"
                 )
-                _shadow_start(
-                    shadows,
-                    counters,
-                    reason="top_band",
-                    rec=rec,
-                    now_ms=now,
-                    ttl_ms=int(args.shadow_miss_ms),
-                    max_open=int(args.shadow_miss_max),
-                    current_buy_sol=current_buy_sol,
-                    prev_buys=len(prev_buys),
-                    prev_buy_sol=prev_buy_sol,
-                    prev_sells=len(prev_sells),
-                    top_share=top_share,
+            if edge_top_ok:
+                top_lane = "edge_top_strong_prior"
+                rearm_min_lamports = int(
+                    float(os.environ.get("V287_EDGE_TOP_REARM_MIN_SOL", "1.80"))
+                    * LAMPORTS_PER_SOL
                 )
-                continue
-            if top_share < float(args.top_share_normal_min):
+                rearm_max_lamports = int(
+                    float(os.environ.get("V287_EDGE_TOP_REARM_MAX_SOL", "3.20"))
+                    * LAMPORTS_PER_SOL
+                )
+            elif top_share < float(args.top_share_normal_min):
                 if not bool(args.enable_low_top_lane):
                     counters["block_top_band"] += 1
                     _log(
