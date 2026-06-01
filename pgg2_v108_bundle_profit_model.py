@@ -18,6 +18,8 @@ ATA_RENT_LAMPORTS = 2_039_280
 
 
 def _log(line: str) -> None:
+    if os.environ.get("V108_PROFIT_LOG", "1").lower() in {"0", "false", "no"}:
+        return
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {line}", flush=True)
 
 
@@ -26,6 +28,26 @@ def _envi(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except Exception:
         return int(default)
+
+
+def _envf(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+def _env_sizes(name: str, default: Iterable[int]) -> tuple[int, ...]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return tuple(int(v) for v in default)
+    out: list[int] = []
+    for part in raw.replace(";", ",").split(","):
+        item = part.strip().replace("_", "")
+        if not item:
+            continue
+        out.append(int(item))
+    return tuple(out) if out else tuple(int(v) for v in default)
 
 
 def quote_buy_tokens_raw(sol_lamports: int, vsol: int, vtok: int, fee_bps: int = PUMP_FEE_BPS) -> int:
@@ -142,7 +164,14 @@ def select_best_size(
     jito_tip_lamports: int = 1_000,
 ) -> Optional[V108ProfitResult]:
     best: Optional[V108ProfitResult] = None
-    for size in sizes_lamports:
+    sizes = _env_sizes("V108_SIZE_LADDER_LAMPORTS", sizes_lamports)
+    min_profit = _envi("V108_MIN_PROFIT_LAMPORTS", 30_000)
+    tip_fraction_cap = _envf("V108_TIP_FRACTION_CAP", 0.20)
+    projection_buffer = _envi("V108_PROJECTION_BUFFER_LAMPORTS", 30_000)
+    priority_fee = _envi("V108_PRIORITY_FEE_LAMPORTS_PER_TX", 5_000)
+    base_fee = _envi("V108_BASE_FEE_LAMPORTS_PER_TX", 5_000)
+    tx_count = _envi("V108_TX_COUNT", 4)
+    for size in sizes:
         res = evaluate_bundle_profit(
             mint=mint,
             vsol_lamports=vsol_lamports,
@@ -150,7 +179,13 @@ def select_best_size(
             external_sol_lamports=external_sol_lamports,
             size_lamports=size,
             jito_tip_lamports=jito_tip_lamports,
+            min_profit_lamports=min_profit,
+            tip_fraction_cap=tip_fraction_cap,
+            projection_buffer_lamports=projection_buffer,
+            priority_fee_lamports_per_tx=priority_fee,
+            base_fee_lamports_per_tx=base_fee,
+            tx_count=tx_count,
         )
-        if res.passed:
+        if res.passed and (best is None or res.bundle_profit_lamports > best.bundle_profit_lamports):
             best = res
     return best

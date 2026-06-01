@@ -95,11 +95,85 @@ def _txn_account_keys(txn_b64: str) -> set[str]:
     return {str(k) for k in tx.message.account_keys}
 
 
+def _validate_buy_creator_vault_from_key(
+    mint: str,
+    txn_b64: str,
+    expected: str,
+    source: str,
+) -> bool:
+    """Validate a known creator-vault account is present in the encoded buy tx."""
+    try:
+        expected_pk = str(as_pubkey(expected))
+        keys = _txn_account_keys(txn_b64)
+        ok = expected_pk in keys
+        _log(
+            "PGG2-V287-CREATOR-VAULT-CHECK "
+            f"mint={_short(mint)} full_mint={mint} "
+            f"expected={expected_pk} present={int(ok)} account_keys={len(keys)} "
+            f"source={source}"
+        )
+        return ok
+    except Exception as exc:
+        _log(
+            "PGG2-V287-CREATOR-VAULT-CHECK-FAIL "
+            f"mint={_short(mint)} full_mint={mint} source={source} "
+            f"err={type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return False
+
+
+def _validate_buy_creator_vault_for_curve(
+    broker: Any,
+    mint: str,
+    txn_b64: str,
+    creator: Any,
+) -> bool:
+    """Prefer the decoded Pump tx creator-vault meta, then fall back to curve creator.
+
+    The fast prebuilt transaction uses the creator-vault account decoded from the
+    observed Pump instruction. A later curve-cache creator read can disagree fo
+    hot candidates, which incorrectly blocked the 7s1e single-prior continuation
+    class. Accepting the already-decoded account keeps the account guard while
+    removing that stale-cache false negative.
+    """
+    override = str(
+        getattr(broker, "_pump_creator_vault_override", {}).get(str(mint), "")
+        or ""
+    )
+    if override and _validate_buy_creator_vault_from_key(
+        mint,
+        txn_b64,
+        override,
+        "geyser_tx_creator_vault_override",
+    ):
+        return True
+    return _validate_buy_creator_vault_from_creator(mint, txn_b64, creator)
+
+
 def _validate_buy_creator_vault(broker: Any, mint: str, txn_b64: str) -> bool:
     """Fail closed before send if the buy transaction was built with a stale creator vault."""
+    override = str(
+        getattr(broker, "_pump_creator_vault_override", {}).get(str(mint), "")
+        or ""
+    )
+    if override and _validate_buy_creator_vault_from_key(
+        mint,
+        txn_b64,
+        override,
+        "geyser_tx_creator_vault_override",
+    ):
+        return True
     try:
         curve = broker.bonding_curve(as_pubkey(mint))
-        return _validate_buy_creator_vault_from_creator(mint, txn_b64, curve.creator)
+        creator = getattr(curve, "creator", "")
+        if not creator:
+            _log(
+                "PGG2-V287-CREATOR-VAULT-CHECK-FAIL "
+                f"mint={_short(mint)} full_mint={mint} "
+                "err=missing_curve_creator_and_no_valid_override"
+            )
+            return False
+        return _validate_buy_creator_vault_for_curve(broker, mint, txn_b64, creator)
     except Exception as exc:
         _log(
             "PGG2-V287-CREATOR-VAULT-CHECK-FAIL "
@@ -330,7 +404,22 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_BACKGROUND_BLOCKHASH_WARM_MS", "20000")
     os.environ.setdefault("V287_BACKGROUND_GLOBAL_WARM_MS", "4000")
     os.environ.setdefault("V287_MIN_FINAL_REFRESH_ABS_DRIFT_PCT", "0.05")
-    os.environ.setdefault("V287_PREBUY_MIN_PROJECTED_DELTA_LAMPORTS", "0")
+    try:
+        _prebuy_floor = int(
+            os.environ.get("V287_PREBUY_MIN_PROJECTED_DELTA_LAMPORTS", "0") or 0
+        )
+    except Exception:
+        _prebuy_floor = 0
+    if _prebuy_floor < 0:
+        _log(
+            "PGG2-V287-PREBUY-FLOOR-CLAMP "
+            f"old_min_projected_delta_lamports={_prebuy_floor} "
+            "new_min_projected_delta_lamports=0 "
+            "reason=selected_fingerprint_must_authorize_negative_roundtrip"
+        )
+        os.environ["V287_PREBUY_MIN_PROJECTED_DELTA_LAMPORTS"] = "0"
+    else:
+        os.environ.setdefault("V287_PREBUY_MIN_PROJECTED_DELTA_LAMPORTS", "0")
     os.environ.setdefault("V287_FRESH_IMPULSE_ZERO_PREV_MIN_REARM_SOL", "1.50")
     os.environ.setdefault("V287_FRESH_IMPULSE_PREV_CARRY_MIN_SOL", "2.00")
     os.environ.setdefault("V287_ALLOW_PREPLAN_REARM_CREDIT", "1")
@@ -390,18 +479,61 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_SELECTED_ACCELERATION_NEG_REFRESH_DRIFT_PCT", "8.00")
     os.environ.setdefault("V287_SELECTED_POSTPLAN_FOLLOWTHROUGH_MIN_SOL", "0.70")
     os.environ.setdefault("V287_SELECTED_NO_MOVEMENT_FOLLOWTHROUGH", "1")
+    os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_ALLOW_FLAT_REFRESH", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_ALLOW_FLAT_REFRESH", "1")
+    os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_MIN_GUARD_MODE", "floor")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_MIN_GUARD_MODE", "floor")
     os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MIN_SOL", "4.50")
     os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_SOL", "10.00")
     os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_DELAY_MS", "1200")
     os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_NO_MOVE_MAX_BUYS", "6")
     os.environ.setdefault("V287_SELECTED_SINGLE_MID_MIN_QUOTE_TOKENS", "680000")
+    os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_ACTUAL_ENABLED", "1")
+    os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MIN_GUARD_MODE", "floor")
+    os.environ.setdefault("V287_SELECTED_FRESH_SINGLE_MID_MIN_TOKEN_HEADROOM_PCT", "5.00")
     os.environ.setdefault("V287_SELECTED_STRONG_MIN_QUOTE_TOKENS", "660000")
     os.environ.setdefault("V287_SELECTED_UPPER_MID_MULTI_MIN_QUOTE_TOKENS", "700000")
+    os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_MAX_QUOTE_TOKENS", "650000")
+    os.environ.setdefault("V287_SELECTED_SINGLE_PRIOR_MIN_TOKEN_HEADROOM_PCT", "5.00")
+    os.environ.setdefault("V287_ENABLE_SEED_PRIOR_CARRY_LANE", "1")
+    os.environ.setdefault("V287_SEED_PRIOR_CARRY_CURRENT_MIN_SOL", "2.00")
+    os.environ.setdefault("V287_SEED_PRIOR_CARRY_CURRENT_MAX_SOL", "2.80")
+    os.environ.setdefault("V287_SEED_PRIOR_CARRY_REARM_MIN_SOL", "2.00")
+    os.environ.setdefault("V287_SEED_PRIOR_CARRY_REARM_MAX_SOL", "6.50")
+    os.environ.setdefault("V287_SEED_PRIOR_CARRY_MIN_REARM_BUYS", "2")
+    os.environ.setdefault("V287_SEED_PRIOR_CARRY_MAX_FIRST_DELAY_MS", "350")
+    os.environ.setdefault("V287_SEED_PRIOR_CARRY_MAX_LAST_DELAY_MS", "350")
+    os.environ.setdefault("V287_SEED_PRIOR_CARRY_TTL_MS", "1350")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_MAX_QUOTE_TOKENS", "760000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_MIN_TOKEN_HEADROOM_PCT", "5.00")
+    os.environ.setdefault("V287_SEED_PRIOR_SINGLE_STRONG_MIN_SOL", "3.00")
+    os.environ.setdefault("V287_SEED_PRIOR_SINGLE_STRONG_MAX_SOL", "6.50")
+    os.environ.setdefault("V287_SEED_PRIOR_SINGLE_STRONG_MAX_DELAY_MS", "75")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SINGLE_STRONG_MAX_QUOTE_TOKENS", "760000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SINGLE_STRONG_MIN_TOKEN_HEADROOM_PCT", "5.00")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SINGLE_STRONG_MIN_GUARD_MODE", "floor")
     os.environ.setdefault("V287_SELECTED_WEAK_DRIFT_KEEP_WATCH", "1")
     os.environ.setdefault("V287_SELECTED_WEAK_DRIFT_WATCH_MAX_AGE_MS", "900")
     os.environ.setdefault("V287_EVENT_BUY_MAX_SOL_SANITY", "20.00")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH", "1")
     os.environ.setdefault("V287_KEEP_UNVERIFIED_FRESH_WATCH_MAX_MS", "1000")
+    os.environ.setdefault("V287_MAX_ACTIVE_CANDIDATES", "12")
+    os.environ.setdefault("V287_SHADOW_CURRENT_BAND_REJECTS", "1")
+    os.environ.setdefault("V287_ENABLE_FRESH_CLEAN_CARRY_RECLASS", "0")
+    os.environ.setdefault("V287_FRESH_CLEAN_CARRY_MIN_BUYS", "3")
+    os.environ.setdefault("V287_FRESH_CLEAN_CARRY_MIN_SOL", "3.50")
+    os.environ.setdefault("V287_FRESH_CLEAN_CARRY_MAX_AGE_MS", "1100")
+    os.environ.setdefault("V287_FRESH_CLEAN_CARRY_MAX_LAST_BUY_LAG_MS", "350")
+    os.environ.setdefault("V287_SELECTED_FRESH_CLEAN_CARRY_MIN_QUOTE_TOKENS", "560000")
+    os.environ.setdefault("V287_ENABLE_HIGH_CURRENT_CLEAN_TRAIN_LANE", "0")
+    os.environ.setdefault("V287_HIGH_CURRENT_TRAIN_CURRENT_MIN_SOL", "3.30")
+    os.environ.setdefault("V287_HIGH_CURRENT_TRAIN_CURRENT_MAX_SOL", "6.00")
+    os.environ.setdefault("V287_HIGH_CURRENT_TRAIN_PREV_MAX_SOL", "4.50")
+    os.environ.setdefault("V287_HIGH_CURRENT_TRAIN_TOP_MIN", "0.95")
+    os.environ.setdefault("V287_HIGH_CURRENT_TRAIN_REARM_MIN_SOL", "3.00")
+    os.environ.setdefault("V287_HIGH_CURRENT_TRAIN_REARM_MAX_SOL", "12.00")
+    os.environ.setdefault("V287_HIGH_CURRENT_TRAIN_TTL_MS", "1000")
+    os.environ.setdefault("V287_HIGH_CURRENT_TRAIN_ALLOW_FLAT_REFRESH", "1")
     os.environ["PGG2_LIVE_MIN_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MAX_TRADE_SOL"] = f"{float(args.size_sol):.9f}"
     os.environ["PGG2_LIVE_MIN_WALLET_RESERVE_SOL"] = f"{float(args.min_reserve_sol):.9f}"
@@ -613,6 +745,31 @@ def _prepare_static_buy_plan_from_feed_rec(
         _log(
             "PGG2-V287-FAST-STATIC-PLAN-FAIL "
             f"mint={_short(mint)} err={type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return False
+
+
+def _drop_static_buy_plan_for_mint_size(
+    broker: Any, mint: str, amount_sol: float, reason: str
+) -> bool:
+    try:
+        plans = getattr(broker, "_pump_buy_static_plans", {})
+        spend_lamports = max(1, int(float(amount_sol) * LAMPORTS_PER_SOL))
+        key = f"{str(mint)}:{int(spend_lamports)}"
+        existed = key in plans
+        if existed:
+            plans.pop(key, None)
+        _log(
+            "PGG2-V287-FAST-STATIC-PLAN-DROP "
+            f"mint={_short(str(mint))} size_sol={float(amount_sol):.6f} "
+            f"existed={int(existed)} reason={reason}"
+        )
+        return bool(existed)
+    except Exception as exc:
+        _log(
+            "PGG2-V287-FAST-STATIC-PLAN-DROP-FAIL "
+            f"mint={_short(str(mint))} reason={reason} "
+            f"err={type(exc).__name__}:{str(exc)[:120]}"
         )
         return False
 
@@ -903,6 +1060,29 @@ def _v287_selected_negative_roundtrip_fingerprint(
         ):
             return True, "selected_fresh_dense_moderate_train"
 
+    if top_lane == "high_current_clean_train":
+        if (
+            os.environ.get("V287_ALLOW_HIGH_CURRENT_CLEAN_TRAIN_LIVE_RISK", "0")
+            != "1"
+        ):
+            return False, "selected_high_current_shadow_only_after_7TSY_loss"
+        high_current_min = float(os.environ.get("V287_HIGH_CURRENT_TRAIN_CURRENT_MIN_SOL", "3.30"))
+        high_current_max = float(os.environ.get("V287_HIGH_CURRENT_TRAIN_CURRENT_MAX_SOL", "6.00"))
+        high_rearm_min = float(os.environ.get("V287_HIGH_CURRENT_TRAIN_SELECTED_REARM_MIN_SOL", "3.00"))
+        high_rearm_max = float(os.environ.get("V287_HIGH_CURRENT_TRAIN_SELECTED_REARM_MAX_SOL", "12.00"))
+        high_min_buys = int(os.environ.get("V287_HIGH_CURRENT_TRAIN_SELECTED_MIN_BUYS", "2"))
+        high_max_buys = int(os.environ.get("V287_HIGH_CURRENT_TRAIN_SELECTED_MAX_BUYS", "12"))
+        high_max_first_delay = int(os.environ.get("V287_HIGH_CURRENT_TRAIN_SELECTED_MAX_FIRST_DELAY_MS", "350"))
+        high_max_last_delay = int(os.environ.get("V287_HIGH_CURRENT_TRAIN_SELECTED_MAX_LAST_DELAY_MS", "1000"))
+        if (
+            high_current_min <= current_buy_sol <= high_current_max
+            and high_rearm_min <= observed_rearm_sol <= high_rearm_max
+            and high_min_buys <= pre_entry_buys <= high_max_buys
+            and first_rearm_delay_ms <= high_max_first_delay
+            and last_rearm_delay_ms <= high_max_last_delay
+        ):
+            return True, "selected_high_current_clean_train"
+
     if top_lane == "normal_top":
         normal_min_sol = float(os.environ.get("V287_SELECTED_NORMAL_REARM_MIN_SOL", "0.70"))
         normal_max_sol = float(os.environ.get("V287_SELECTED_NORMAL_REARM_MAX_SOL", "2.05"))
@@ -955,6 +1135,49 @@ def _v287_selected_negative_roundtrip_fingerprint(
             and last_rearm_delay_ms <= single_max_delay
         ):
             return True, "selected_single_prior_strong_rearm"
+
+    if top_lane == "seed_prior_carry_continuation":
+        # This is the scanner-blind sibling of the successful single-prior lane:
+        # the first buy is the "prior" leg, then a clean carry arrives before
+        # we send. It stays narrower than high_current_clean_train and requires
+        # either multiple clean continuation buys or one very fast, large carry.
+        seed_current_min = float(os.environ.get("V287_SEED_PRIOR_CARRY_CURRENT_MIN_SOL", "2.00"))
+        seed_current_max = float(os.environ.get("V287_SEED_PRIOR_CARRY_CURRENT_MAX_SOL", "2.80"))
+        seed_single_strong_min = float(
+            os.environ.get("V287_SEED_PRIOR_SINGLE_STRONG_MIN_SOL", "3.00")
+        )
+        seed_single_strong_max = float(
+            os.environ.get("V287_SEED_PRIOR_SINGLE_STRONG_MAX_SOL", "6.50")
+        )
+        seed_single_strong_max_delay = int(
+            os.environ.get("V287_SEED_PRIOR_SINGLE_STRONG_MAX_DELAY_MS", "75")
+        )
+        if (
+            seed_current_min <= current_buy_sol <= seed_current_max
+            and prev_buy_sol <= 1e-12
+            and top_share >= 0.999
+            and seed_single_strong_min <= observed_rearm_sol <= seed_single_strong_max
+            and pre_entry_buys == 1
+            and first_rearm_delay_ms <= seed_single_strong_max_delay
+            and last_rearm_delay_ms <= seed_single_strong_max_delay
+        ):
+            return True, "selected_seed_prior_single_strong_rearm"
+
+        seed_rearm_min = float(os.environ.get("V287_SEED_PRIOR_CARRY_REARM_MIN_SOL", "2.00"))
+        seed_rearm_max = float(os.environ.get("V287_SEED_PRIOR_CARRY_REARM_MAX_SOL", "6.50"))
+        seed_min_buys = int(os.environ.get("V287_SEED_PRIOR_CARRY_MIN_REARM_BUYS", "2"))
+        seed_max_first_delay = int(os.environ.get("V287_SEED_PRIOR_CARRY_MAX_FIRST_DELAY_MS", "350"))
+        seed_max_last_delay = int(os.environ.get("V287_SEED_PRIOR_CARRY_MAX_LAST_DELAY_MS", "350"))
+        if (
+            seed_current_min <= current_buy_sol <= seed_current_max
+            and prev_buy_sol <= 1e-12
+            and top_share >= 0.999
+            and seed_rearm_min <= observed_rearm_sol <= seed_rearm_max
+            and seed_min_buys <= pre_entry_buys <= 6
+            and first_rearm_delay_ms <= seed_max_first_delay
+            and last_rearm_delay_ms <= seed_max_last_delay
+        ):
+            return True, "selected_seed_prior_carry_rearm"
 
     if top_lane == "dust_prior_clean_continuation":
         # Repair for the 2026-05-30 frequency leak: a single tiny prior buy can
@@ -1009,6 +1232,19 @@ def _v287_selected_negative_reason_allowed(reason: str) -> bool:
     return bool(reason.startswith("selected_")) and reason != "selected_no_match"
 
 
+def _v287_selected_fresh_actual_enabled(reason: str) -> bool:
+    """Keep broad fresh actual disabled while allowing replay-backed sublanes."""
+    reason = str(reason or "")
+    if os.environ.get("V287_SELECTED_FRESH_ACTUAL_ENABLED", "0") == "1":
+        return True
+    if reason == "selected_fresh_single_mid_rearm":
+        return (
+            os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_ACTUAL_ENABLED", "1")
+            != "0"
+        )
+    return False
+
+
 def _v287_reason_min_quote_tokens(reason: str, default_min_tokens: float) -> float:
     """Raise token-output floor only for replay-backed selected exception lanes."""
     reason = str(reason or "")
@@ -1033,7 +1269,214 @@ def _v287_reason_min_quote_tokens(reason: str, default_min_tokens: float) -> flo
                 )
             ),
         )
+    elif reason == "selected_fresh_clean_carry_reclass":
+        floor = max(
+            floor,
+            float(os.environ.get("V287_SELECTED_FRESH_CLEAN_CARRY_MIN_QUOTE_TOKENS", "560000")),
+        )
     return floor
+
+
+def _v287_reason_max_quote_tokens(reason: str) -> float:
+    """Reason-specific upper token cap blocks too-early fills that replay lost."""
+    reason = str(reason or "")
+    if reason in {
+        "selected_single_prior_strong_rearm",
+        "selected_single_prior_no_movement_followthrough",
+    }:
+        return float(os.environ.get("V287_SELECTED_SINGLE_PRIOR_MAX_QUOTE_TOKENS", "650000"))
+    if reason == "selected_seed_prior_carry_rearm":
+        return float(os.environ.get("V287_SELECTED_SEED_PRIOR_MAX_QUOTE_TOKENS", "760000"))
+    if reason == "selected_seed_prior_single_strong_rearm":
+        return float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_SINGLE_STRONG_MAX_QUOTE_TOKENS",
+                "760000",
+            )
+        )
+    return 0.0
+
+
+def _v287_reason_min_token_headroom_pct(reason: str) -> float:
+    """Require extra token headroom only where recent live failed-buy fees proved it."""
+    reason = str(reason or "")
+    if reason in {
+        "selected_single_prior_strong_rearm",
+        "selected_single_prior_no_movement_followthrough",
+    }:
+        return max(
+            0.0,
+            float(
+                os.environ.get(
+                    "V287_SELECTED_SINGLE_PRIOR_MIN_TOKEN_HEADROOM_PCT",
+                    "5.00",
+                )
+            ),
+        )
+    if reason == "selected_fresh_single_mid_rearm":
+        return max(
+            0.0,
+            float(
+                os.environ.get(
+                    "V287_SELECTED_FRESH_SINGLE_MID_MIN_TOKEN_HEADROOM_PCT",
+                    "5.00",
+                )
+            ),
+        )
+    if reason == "selected_seed_prior_carry_rearm":
+        return max(
+            0.0,
+            float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_MIN_TOKEN_HEADROOM_PCT",
+                    "5.00",
+                )
+            ),
+        )
+    if reason == "selected_seed_prior_single_strong_rearm":
+        return max(
+            0.0,
+            float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_SINGLE_STRONG_MIN_TOKEN_HEADROOM_PCT",
+                    "5.00",
+                )
+            ),
+        )
+    return 0.0
+
+
+def _v287_buy_quote_headroom_ok(
+    *,
+    mint: str,
+    reason: str,
+    quote_tokens: float,
+    min_quote_tokens: float,
+    source: str,
+) -> bool:
+    min_headroom_pct = _v287_reason_min_token_headroom_pct(reason)
+    if min_headroom_pct <= 0.0 or min_quote_tokens <= 0.0:
+        return True
+    required_tokens = min_quote_tokens * (1.0 + (min_headroom_pct / 100.0))
+    headroom_pct = ((quote_tokens - min_quote_tokens) / min_quote_tokens) * 100.0
+    ok = quote_tokens >= required_tokens
+    _log(
+        "PGG2-V287-BUY-QUOTE-HEADROOM-CHECK "
+        f"mint={_short(mint)} full_mint={mint} "
+        f"reason={reason or '-'} "
+        f"amount_out_tokens={quote_tokens:.6f} "
+        f"min_tokens={min_quote_tokens:.6f} "
+        f"required_tokens={required_tokens:.6f} "
+        f"headroom_pct={headroom_pct:+.3f} "
+        f"min_headroom_pct={min_headroom_pct:.3f} "
+        f"pass={int(ok)} source={source}"
+    )
+    return ok
+
+
+def _v287_reason_min_guard_mode(reason: str) -> str:
+    reason = str(reason or "")
+    if reason in {
+        "selected_single_prior_strong_rearm",
+        "selected_single_prior_no_movement_followthrough",
+    }:
+        return str(
+            os.environ.get("V287_SELECTED_SINGLE_PRIOR_MIN_GUARD_MODE", "floor")
+            or "floor"
+        ).strip().lower()
+    if reason == "selected_fresh_single_mid_rearm":
+        return str(
+            os.environ.get("V287_SELECTED_FRESH_SINGLE_MID_MIN_GUARD_MODE", "floor")
+            or "floor"
+        ).strip().lower()
+    if reason == "selected_seed_prior_carry_rearm":
+        return str(
+            os.environ.get("V287_SELECTED_SEED_PRIOR_MIN_GUARD_MODE", "floor")
+            or "floor"
+        ).strip().lower()
+    if reason == "selected_seed_prior_single_strong_rearm":
+        return str(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_SINGLE_STRONG_MIN_GUARD_MODE",
+                "floor",
+            )
+            or "floor"
+        ).strip().lower()
+    return "slippage"
+
+
+def _v287_buy_min_guard_tokens(
+    *,
+    mint: str,
+    reason: str,
+    quote_tokens: float,
+    min_quote_tokens: float,
+    buy_slippage_pct: float,
+    source: str,
+) -> float:
+    slippage_tokens = quote_tokens * max(0.0, 1.0 - (buy_slippage_pct / 100.0))
+    mode = _v287_reason_min_guard_mode(reason)
+    if mode == "floor":
+        guard_tokens = float(min_quote_tokens)
+    else:
+        mode = "slippage"
+        guard_tokens = max(float(slippage_tokens), float(min_quote_tokens))
+    _log(
+        "PGG2-V287-MIN-TOKEN-GUARD-CHECK "
+        f"mint={_short(mint)} full_mint={mint} "
+        f"reason={reason or '-'} mode={mode} "
+        f"quote_tokens={quote_tokens:.6f} "
+        f"slippage_tokens={slippage_tokens:.6f} "
+        f"min_quote_tokens={min_quote_tokens:.6f} "
+        f"guard_tokens={guard_tokens:.6f} "
+        f"source={source}"
+    )
+    if guard_tokens <= 0.0:
+        raise RuntimeError("v287_min_token_guard_zero")
+    return guard_tokens
+
+
+def _v287_fresh_clean_carry_reclass_ready(cand: dict[str, Any], now_ms: int) -> tuple[bool, str]:
+    """Promote a fresh/no-prior candidate only after clean continuation proves it.
+
+    This does not re-enable the old fresh actual lane. A candidate starts as
+    shadow-only, must remain sell-free, and must accumulate enough follow-through
+    before it can use the selected/protected send path.
+    """
+    if os.environ.get("V287_ENABLE_FRESH_CLEAN_CARRY_RECLASS", "1") == "0":
+        return False, "disabled"
+    if str(cand.get("top_lane") or "") != "fresh_impulse":
+        return False, "not_fresh"
+    if float(cand.get("prev_buy_sol") or 0.0) > 1e-12:
+        return False, "prior_present"
+    age_ms = max(0, int(now_ms) - int(cand.get("start_ms") or now_ms))
+    max_age_ms = int(os.environ.get("V287_FRESH_CLEAN_CARRY_MAX_AGE_MS", "1100"))
+    if age_ms > max_age_ms:
+        return False, "age"
+    min_buys = int(os.environ.get("V287_FRESH_CLEAN_CARRY_MIN_BUYS", "3"))
+    min_sol = float(os.environ.get("V287_FRESH_CLEAN_CARRY_MIN_SOL", "3.50"))
+    pre_entry_buys = int(cand.get("pre_entry_buys") or 0)
+    pre_entry_sol = int(cand.get("pre_entry_buy_lamports") or 0) / LAMPORTS_PER_SOL
+    if pre_entry_buys < min_buys:
+        return False, "buys"
+    if pre_entry_sol < min_sol:
+        return False, "sol"
+    max_lag_ms = int(os.environ.get("V287_FRESH_CLEAN_CARRY_MAX_LAST_BUY_LAG_MS", "350"))
+    last_lag_ms = max(0, int(now_ms) - int(cand.get("last_rearm_pass_ts_ms") or now_ms))
+    if last_lag_ms > max_lag_ms:
+        return False, "lag"
+    return True, "clean_carry"
+
+
+def _v287_fresh_actual_should_wait(cand: dict[str, Any], now_ms: int) -> bool:
+    if os.environ.get("V287_ENABLE_FRESH_CLEAN_CARRY_RECLASS", "1") == "0":
+        return False
+    if str(cand.get("top_lane") or "") != "fresh_impulse":
+        return False
+    if float(cand.get("prev_buy_sol") or 0.0) > 1e-12:
+        return False
+    age_ms = max(0, int(now_ms) - int(cand.get("start_ms") or now_ms))
+    return age_ms <= int(os.environ.get("V287_FRESH_CLEAN_CARRY_MAX_AGE_MS", "1100"))
 
 
 def _prebuy_postbuy_sell_projection_pass(
@@ -1873,6 +2316,7 @@ def main() -> int:
     ap.add_argument("--min-buy-quote-tokens", type=float, default=float(os.environ.get("V287_MIN_BUY_QUOTE_TOKENS", "500000")))
     ap.add_argument("--shadow-miss-ms", type=int, default=int(os.environ.get("V287_SHADOW_MISS_MS", "3000")))
     ap.add_argument("--shadow-miss-max", type=int, default=int(os.environ.get("V287_SHADOW_MISS_MAX", "128")))
+    ap.add_argument("--max-active-candidates", type=int, default=int(os.environ.get("V287_MAX_ACTIVE_CANDIDATES", "12")))
     ap.add_argument(
         "--skip-startup-token-check",
         action="store_true",
@@ -1935,10 +2379,11 @@ def main() -> int:
             os.environ.get("V287_PREBUY_MIN_SELF_ROUNDTRIP_DELTA_LAMPORTS", "-1000000"),
         )
     )
-    if prebuy_min_self_roundtrip_delta < -1_250_000:
+    if prebuy_min_self_roundtrip_delta < 0:
         _log(
-            "PGG2-V287-FATAL prebuy_self_roundtrip_floor_too_loose "
-            f"min_delta={prebuy_min_self_roundtrip_delta} floor=-1250000"
+            "PGG2-V287-FATAL prebuy_self_roundtrip_floor_negative "
+            f"min_delta={prebuy_min_self_roundtrip_delta} floor=0 "
+            "reason=selected_fingerprint_authority_required"
         )
         return 2
 
@@ -2808,6 +3253,38 @@ def main() -> int:
                                 curve_ms = curve_ts_ms - fast_start_ms
                                 continuation_model_ok = False
                                 continuation_reason = ""
+                                fp_now_ms = _now_ms()
+                                fp_age_ms = fp_now_ms - int(
+                                    cand.get("start_ms") or fp_now_ms
+                                )
+                                fp_first_rearm_delay_ms = int(
+                                    cand.get("first_rearm_pass_delay_ms") or fp_age_ms
+                                )
+                                fp_last_rearm_delay_ms = int(
+                                    cand.get("last_rearm_pass_delay_ms")
+                                    or fp_first_rearm_delay_ms
+                                )
+                                fp_last_rearm_lag_ms = max(
+                                    0,
+                                    fp_now_ms
+                                    - int(cand.get("last_rearm_pass_ts_ms") or fp_now_ms),
+                                )
+                                pre_projection_selected_ok, pre_projection_selected_reason = (
+                                    _v287_selected_negative_roundtrip_fingerprint(
+                                        top_lane=str(cand.get("top_lane") or ""),
+                                        current_buy_sol=float(cand.get("current_buy_sol") or 0.0),
+                                        prev_buy_sol=float(cand.get("prev_buy_sol") or 0.0),
+                                        top_share=float(cand.get("top_share") or 0.0),
+                                        pre_entry_buys=int(cand.get("pre_entry_buys") or 0),
+                                        observed_rearm_sol=(
+                                            int(cand.get("pre_entry_buy_lamports") or 0)
+                                            / LAMPORTS_PER_SOL
+                                        ),
+                                        first_rearm_delay_ms=fp_first_rearm_delay_ms,
+                                        last_rearm_delay_ms=fp_last_rearm_delay_ms,
+                                        last_rearm_lag_ms=fp_last_rearm_lag_ms,
+                                    )
+                                )
                                 ok_proj, quote_tokens, _expected_raw = _prebuy_postbuy_sell_projection_from_curve(
                                     broker,
                                     mint,
@@ -3314,6 +3791,25 @@ def main() -> int:
                                     selected_negative_reason_allowed = (
                                         _v287_selected_negative_reason_allowed(continuation_reason or "")
                                     )
+                                    fresh_clean_ready, fresh_clean_reason = (
+                                        _v287_fresh_clean_carry_reclass_ready(cand, _now_ms())
+                                    )
+                                    if (
+                                        not selected_negative_reason_allowed
+                                        and fresh_clean_ready
+                                    ):
+                                        continuation_reason = "selected_fresh_clean_carry_reclass"
+                                        selected_negative_reason_allowed = True
+                                        cand["fresh_clean_carry_reclass"] = 1
+                                        counters["fresh_clean_carry_reclass_pass"] += 1
+                                        _log(
+                                            "PGG2-V287-FRESH-CLEAN-CARRY-RECLASS-PASS "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                            f"pre_entry_buy_sol={int(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                            f"age_ms={_now_ms()-int(cand.get('start_ms') or _now_ms())} "
+                                            f"reason={fresh_clean_reason} source=negative_roundtrip_authority"
+                                        )
                                     if (
                                         os.environ.get(
                                             "V287_ALLOW_NEGATIVE_SELF_ROUNDTRIP_CONTINUATION",
@@ -3356,7 +3852,104 @@ def main() -> int:
                                             f"last_rearm_lag_ms={last_rearm_lag_ms} "
                                             "source=final_projection_negative"
                                         )
+                                if not continuation_reason and pre_projection_selected_ok:
+                                    continuation_reason = pre_projection_selected_reason
+                                    continuation_model_ok = True
+                                    counters[
+                                        "selected_reason_restored_for_final_refresh"
+                                    ] += 1
+                                    _log(
+                                        "PGG2-V287-SELECTED-REASON-RESTORED-FOR-FINAL-REFRESH "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"reason={continuation_reason} "
+                                        f"top_lane={str(cand.get('top_lane') or '')} "
+                                        f"current_buy_sol={float(cand.get('current_buy_sol') or 0.0):.6f} "
+                                        f"prev_buy_sol={float(cand.get('prev_buy_sol') or 0.0):.6f} "
+                                        f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                        f"pre_entry_buy_sol={int(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                        f"first_rearm_delay_ms={fp_first_rearm_delay_ms} "
+                                        f"last_rearm_delay_ms={fp_last_rearm_delay_ms} "
+                                        f"last_rearm_lag_ms={fp_last_rearm_lag_ms} "
+                                        "source=positive_or_floor_passing_projection"
+                                    )
+                                if (
+                                    str(cand.get("top_lane") or "")
+                                    == "high_current_clean_train"
+                                    and os.environ.get(
+                                        "V287_ALLOW_HIGH_CURRENT_CLEAN_TRAIN_LIVE_RISK",
+                                        "0",
+                                    )
+                                    != "1"
+                                ):
+                                    counters["high_current_train_actual_block"] += 1
+                                    _log(
+                                        "PGG2-V287-HIGH-CURRENT-TRAIN-ACTUAL-BLOCK "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"reason={continuation_reason or pre_projection_selected_reason} "
+                                        "source=7TSY_live_loss_replay"
+                                    )
+                                    active.pop(mint, None)
+                                    hist[mint].append(rec)
+                                    continue
                                 base_min_quote_tokens = float(args.min_buy_quote_tokens)
+                                if (
+                                    os.environ.get(
+                                        "V287_SELECTED_FRESH_ACTUAL_ENABLED",
+                                        "0",
+                                    )
+                                    != "1"
+                                    and not _v287_selected_fresh_actual_enabled(
+                                        continuation_reason
+                                        or pre_projection_selected_reason
+                                    )
+                                    and str(cand.get("top_lane") or "")
+                                    == "fresh_impulse"
+                                    and float(cand.get("prev_buy_sol") or 0.0)
+                                    <= 1e-12
+                                    and not bool(cand.get("fresh_clean_carry_reclass"))
+                                ):
+                                    fresh_clean_ready, fresh_clean_reason = (
+                                        _v287_fresh_clean_carry_reclass_ready(cand, _now_ms())
+                                    )
+                                    if fresh_clean_ready:
+                                        continuation_reason = "selected_fresh_clean_carry_reclass"
+                                        cand["fresh_clean_carry_reclass"] = 1
+                                        counters["fresh_clean_carry_reclass_pass"] += 1
+                                        _log(
+                                            "PGG2-V287-FRESH-CLEAN-CARRY-RECLASS-PASS "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                            f"pre_entry_buy_sol={int(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                            f"age_ms={_now_ms()-int(cand.get('start_ms') or _now_ms())} "
+                                            f"reason={fresh_clean_reason} source=fresh_shadow_authority"
+                                        )
+                                    elif _v287_fresh_actual_should_wait(cand, _now_ms()):
+                                        counters["fresh_clean_carry_watch_keep"] += 1
+                                        _log(
+                                            "PGG2-V287-FRESH-CLEAN-CARRY-WATCH-KEEP "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"current_buy_sol={float(cand.get('current_buy_sol') or 0.0):.6f} "
+                                            f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                            f"pre_entry_buy_sol={int(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                            f"blocker={fresh_clean_reason} source=fast_final_curve"
+                                        )
+                                        hist[mint].append(rec)
+                                        continue
+                                    else:
+                                        counters[
+                                            "selected_fresh_actual_shadow_only_block"
+                                        ] += 1
+                                        _log(
+                                            "PGG2-V287-SELECTED-FRESH-ACTUAL-BLOCK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"current_buy_sol={float(cand.get('current_buy_sol') or 0.0):.6f} "
+                                            f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                            f"pre_entry_buy_sol={int(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                            f"reason=fresh_no_prior_shadow_only blocker={fresh_clean_reason} source=fast_final_curve"
+                                        )
+                                        active.pop(mint, None)
+                                        hist[mint].append(rec)
+                                        continue
                                 min_quote_tokens = _v287_reason_min_quote_tokens(
                                     continuation_reason,
                                     base_min_quote_tokens,
@@ -3409,6 +4002,24 @@ def main() -> int:
                                             f"amount_out_tokens={quote_tokens:.6f} min_tokens={min_quote_tokens:.6f} "
                                             "source=fast_final_curve"
                                         )
+                                        active.pop(mint, None)
+                                        continue
+
+                                max_quote_tokens = _v287_reason_max_quote_tokens(
+                                    continuation_reason
+                                )
+                                if max_quote_tokens > 0:
+                                    cap_pass = quote_tokens <= max_quote_tokens
+                                    _log(
+                                        "PGG2-V287-FINAL-BUY-QUOTE-TOKEN-CAP-CHECK "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"reason={continuation_reason} "
+                                        f"amount_out_tokens={quote_tokens:.6f} "
+                                        f"max_tokens={max_quote_tokens:.6f} "
+                                        f"pass={int(cap_pass)} source=fast_final_curve"
+                                    )
+                                    if not cap_pass:
+                                        counters["buy_quote_token_cap_block"] += 1
                                         active.pop(mint, None)
                                         continue
 
@@ -3531,6 +4142,23 @@ def main() -> int:
                                         )
                                         active.pop(mint, None)
                                         continue
+                                    max_quote_tokens = _v287_reason_max_quote_tokens(
+                                        continuation_reason
+                                    )
+                                    if max_quote_tokens > 0:
+                                        cap_pass = quote_tokens <= max_quote_tokens
+                                        _log(
+                                            "PGG2-V287-FINAL-BUY-QUOTE-TOKEN-CAP-CHECK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason} "
+                                            f"amount_out_tokens={quote_tokens:.6f} "
+                                            f"max_tokens={max_quote_tokens:.6f} "
+                                            f"pass={int(cap_pass)} source=fast_final_curve_refresh"
+                                        )
+                                        if not cap_pass:
+                                            counters["buy_quote_token_cap_refresh_block"] += 1
+                                            active.pop(mint, None)
+                                            continue
                                     min_tokens_ui = quote_tokens * max(
                                         0.0,
                                         1.0 - (float(args.buy_slippage_pct) / 100.0),
@@ -3736,9 +4364,44 @@ def main() -> int:
                                         < min_abs_refresh_drift_pct
                                     ):
                                         allow_no_movement_followthrough_send = (
-                                            continuation_reason
-                                            == "selected_single_prior_no_movement_followthrough"
-                                            and final_refresh_drift_pct >= 0.0
+                                            (
+                                                continuation_reason
+                                                == "selected_single_prior_no_movement_followthrough"
+                                                or (
+                                                    continuation_reason
+                                                    == "selected_single_prior_strong_rearm"
+                                                    and str(cand.get("top_lane") or "")
+                                                    == "single_prior_buy_continuation"
+                                                    and os.environ.get(
+                                                        "V287_SELECTED_SINGLE_PRIOR_ALLOW_FLAT_REFRESH",
+                                                        "1",
+                                                    )
+                                                    != "0"
+                                                )
+                                                or (
+                                                    continuation_reason
+                                                    == "selected_high_current_clean_train"
+                                                    and str(cand.get("top_lane") or "")
+                                                    == "high_current_clean_train"
+                                                    and os.environ.get(
+                                                        "V287_HIGH_CURRENT_TRAIN_ALLOW_FLAT_REFRESH",
+                                                        "1",
+                                                    )
+                                                    != "0"
+                                                )
+                                                or (
+                                                    continuation_reason
+                                                    == "selected_seed_prior_carry_rearm"
+                                                    and str(cand.get("top_lane") or "")
+                                                    == "seed_prior_carry_continuation"
+                                                    and os.environ.get(
+                                                        "V287_SELECTED_SEED_PRIOR_ALLOW_FLAT_REFRESH",
+                                                        "1",
+                                                    )
+                                                    != "0"
+                                                )
+                                            )
+                                            and final_refresh_drift_pct >= -1e-9
                                         )
                                         if allow_no_movement_followthrough_send:
                                             counters[
@@ -3819,6 +4482,25 @@ def main() -> int:
                                             )
                                             active.pop(mint, None)
                                             continue
+                                if not _v287_buy_quote_headroom_ok(
+                                    mint=mint,
+                                    reason=continuation_reason,
+                                    quote_tokens=float(quote_tokens),
+                                    min_quote_tokens=float(min_quote_tokens),
+                                    source="fast_final_send_authority",
+                                ):
+                                    counters["buy_quote_headroom_block"] += 1
+                                    active.pop(mint, None)
+                                    hist[mint].append(rec)
+                                    continue
+                                min_tokens_ui = _v287_buy_min_guard_tokens(
+                                    mint=mint,
+                                    reason=continuation_reason,
+                                    quote_tokens=float(quote_tokens),
+                                    min_quote_tokens=float(min_quote_tokens),
+                                    buy_slippage_pct=float(args.buy_slippage_pct),
+                                    source="fast_final_send_authority",
+                                )
                                 if (
                                     not plan_ready
                                     and os.environ.get(
@@ -3840,21 +4522,60 @@ def main() -> int:
                                 if plan_ready and hasattr(
                                     broker, "build_fast_signed_buy_with_min_tokens_from_curve_snapshot"
                                 ):
-                                    buy_quote = broker.build_fast_signed_buy_with_min_tokens_from_curve_snapshot(
-                                        mint,
-                                        float(args.size_sol),
-                                        min_tokens_ui,
-                                        virtual_token_reserves=int(curve.virtual_token_reserves),
-                                        virtual_sol_reserves=int(curve.virtual_sol_reserves),
-                                        real_token_reserves=int(curve.real_token_reserves),
-                                        real_sol_reserves=int(curve.real_sol_reserves),
-                                        token_total_supply=int(curve.token_total_supply),
-                                        complete=bool(curve.complete),
-                                        creator="",
-                                        is_mayhem=bool(getattr(curve, "is_mayhem", False)),
-                                        cashback_enabled=bool(getattr(curve, "cashback_enabled", False)),
-                                        snapshot_ts_ms=curve_ts_ms,
-                                    )
+                                    def _fast_buy_quote_from_current_curve() -> dict[str, Any]:
+                                        return broker.build_fast_signed_buy_with_min_tokens_from_curve_snapshot(
+                                            mint,
+                                            float(args.size_sol),
+                                            min_tokens_ui,
+                                            virtual_token_reserves=int(curve.virtual_token_reserves),
+                                            virtual_sol_reserves=int(curve.virtual_sol_reserves),
+                                            real_token_reserves=int(curve.real_token_reserves),
+                                            real_sol_reserves=int(curve.real_sol_reserves),
+                                            token_total_supply=int(curve.token_total_supply),
+                                            complete=bool(curve.complete),
+                                            creator="",
+                                            is_mayhem=bool(getattr(curve, "is_mayhem", False)),
+                                            cashback_enabled=bool(getattr(curve, "cashback_enabled", False)),
+                                            snapshot_ts_ms=curve_ts_ms,
+                                        )
+
+                                    try:
+                                        buy_quote = _fast_buy_quote_from_current_curve()
+                                    except RuntimeError as exc:
+                                        stale_plan_err = str(exc)
+                                        if stale_plan_err not in (
+                                            "v165_precompiled_creator_missing",
+                                            "v165_precompiled_creator_mismatch",
+                                            "v165_precompiled_buy_plan_missing",
+                                        ):
+                                            raise
+                                        counters["fast_static_plan_stale_rebuild"] += 1
+                                        _log(
+                                            "PGG2-V287-FAST-STATIC-PLAN-STALE-REBUILD "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"err={stale_plan_err} source=latest_feed_rec"
+                                        )
+                                        _drop_static_buy_plan_for_mint_size(
+                                            broker,
+                                            mint,
+                                            float(args.size_sol),
+                                            stale_plan_err,
+                                        )
+                                        if not _prepare_static_buy_plan_from_feed_rec(
+                                            broker,
+                                            rec,
+                                            float(args.size_sol),
+                                        ):
+                                            counters["fast_static_plan_rebuild_block"] += 1
+                                            _log(
+                                                "PGG2-V287-FAST-STATIC-PLAN-REBUILD-BLOCK "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"err={stale_plan_err} "
+                                                "reason=latest_feed_rec_could_not_rebuild"
+                                            )
+                                            active.pop(mint, None)
+                                            continue
+                                        buy_quote = _fast_buy_quote_from_current_curve()
                                 else:
                                     buy_quote = broker.build_buy_with_min_tokens_from_curve_snapshot(
                                         mint,
@@ -3866,7 +4587,7 @@ def main() -> int:
                                         real_sol_reserves=int(curve.real_sol_reserves),
                                         token_total_supply=int(curve.token_total_supply),
                                         complete=bool(curve.complete),
-                                        creator=str(curve.creator),
+                                        creator=str(getattr(curve, "creator", "")),
                                         is_mayhem=bool(getattr(curve, "is_mayhem", False)),
                                         cashback_enabled=bool(getattr(curve, "cashback_enabled", False)),
                                         snapshot_ts_ms=curve_ts_ms,
@@ -3916,8 +4637,11 @@ def main() -> int:
                                     continue
                                 if buy_quote.get("route") != "pump_bc":
                                     raise RuntimeError(f"route_not_pump_bc_fast:{buy_quote.get('route')}")
-                                if not _validate_buy_creator_vault_from_creator(
-                                    mint, str(buy_quote["txn"]), curve.creator
+                                if not _validate_buy_creator_vault_for_curve(
+                                    broker,
+                                    mint,
+                                    str(buy_quote["txn"]),
+                                    getattr(curve, "creator", ""),
                                 ):
                                     counters["creator_vault_block"] += 1
                                     _log(
@@ -3987,6 +4711,63 @@ def main() -> int:
                                 raise RuntimeError(f"route_not_pump_bc:{buy_quote.get('route')}")
                             quote_tokens = _rate_float(buy_quote, "amountOut")
                             base_min_quote_tokens = float(args.min_buy_quote_tokens)
+                            if (
+                                os.environ.get(
+                                    "V287_SELECTED_FRESH_ACTUAL_ENABLED",
+                                    "0",
+                                )
+                                != "1"
+                                and not _v287_selected_fresh_actual_enabled(
+                                    continuation_reason
+                                )
+                                and str(cand.get("top_lane") or "")
+                                == "fresh_impulse"
+                                and float(cand.get("prev_buy_sol") or 0.0)
+                                <= 1e-12
+                                and not bool(cand.get("fresh_clean_carry_reclass"))
+                            ):
+                                fresh_clean_ready, fresh_clean_reason = (
+                                    _v287_fresh_clean_carry_reclass_ready(cand, _now_ms())
+                                )
+                                if fresh_clean_ready:
+                                    continuation_reason = "selected_fresh_clean_carry_reclass"
+                                    cand["fresh_clean_carry_reclass"] = 1
+                                    counters["fresh_clean_carry_reclass_pass"] += 1
+                                    _log(
+                                        "PGG2-V287-FRESH-CLEAN-CARRY-RECLASS-PASS "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                        f"pre_entry_buy_sol={int(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                        f"age_ms={_now_ms()-int(cand.get('start_ms') or _now_ms())} "
+                                        f"reason={fresh_clean_reason} source=fallback_buy_path"
+                                    )
+                                elif _v287_fresh_actual_should_wait(cand, _now_ms()):
+                                    counters["fresh_clean_carry_watch_keep"] += 1
+                                    _log(
+                                        "PGG2-V287-FRESH-CLEAN-CARRY-WATCH-KEEP "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"current_buy_sol={float(cand.get('current_buy_sol') or 0.0):.6f} "
+                                        f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                        f"pre_entry_buy_sol={int(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                        f"blocker={fresh_clean_reason} source=fallback_buy_path"
+                                    )
+                                    hist[mint].append(rec)
+                                    continue
+                                else:
+                                    counters[
+                                        "selected_fresh_actual_shadow_only_block"
+                                    ] += 1
+                                    _log(
+                                        "PGG2-V287-SELECTED-FRESH-ACTUAL-BLOCK "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"current_buy_sol={float(cand.get('current_buy_sol') or 0.0):.6f} "
+                                        f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                        f"pre_entry_buy_sol={int(cand.get('pre_entry_buy_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
+                                        f"reason=fresh_no_prior_shadow_only blocker={fresh_clean_reason} source=fallback_buy_path"
+                                    )
+                                    active.pop(mint, None)
+                                    hist[mint].append(rec)
+                                    continue
                             min_quote_tokens = _v287_reason_min_quote_tokens(
                                 continuation_reason,
                                 base_min_quote_tokens,
@@ -4015,6 +4796,23 @@ def main() -> int:
                                 )
                                 active.pop(mint, None)
                                 continue
+                            max_quote_tokens = _v287_reason_max_quote_tokens(
+                                continuation_reason
+                            )
+                            if max_quote_tokens > 0:
+                                cap_pass = quote_tokens <= max_quote_tokens
+                                _log(
+                                    "PGG2-V287-FINAL-BUY-QUOTE-TOKEN-CAP-CHECK "
+                                    f"mint={_short(mint)} full_mint={mint} "
+                                    f"reason={continuation_reason} "
+                                    f"amount_out_tokens={quote_tokens:.6f} "
+                                    f"max_tokens={max_quote_tokens:.6f} "
+                                    f"pass={int(cap_pass)} source=fallback_buy_path"
+                                )
+                                if not cap_pass:
+                                    counters["buy_quote_token_cap_block"] += 1
+                                    active.pop(mint, None)
+                                    continue
                             if not _validate_buy_creator_vault(broker, mint, str(buy_quote["txn"])):
                                 counters["creator_vault_retry"] += 1
                                 _log(
@@ -4041,6 +4839,23 @@ def main() -> int:
                                     )
                                     active.pop(mint, None)
                                     continue
+                                max_quote_tokens = _v287_reason_max_quote_tokens(
+                                    continuation_reason
+                                )
+                                if max_quote_tokens > 0:
+                                    cap_pass = quote_tokens <= max_quote_tokens
+                                    _log(
+                                        "PGG2-V287-FINAL-BUY-QUOTE-TOKEN-CAP-CHECK "
+                                        f"mint={_short(mint)} full_mint={mint} "
+                                        f"reason={continuation_reason} "
+                                        f"amount_out_tokens={quote_tokens:.6f} "
+                                        f"max_tokens={max_quote_tokens:.6f} "
+                                        f"pass={int(cap_pass)} source=fallback_buy_rebuild"
+                                    )
+                                    if not cap_pass:
+                                        counters["buy_quote_token_cap_rebuild_block"] += 1
+                                        active.pop(mint, None)
+                                        continue
                                 if not _validate_buy_creator_vault(broker, mint, str(buy_quote["txn"])):
                                     counters["creator_vault_block"] += 1
                                     _log(
@@ -4127,6 +4942,23 @@ def main() -> int:
                                             )
                                             active.pop(mint, None)
                                             continue
+                                    max_quote_tokens = _v287_reason_max_quote_tokens(
+                                        continuation_reason
+                                    )
+                                    if max_quote_tokens > 0:
+                                        cap_pass = boundary_tokens <= max_quote_tokens
+                                        _log(
+                                            "PGG2-V287-FINAL-BUY-QUOTE-TOKEN-CAP-CHECK "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason} "
+                                            f"amount_out_tokens={boundary_tokens:.6f} "
+                                            f"max_tokens={max_quote_tokens:.6f} "
+                                            f"pass={int(cap_pass)} source=send_boundary_requote"
+                                        )
+                                        if not cap_pass:
+                                            counters["buy_quote_token_cap_boundary_block"] += 1
+                                            active.pop(mint, None)
+                                            continue
                                     if not _prebuy_postbuy_sell_projection_pass(
                                         broker, mint, boundary_quote, wallet_before_buy, args
                                     ):
@@ -4148,6 +4980,17 @@ def main() -> int:
                                     )
                                     active.pop(mint, None)
                                     continue
+                            if not _v287_buy_quote_headroom_ok(
+                                mint=mint,
+                                reason=continuation_reason,
+                                quote_tokens=float(quote_tokens),
+                                min_quote_tokens=float(min_quote_tokens),
+                                source="fallback_send_authority",
+                            ):
+                                counters["buy_quote_headroom_block"] += 1
+                                active.pop(mint, None)
+                                hist[mint].append(rec)
+                                continue
                             signed_b64, sig_preview = broker.sign_transaction(str(buy_quote["txn"]))
                             _log(
                                 "PGG2-V287-BUY-SEND "
@@ -4258,12 +5101,193 @@ def main() -> int:
                 or current_ok_single_prior
                 or current_ok_two_prior
             ):
+                seed_prior_carry_ok = (
+                    os.environ.get("V287_ENABLE_SEED_PRIOR_CARRY_LANE", "1")
+                    != "0"
+                    and mint not in active
+                    and len(active) < int(args.max_active_candidates)
+                    and len(prev_buys) == 0
+                    and len(prev_sells) == 0
+                    and float(os.environ.get("V287_SEED_PRIOR_CARRY_CURRENT_MIN_SOL", "2.00"))
+                    <= current_buy_sol
+                    <= float(os.environ.get("V287_SEED_PRIOR_CARRY_CURRENT_MAX_SOL", "2.80"))
+                    and top_share >= 0.999
+                )
+                if seed_prior_carry_ok:
+                    top_lane = "seed_prior_carry_continuation"
+                    rearm_min_lamports = int(
+                        float(os.environ.get("V287_SEED_PRIOR_CARRY_REARM_MIN_SOL", "2.00"))
+                        * LAMPORTS_PER_SOL
+                    )
+                    rearm_max_lamports = int(
+                        float(os.environ.get("V287_SEED_PRIOR_CARRY_REARM_MAX_SOL", "6.50"))
+                        * LAMPORTS_PER_SOL
+                    )
+                    candidate_pair_ok = _remember_pair_from_feed_rec(broker, rec)
+                    active[mint] = {
+                        "mint": mint,
+                        "start_ms": now,
+                        "candidate_sig": sig,
+                        "candidate_pair_ok": candidate_pair_ok,
+                        "current_buy_sol": current_buy_sol,
+                        "prev_buy_sol": prev_buy_sol,
+                        "prev_buys": len(prev_buys),
+                        "top_share": top_share,
+                        "top_lane": top_lane,
+                        "rearm_min_lamports": rearm_min_lamports,
+                        "rearm_max_lamports": rearm_max_lamports,
+                        "candidate_ttl_ms": int(
+                            os.environ.get("V287_SEED_PRIOR_CARRY_TTL_MS", "1350")
+                        ),
+                        "pre_entry_buys": 0,
+                        "pre_entry_buy_lamports": 0,
+                    }
+                    active[mint]["prewarm_future"] = (
+                        None
+                        if candidate_pair_ok
+                        else prewarm_pool.submit(_prewarm_pair_from_sigs, broker, mint, [sig])
+                    )
+                    active[mint]["static_plan_future"] = prewarm_pool.submit(
+                        _prepare_static_buy_plan_from_feed_rec,
+                        broker,
+                        dict(rec),
+                        float(args.size_sol),
+                    )
+                    counters["seed_prior_carry_candidate_start"] += 1
+                    counters["candidate_start"] += 1
+                    _shadow_start(
+                        shadows,
+                        counters,
+                        reason="seed_prior_carry_candidate_watch",
+                        rec=rec,
+                        now_ms=now,
+                        ttl_ms=int(args.shadow_miss_ms),
+                        max_open=int(args.shadow_miss_max),
+                        current_buy_sol=current_buy_sol,
+                        prev_buys=len(prev_buys),
+                        prev_buy_sol=prev_buy_sol,
+                        prev_sells=len(prev_sells),
+                        top_share=top_share,
+                        top_lane=top_lane,
+                        rearm_min_sol=rearm_min_lamports / LAMPORTS_PER_SOL,
+                    )
+                    _log(
+                        "PGG2-V287-SEED-PRIOR-CARRY-CANDIDATE "
+                        f"mint={_short(mint)} full_mint={mint} "
+                        f"current_buy_sol={current_buy_sol:.6f} "
+                        f"prev_buys_1s={len(prev_buys)} prev_buy_sol_1s={prev_buy_sol:.6f} "
+                        f"prev_sells_1s={len(prev_sells)} top_share_1s={top_share:.4f} "
+                        f"rearm_min_sol={rearm_min_lamports/LAMPORTS_PER_SOL:.6f} "
+                        f"rearm_max_sol={rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
+                        f"ttl_ms={_candidate_live_ttl_ms(active[mint])} "
+                        "source=current_band_seed_prior_blindness_repair"
+                    )
+                    continue
+                high_current_train_ok = (
+                    os.environ.get("V287_ENABLE_HIGH_CURRENT_CLEAN_TRAIN_LANE", "1")
+                    != "0"
+                    and mint not in active
+                    and len(active) < int(args.max_active_candidates)
+                    and len(prev_sells) == 0
+                    and float(os.environ.get("V287_HIGH_CURRENT_TRAIN_CURRENT_MIN_SOL", "3.30"))
+                    <= current_buy_sol
+                    <= float(os.environ.get("V287_HIGH_CURRENT_TRAIN_CURRENT_MAX_SOL", "6.00"))
+                    and prev_buy_sol
+                    <= float(os.environ.get("V287_HIGH_CURRENT_TRAIN_PREV_MAX_SOL", "4.50"))
+                    and top_share
+                    >= float(os.environ.get("V287_HIGH_CURRENT_TRAIN_TOP_MIN", "0.95"))
+                )
+                if high_current_train_ok:
+                    top_lane = "high_current_clean_train"
+                    rearm_min_lamports = int(
+                        float(os.environ.get("V287_HIGH_CURRENT_TRAIN_REARM_MIN_SOL", "3.00"))
+                        * LAMPORTS_PER_SOL
+                    )
+                    rearm_max_lamports = int(
+                        float(os.environ.get("V287_HIGH_CURRENT_TRAIN_REARM_MAX_SOL", "12.00"))
+                        * LAMPORTS_PER_SOL
+                    )
+                    candidate_pair_ok = _remember_pair_from_feed_rec(broker, rec)
+                    active[mint] = {
+                        "mint": mint,
+                        "start_ms": now,
+                        "candidate_sig": sig,
+                        "candidate_pair_ok": candidate_pair_ok,
+                        "current_buy_sol": current_buy_sol,
+                        "prev_buy_sol": prev_buy_sol,
+                        "prev_buys": len(prev_buys),
+                        "top_share": top_share,
+                        "top_lane": top_lane,
+                        "rearm_min_lamports": rearm_min_lamports,
+                        "rearm_max_lamports": rearm_max_lamports,
+                        "candidate_ttl_ms": int(
+                            os.environ.get("V287_HIGH_CURRENT_TRAIN_TTL_MS", "1000")
+                        ),
+                        "pre_entry_buys": 0,
+                        "pre_entry_buy_lamports": 0,
+                    }
+                    active[mint]["prewarm_future"] = (
+                        None
+                        if candidate_pair_ok
+                        else prewarm_pool.submit(_prewarm_pair_from_sigs, broker, mint, [sig])
+                    )
+                    active[mint]["static_plan_future"] = prewarm_pool.submit(
+                        _prepare_static_buy_plan_from_feed_rec,
+                        broker,
+                        dict(rec),
+                        float(args.size_sol),
+                    )
+                    counters["high_current_train_candidate_start"] += 1
+                    counters["candidate_start"] += 1
+                    _shadow_start(
+                        shadows,
+                        counters,
+                        reason="high_current_train_candidate_watch",
+                        rec=rec,
+                        now_ms=now,
+                        ttl_ms=int(args.shadow_miss_ms),
+                        max_open=int(args.shadow_miss_max),
+                        current_buy_sol=current_buy_sol,
+                        prev_buys=len(prev_buys),
+                        prev_buy_sol=prev_buy_sol,
+                        prev_sells=len(prev_sells),
+                        top_share=top_share,
+                        top_lane=top_lane,
+                        rearm_min_sol=rearm_min_lamports / LAMPORTS_PER_SOL,
+                    )
+                    _log(
+                        "PGG2-V287-HIGH-CURRENT-TRAIN-CANDIDATE "
+                        f"mint={_short(mint)} full_mint={mint} "
+                        f"current_buy_sol={current_buy_sol:.6f} "
+                        f"prev_buys_1s={len(prev_buys)} prev_buy_sol_1s={prev_buy_sol:.6f} "
+                        f"prev_sells_1s={len(prev_sells)} top_share_1s={top_share:.4f} "
+                        f"rearm_min_sol={rearm_min_lamports/LAMPORTS_PER_SOL:.6f} "
+                        f"rearm_max_sol={rearm_max_lamports/LAMPORTS_PER_SOL:.6f} "
+                        "source=current_band_shadow_miss_repair"
+                    )
+                    continue
                 counters["block_current_band"] += 1
+                if os.environ.get("V287_SHADOW_CURRENT_BAND_REJECTS", "1") != "0":
+                    _shadow_start(
+                        shadows,
+                        counters,
+                        reason="current_band",
+                        rec=rec,
+                        now_ms=now,
+                        ttl_ms=int(args.shadow_miss_ms),
+                        max_open=int(args.shadow_miss_max),
+                        current_buy_sol=current_buy_sol,
+                        prev_buys=len(prev_buys),
+                        prev_buy_sol=prev_buy_sol,
+                        prev_sells=len(prev_sells),
+                        top_share=top_share,
+                    )
                 continue
             if len(prev_buys) < 3:
                 single_prior_ok = (
                     bool(args.enable_single_prior_buy_lane)
-                    and not active
+                    and mint not in active
+                    and len(active) < int(args.max_active_candidates)
                     and len(prev_buys) == 1
                     and len(prev_sells) == 0
                     and float(args.single_prior_current_min_sol)
@@ -4334,7 +5358,8 @@ def main() -> int:
                     continue
                 two_prior_ok = (
                     bool(args.enable_two_prior_buy_lane)
-                    and not active
+                    and mint not in active
+                    and len(active) < int(args.max_active_candidates)
                     and len(prev_buys) == 2
                     and len(prev_sells) == 0
                     and float(args.two_prior_current_min_sol)
@@ -4408,7 +5433,8 @@ def main() -> int:
                 dust_prior_ok = (
                     os.environ.get("V287_ENABLE_DUST_PRIOR_CONTINUATION_LANE", "1")
                     != "0"
-                    and not active
+                    and mint not in active
+                    and len(active) < int(args.max_active_candidates)
                     and len(prev_buys) == 1
                     and len(prev_sells) == 0
                     and float(os.environ.get("V287_DUST_PRIOR_CURRENT_MIN_SOL", "2.00"))
@@ -4491,7 +5517,8 @@ def main() -> int:
                     continue
                 fresh_impulse_ok = (
                     bool(args.enable_fresh_impulse_lane)
-                    and not active
+                    and mint not in active
+                    and len(active) < int(args.max_active_candidates)
                     and len(prev_sells) == 0
                     and current_ok_main
                     and current_buy_sol >= float(args.fresh_impulse_current_min_sol)
@@ -4716,12 +5743,12 @@ def main() -> int:
                 top_lane = "normal_top"
                 rearm_min_lamports = int(float(args.rearm_min_sol) * LAMPORTS_PER_SOL)
                 rearm_max_lamports = int(float(args.rearm_max_sol) * LAMPORTS_PER_SOL)
-            if active:
+            if mint in active or len(active) >= int(args.max_active_candidates):
                 counters["block_active_exists"] += 1
                 _shadow_start(
                     shadows,
                     counters,
-                    reason="active_exists",
+                    reason="active_exists" if mint in active else "active_capacity",
                     rec=rec,
                     now_ms=now,
                     ttl_ms=int(args.shadow_miss_ms),

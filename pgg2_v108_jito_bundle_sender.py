@@ -138,13 +138,25 @@ def _get_conn(url: str) -> tuple[http.client.HTTPSConnection, str]:
 def _rpc_persistent(url: str, method: str, params: list[Any], timeout: float = 1.5) -> Any:
     payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, separators=(",", ":")).encode("utf-8")
     last_exc: Exception | None = None
-    for attempt in range(2):
+    max_attempts = 1 if method == "sendBundle" and os.environ.get("PGG2_BUNDLE_SEND_NO_RETRY", "1").strip().lower() in {"1", "true", "yes", "on"} else 2
+    for attempt in range(max_attempts):
         conn, path = _get_conn(url)
+        started = time.perf_counter()
+        request_done: float | None = None
         try:
             conn.timeout = timeout
             conn.request("POST", path, body=payload, headers={"Content-Type": "application/json"})
+            request_done = time.perf_counter()
             resp = conn.getresponse()
             body = resp.read().decode("utf-8", errors="replace")
+            done = time.perf_counter()
+            if method == "sendBundle":
+                _log(
+                    f"PGG2-V108-JITO-POST-TIMING region={_region(url)} "
+                    f"request_ms={int((request_done - started) * 1000)} "
+                    f"response_ms={int((done - request_done) * 1000)} "
+                    f"total_ms={int((done - started) * 1000)} http_status={resp.status}"
+                )
             if resp.status >= 400:
                 raise RuntimeError(f"{method}_http_{resp.status}:{_redact_text(body[:800])}")
             parsed = json.loads(body)
@@ -152,6 +164,19 @@ def _rpc_persistent(url: str, method: str, params: list[Any], timeout: float = 1
                 raise RuntimeError(f"{method}_error:{_redact_text(str(parsed['error']))}")
             return parsed.get("result")
         except Exception as exc:
+            if method == "sendBundle":
+                now = time.perf_counter()
+                request_ms = (
+                    int((request_done - started) * 1000)
+                    if request_done is not None
+                    else -1
+                )
+                _log(
+                    f"PGG2-V108-JITO-POST-TIMING-ERR region={_region(url)} "
+                    f"request_ms={request_ms} "
+                    f"total_ms={int((now - started) * 1000)} "
+                    f"err={_redact_text(type(exc).__name__ + ':' + str(exc))[:220]}"
+                )
             last_exc = exc
             parsed = urllib.parse.urlparse(url)
             key = (parsed.hostname or "", parsed.port or 443)
@@ -162,7 +187,7 @@ def _rpc_persistent(url: str, method: str, params: list[Any], timeout: float = 1
                     old.close()
             except Exception:
                 pass
-            if attempt == 0:
+            if attempt < max_attempts - 1:
                 continue
     raise RuntimeError(_redact_text(str(last_exc or "rpc_persistent_failed")))
 
@@ -269,10 +294,11 @@ def send_bundle(txs_b64: Iterable[str], *, dry_run: bool = True) -> dict[str, An
         raise RuntimeError("empty_bundle")
     if len(txs) > 5:
         raise RuntimeError("bundle_too_large")
-    _log(
-        f"PGG2-V108-JITO-BUNDLE-SEND dry_run={int(dry_run)} tx_count={len(txs)} "
-        f"endpoints={','.join(_region(u) for u in urls)}"
-    )
+    if os.environ.get("PGG2_BUNDLE_PRESEND_LOG", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        _log(
+            f"PGG2-V108-JITO-BUNDLE-SEND dry_run={int(dry_run)} tx_count={len(txs)} "
+            f"endpoints={','.join(_region(u) for u in urls)}"
+        )
     if dry_run:
         _log("PGG2-V108-JITO-BUNDLE-NOT-LANDED dry_run=1 reason=no_send_validation")
         return {"dry_run": True, "bundle_id": "", "tx_count": len(txs)}
@@ -289,9 +315,14 @@ def send_bundle(txs_b64: Iterable[str], *, dry_run: bool = True) -> dict[str, An
 
     workers = min(len(urls), int(os.environ.get("PGG2_BUNDLE_RACE_WORKERS", "5") or 5))
     errors: list[dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers))
+    futs: list[concurrent.futures.Future[dict[str, Any]]] = []
+    try:
         futs = [ex.submit(send_one, url) for url in urls]
-        for fut in concurrent.futures.as_completed(futs, timeout=float(os.environ.get("PGG2_BUNDLE_RACE_TIMEOUT_SEC", "2.0") or 2.0)):
+        for fut in concurrent.futures.as_completed(
+            futs,
+            timeout=float(os.environ.get("PGG2_BUNDLE_RACE_TIMEOUT_SEC", "2.0") or 2.0),
+        ):
             res = fut.result()
             if res.get("ok"):
                 _log(f"PGG2-V108-JITO-BUNDLE-SEND-RESULT region={res['region']} ms={res['ms']} status=submitted")
@@ -299,6 +330,18 @@ def send_bundle(txs_b64: Iterable[str], *, dry_run: bool = True) -> dict[str, An
                 return {"dry_run": False, "bundle_id": res["bundle_id"], "tx_count": len(txs), "endpoint": res["url"], "region": res["region"], "send_ms": res["ms"]}
             errors.append(res)
             _log(f"PGG2-V108-JITO-BUNDLE-SEND-ERR region={res['region']} ms={res['ms']} err={str(res.get('error'))[:240]}")
+            if (
+                os.environ.get("PGG2_BUNDLE_FAIL_FAST_ALREADY_PROCESSED", "1").strip().lower()
+                in {"1", "true", "yes", "on"}
+                and "already processed transaction" in str(res.get("error", "")).lower()
+            ):
+                for pending in futs:
+                    if pending is not fut:
+                        pending.cancel()
+                summary = f"{res.get('region')}:{res.get('ms')}ms:{str(res.get('error'))[:160]}"
+                raise RuntimeError(f"sendBundle_external_already_processed:{summary}")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     summary = ";".join(f"{e.get('region')}:{e.get('ms')}ms:{str(e.get('error'))[:160]}" for e in errors[:8])
     raise RuntimeError(f"sendBundle_all_endpoints_failed:{summary}")
 

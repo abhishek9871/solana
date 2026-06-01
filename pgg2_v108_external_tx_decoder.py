@@ -18,9 +18,25 @@ from solders.transaction import VersionedTransaction  # type: ignore
 
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+COMPUTE_BUDGET_PROGRAM = "ComputeBudget111111111111111111111111111111"
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+MEMO_PROGRAM = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+MEMO_PROGRAM_V2 = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo"
 DISC_BUY = bytes([102, 6, 61, 18, 1, 218, 235, 234])
 DISC_BUY_EXACT_SOL_IN = bytes([56, 252, 116, 8, 158, 223, 205, 95])
 DISC_SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])
+SETUP_PROGRAMS = {
+    COMPUTE_BUDGET_PROGRAM,
+    SYSTEM_PROGRAM,
+    ASSOCIATED_TOKEN_PROGRAM,
+    TOKEN_PROGRAM,
+    TOKEN_2022_PROGRAM,
+    MEMO_PROGRAM,
+    MEMO_PROGRAM_V2,
+}
 
 
 def _log(line: str) -> None:
@@ -62,10 +78,18 @@ def decode_external_pump_buy(raw_tx_b64: str, *, expected_sig: str = "", source:
         raise ValueError(f"signature_mismatch expected={expected_sig} actual={signature}")
     fee_payer = str(keys[0]) if keys else ""
     found: Optional[ExternalPumpBuy] = None
+    seen_non_setup_before_pump: list[str] = []
     for ix in tx.message.instructions:
         program = _key(keys, int(ix.program_id_index))
         if program != PUMP_PROGRAM:
+            if program and program not in SETUP_PROGRAMS:
+                seen_non_setup_before_pump.append(program)
             continue
+        if seen_non_setup_before_pump:
+            raise ValueError(
+                "external_tx_has_pre_pump_program:"
+                + ",".join(seen_non_setup_before_pump[:3])
+            )
         data = bytes(ix.data)
         if len(data) < 24:
             continue

@@ -923,26 +923,27 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
         creator_pk = as_pubkey(creator) if creator else Pubkey.default()
         creator_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(creator_pk))
         user_volume = pda(PUMP_PROGRAM_ID, b"user_volume_accumulator", bytes(user))
-        global_cfg = self.pump_global()
-        placeholder_curve = PumpBondingCurve(
-            key=curve_key,
-            virtual_token_reserves=1,
-            virtual_sol_reserves=1,
-            real_token_reserves=1,
-            real_sol_reserves=0,
-            token_total_supply=0,
-            complete=False,
-            creator=creator_pk,
-            is_mayhem=False,
-            cashback_enabled=False,
-        )
-        fee_recipient = self.pump_fee_recipient(global_cfg, placeholder_curve)
         creator_vault_override = self._pump_creator_vault_override.get(str(mint), "")
         if creator_vault_override:
             creator_vault = as_pubkey(creator_vault_override)
         fee_recipient_override = self._pump_fee_recipient_override.get(str(mint), "")
         if fee_recipient_override:
             fee_recipient = as_pubkey(fee_recipient_override)
+        else:
+            global_cfg = self.pump_global()
+            placeholder_curve = PumpBondingCurve(
+                key=curve_key,
+                virtual_token_reserves=1,
+                virtual_sol_reserves=1,
+                real_token_reserves=1,
+                real_sol_reserves=0,
+                token_total_supply=0,
+                complete=False,
+                creator=creator_pk,
+                is_mayhem=False,
+                cashback_enabled=False,
+            )
+            fee_recipient = self.pump_fee_recipient(global_cfg, placeholder_curve)
         remaining_metas = tuple(self.pump_buy_remaining_metas(mint))
         pair_source = self._last_pair_source.get(str(mint), "unknown")
         pair_recipient = self._last_pair_recipient.get(str(mint), "")

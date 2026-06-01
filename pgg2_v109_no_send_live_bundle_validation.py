@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
@@ -70,21 +71,67 @@ def _load_env() -> None:
 def _rpc_url() -> str:
     api = os.environ.get("HELIUS_API_KEY", "")
     return (
-        os.environ.get("HELIUS_RPC_URL")
+        os.environ.get("V109_READ_RPC_URL")
+        or os.environ.get("PGG2_READ_RPC_URL")
+        or os.environ.get("HELIUS_RPC_URL")
         or (f"https://mainnet.helius-rpc.com/?api-key={api}" if api else "")
         or os.environ.get("SOLANA_RPC_URL", "")
         or "https://api.mainnet-beta.solana.com"
     )
 
 
+def _rpc_urls() -> list[str]:
+    out: list[str] = []
+
+    def add(url: str | None) -> None:
+        clean = str(url or "").strip()
+        if clean and clean not in out:
+            out.append(clean)
+
+    add(os.environ.get("V109_READ_RPC_URL"))
+    add(os.environ.get("PGG2_READ_RPC_URL"))
+    add(os.environ.get("HELIUS_RPC_URL"))
+    api = os.environ.get("HELIUS_API_KEY", "")
+    if api:
+        add(f"https://mainnet.helius-rpc.com/?api-key={api}")
+    add(os.environ.get("SOLANATRACKER_RPC_HTTP"))
+    add(os.environ.get("RPCFAST_HTTP_URL"))
+    add(os.environ.get("RPCFAST_RPC_URL"))
+    rpcfast_key = os.environ.get("RPCFAST_API_KEY", "")
+    if rpcfast_key:
+        add(f"https://solana-rpc.rpcfast.com/?api_key={rpcfast_key}")
+    add(os.environ.get("SHYFT_RPC_HTTP"))
+    shyft_key = os.environ.get("SHYFT_API_KEY", "")
+    if shyft_key:
+        add(f"https://rpc.shyft.to?api_key={shyft_key}")
+    add(os.environ.get("SOLANA_RPC_URL"))
+    add("https://api.mainnet-beta.solana.com")
+    return out
+
+
 def _rpc_call(method: str, params: list[Any], timeout: float = 4.0) -> Any:
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode("utf-8")
-    req = urllib.request.Request(_rpc_url(), data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        parsed = json.loads(resp.read().decode("utf-8"))
-    if parsed.get("error"):
-        raise RuntimeError(parsed["error"])
-    return parsed.get("result")
+    last_exc: Exception | None = None
+    for url in _rpc_urls():
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                parsed = json.loads(resp.read().decode("utf-8"))
+            if parsed.get("error"):
+                raise RuntimeError(parsed["error"])
+            return parsed.get("result")
+        except Exception as exc:
+            last_exc = exc
+            status = getattr(exc, "code", "")
+            msg = str(exc)
+            if status not in {403, 429} and "max_usage" not in msg and "credits" not in msg.lower():
+                # Try the next endpoint for transient network/provider errors,
+                # but avoid noisy logs on the hot path.
+                continue
+            continue
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("rpc_call_no_endpoint")
 
 
 def _sig_status(sig: str) -> Optional[dict[str, Any]]:
@@ -170,7 +217,7 @@ def _make_broker() -> Any:
     # guarded txs for bundle construction only; pgg2_v108_jito_bundle_sender
     # is the only module allowed to submit a bundle.
     api = os.environ.get("HELIUS_API_KEY", "")
-    helius_rpc = os.environ.get("HELIUS_RPC_URL") or (
+    helius_rpc = os.environ.get("V109_READ_RPC_URL") or os.environ.get("PGG2_READ_RPC_URL") or os.environ.get("HELIUS_RPC_URL") or (
         f"https://mainnet.helius-rpc.com/?api-key={api}" if api else ""
     )
     if helius_rpc:
