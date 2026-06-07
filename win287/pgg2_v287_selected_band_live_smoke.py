@@ -474,10 +474,14 @@ def _live_creator_vault_from_rpc(
         last_err = ""
         for candidate_rpc in _read_rpc_urls(str(rpc_url)):
             try:
+                # Creator-vault is part of Pump's account constraints. A
+                # processed read can come from a losing fork and still pass our
+                # local account-index checks, which burns the base fee with
+                # Custom 2006. Use confirmed data for the final authority.
                 info = _rpc_post_once(
                     candidate_rpc,
                     "getAccountInfo",
-                    [curve_key, {"encoding": "base64", "commitment": "processed"}],
+                    [curve_key, {"encoding": "base64", "commitment": "confirmed"}],
                     timeout=2.0,
                 )
                 value = (info or {}).get("value") or {}
@@ -1100,18 +1104,25 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_SEED_PRIOR_CARRY_TTL_MS", "1350")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_AUTHORITY_ENABLED", "1")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MIN_QUOTE_TOKENS", "150000")
-    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MAX_QUOTE_TOKENS", "900000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MAX_QUOTE_TOKENS", "760000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MAX_CURRENT_SOL", "2.65")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MAX_PRE_ENTRY_SOL", "3.00")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MAX_PRE_ENTRY_BUYS", "2")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MAX_REARM_DELAY_MS", "80")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MAX_REARM_LAG_MS", "350")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MAX_AUTHORITY_LAG_MS", "1150")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_USE_EVENT_DELAY_LAG", "1")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_MIN_TOP_SHARE", "0.999")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_NO_POSTPLAN_ENABLED", "0")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_NO_POSTPLAN_MIN_PCT", "1.50")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_NO_POSTPLAN_MIN_QUOTE_TOKENS", "540000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_NO_POSTPLAN_MAX_QUOTE_TOKENS", "760000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSTPLAN_ZERODRIFT_ENABLED", "1")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSTPLAN_MIN_SOL", "0.70")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSTPLAN_MIN_BUYS", "1")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSTPLAN_MIN_TOKEN_HEADROOM_PCT", "4.90")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_POSTPLAN_ENABLED", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_POSTPLAN_MAX_QUOTE_TOKENS", "760000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_MIN_POSTPLAN_SOL", "0.70")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_MIN_POSTPLAN_BUYS", "1")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_FAST_SINGLE_REARM_ZERODRIFT_ENABLED", "1")
@@ -1142,19 +1153,64 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_ONE_STRONG_POSTPLAN_MIN_TOP_SHARE", "0.999")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_MAX_QUOTE_TOKENS", "760000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_SEND_ENABLED", "1")
-    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_SOL", "1.30")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_SOL", "1.20")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_BUYS", "1")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_QUOTE_TOKENS", "540000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MAX_QUOTE_TOKENS", "760000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MAX_REARM_LAG_MS", "650")
-    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MAX_PRE_ENTRY_SOL", "11.00")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MAX_PRE_ENTRY_SOL", "3.00")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_DRIFT_PCT", "-0.050")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_TOP_SHARE", "0.999")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_ENABLED", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MS", "350")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MAX_WAITS", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MAX_AGE_MS", "1400")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_FOLLOW_MIN_SOL", "0.50")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_FOLLOW_MIN_BUYS", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MAX_QUOTE_TOKENS", "760000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_ENABLED", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_QUOTE_TOKENS", "795000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_QUOTE_TOKENS", "825000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_POSTPLAN_SOL", "0.70")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_POSTPLAN_SOL", "1.18")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_PRE_ENTRY_SOL", "2.00")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_PRE_ENTRY_SOL", "2.70")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_EXACT_PRE_ENTRY_BUYS", "2")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_CURRENT_SOL", "2.00")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_CURRENT_SOL", "2.20")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_RAW_REARM_LAG_MS", "350")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_REARM_DELAY_MS", "45")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_TOP_SHARE", "0.999")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_SEND_ENABLED", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_SOL", "1.20")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_BUYS", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_QUOTE_TOKENS", "540000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MAX_QUOTE_TOKENS", "760000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_PRE_ENTRY_SOL", "2.15")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MAX_PRE_ENTRY_SOL", "2.70")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_EXACT_PRE_ENTRY_BUYS", "2")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MAX_REARM_DELAY_MS", "80")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MAX_PASS_AGE_MS", "650")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_NEG_DRIFT_PCT", "-20.00")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_TOP_SHARE", "0.999")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_MIN_TOKEN_HEADROOM_PCT", "5.00")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_PLAN_READY_WAIT_MS", "650")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CLEAN_MAX_QUOTE_TOKENS", "825000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CAP_MIN_PRE_ENTRY_SOL", "2.00")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_CAP_MAX_REARM_DELAY_MS", "80")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_ENABLED", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_QUOTE_TOKENS", "870000")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MIN_POSTPLAN_SOL", "0.70")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_POSTPLAN_SOL", "0.95")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_EXACT_POSTPLAN_BUYS", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MIN_PRE_ENTRY_SOL", "1.40")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_PRE_ENTRY_SOL", "1.85")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_EXACT_PRE_ENTRY_BUYS", "2")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MIN_CURRENT_SOL", "2.00")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_CURRENT_SOL", "2.25")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_REARM_DELAY_MS", "80")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_LAST_REARM_LAG_MS", "350")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MIN_TOP_SHARE", "0.999")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_POSTPLAN_CAP_OVERRIDE_ENABLED", "1")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_POSTPLAN_CAP_MAX_QUOTE_TOKENS", "925000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_POSTPLAN_CAP_MIN_SOL", "2.50")
@@ -1281,11 +1337,12 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_ENABLED", "1")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_SOL", "0.50")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_BUYS", "2")
-    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_SEND_ENABLED", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_SEND_ENABLED", "0")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MAX_AGE_MS", "650")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_TOP_SHARE", "0.999")
     os.environ.setdefault("V287_FAST_STATIC_PLAN_USE_FEED_ACCOUNTS_ONLY", "1")
-    os.environ.setdefault("V287_TRUST_SUCCESSFUL_FEED_CREATOR_VAULT_FINAL", "1")
+    os.environ.setdefault("V287_FAST_STATIC_PLAN_LIVE_CREATOR_VAULT_PREWARM", "0")
+    os.environ.setdefault("V287_TRUST_SUCCESSFUL_FEED_CREATOR_VAULT_FINAL", "0")
     os.environ.setdefault("V287_IGNORE_SOCIAL_FEE_PDA_FOR_PLAN_CHURN", "1")
     os.environ.setdefault("V287_IGNORE_FEE_RECIPIENT_FOR_PLAN_CHURN", "1")
     os.environ.setdefault("V287_IGNORE_FEE_RECIPIENT_FOR_CANDIDATE_FP", "1")
@@ -1301,7 +1358,7 @@ def _configure_live_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_POS_REFRESH_WATCH_MAX_AGE_MS", "1400")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_POS_REFRESH_WATCH_MAX_WAITS", "2")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_POS_REFRESH_FOLLOWTHROUGH_MAX_AGE_MS", "450")
-    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_FRESH_POS_POSTPLAN_SEND_ENABLED", "1")
+    os.environ.setdefault("V287_SELECTED_SEED_PRIOR_FRESH_POS_POSTPLAN_SEND_ENABLED", "0")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_FRESH_POS_MIN_DRIFT_PCT", "2.00")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_FRESH_POS_MIN_QUOTE_TOKENS", "680000")
     os.environ.setdefault("V287_SELECTED_SEED_PRIOR_FRESH_POS_MAX_QUOTE_TOKENS", "760000")
@@ -1603,6 +1660,7 @@ def _remember_static_accounts_from_feed_rec(broker: Any, rec: dict[str, Any]) ->
         return False
     stored = False
     creator_vault = str(rec.get("creator_vault") or "")
+    creator_vault_from_live = False
     fee_recipient = str(rec.get("fee_recipient") or "")
     token_program = str(rec.get("token_program") or "")
     try:
@@ -1620,6 +1678,19 @@ def _remember_static_accounts_from_feed_rec(broker: Any, rec: dict[str, Any]) ->
                     f"feed={_short(feed_creator_vault)} live={_short(live_creator_vault)}"
                 )
             creator_vault = live_creator_vault
+            creator_vault_from_live = True
+        elif (
+            creator_vault
+            and os.environ.get("V287_FAST_STATIC_PLAN_USE_FEED_ACCOUNTS_ONLY", "0")
+            == "0"
+        ):
+            _log(
+                "PGG2-V287-FEED-CREATOR-VAULT-NOT-STORED "
+                f"mint={_short(mint)} full_mint={mint} "
+                f"feed={_short(creator_vault)} "
+                "reason=confirmed_live_creator_vault_required"
+            )
+            creator_vault = ""
         if token_program:
             as_pubkey(token_program)
             # mint_owner() only needs the account owner. The Geyser Pump ix
@@ -1643,7 +1714,8 @@ def _remember_static_accounts_from_feed_rec(broker: Any, rec: dict[str, Any]) ->
                 "PGG2-V287-STATIC-ACCOUNT-PREWARM "
                 f"mint={_short(mint)} creator_vault={_short(creator_vault)} "
                 f"fee_recipient={_short(fee_recipient)} "
-                f"token_program={_short(token_program)}"
+                f"token_program={_short(token_program)} "
+                f"creator_vault_source={'live_confirmed' if creator_vault_from_live else 'feed'}"
             )
     except Exception as exc:
         _log(
@@ -1710,7 +1782,7 @@ def _prepare_static_buy_plan_from_feed_rec(
                 )
         use_feed_only = (
             not creator_pk
-            and os.environ.get("V287_FAST_STATIC_PLAN_USE_FEED_ACCOUNTS_ONLY", "1")
+            and os.environ.get("V287_FAST_STATIC_PLAN_USE_FEED_ACCOUNTS_ONLY", "0")
             != "0"
             and bool(feed_creator_vault)
             and feed_creator_vault != str(Pubkey.default())
@@ -1944,6 +2016,76 @@ def _v287_try_seed_prior_static_plan_sync_recover(
         f"source={source} blocker=rebuild_failed"
     )
     return False
+
+
+def _v287_rebuild_static_plan_with_confirmed_creator(
+    *,
+    broker: Any,
+    mint: str,
+    amount_sol: float,
+    counters: Counter[str],
+    source: str,
+) -> bool:
+    """Rebuild a Pump buy static plan from confirmed curve creator state.
+
+    This specifically repairs creator_vault ConstraintSeeds failures. It does
+    not authorize a send; the caller must rebuild the quote and re-run the
+    normal account-index, fingerprint and live creator-vault checks.
+    """
+    counters["confirmed_creator_static_plan_rebuild_attempt"] += 1
+    creator_pk, creator_vault, fetch_ms, cache_hit, err = _live_creator_vault_from_rpc(
+        broker,
+        mint,
+        _default_rpc_url(),
+    )
+    if not creator_pk or not creator_vault:
+        counters["confirmed_creator_static_plan_rebuild_block"] += 1
+        _log(
+            "PGG2-V287-CONFIRMED-CREATOR-STATIC-PLAN-REBUILD-BLOCK "
+            f"mint={_short(mint)} full_mint={mint} source={source} "
+            f"reason={err or 'missing_confirmed_creator_vault'} fetch_ms={fetch_ms}"
+        )
+        return False
+    try:
+        _drop_static_buy_plan_for_mint_size(
+            broker,
+            mint,
+            float(amount_sol),
+            f"confirmed_creator_rebuild_{source}",
+        )
+        getattr(broker, "_pump_creator_vault_override", {})[mint] = str(creator_vault)
+        ok = bool(
+            broker.prepare_pump_buy_static_plan(
+                mint,
+                float(amount_sol),
+                creator=str(creator_pk),
+            )
+        )
+        if not ok:
+            counters["confirmed_creator_static_plan_rebuild_block"] += 1
+            _log(
+                "PGG2-V287-CONFIRMED-CREATOR-STATIC-PLAN-REBUILD-BLOCK "
+                f"mint={_short(mint)} full_mint={mint} source={source} "
+                "reason=prepare_failed"
+            )
+            return False
+        counters["confirmed_creator_static_plan_rebuild_pass"] += 1
+        _log(
+            "PGG2-V287-CONFIRMED-CREATOR-STATIC-PLAN-REBUILD-PASS "
+            f"mint={_short(mint)} full_mint={mint} source={source} "
+            f"creator={_short(creator_pk)} creator_vault={_short(creator_vault)} "
+            f"fetch_ms={fetch_ms} cache_hit={cache_hit} "
+            "next_step=normal_presend_validators"
+        )
+        return True
+    except Exception as exc:
+        counters["confirmed_creator_static_plan_rebuild_block"] += 1
+        _log(
+            "PGG2-V287-CONFIRMED-CREATOR-STATIC-PLAN-REBUILD-BLOCK "
+            f"mint={_short(mint)} full_mint={mint} source={source} "
+            f"err={type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return False
 
 
 def _candidate_live_ttl_ms(cand: dict[str, Any]) -> int:
@@ -2517,6 +2659,44 @@ def _v287_cand_post_plan_sol(cand: dict[str, Any]) -> float:
     return int(cand.get("post_plan_followthrough_lamports") or 0) / LAMPORTS_PER_SOL
 
 
+def _v287_selected_seed_prior_effective_rearm_lag_ms(
+    cand: dict[str, Any],
+    *,
+    max_delay_ms: int,
+    max_authority_lag_ms: int,
+) -> tuple[int, int, str]:
+    """Separate market rearm freshness from late final-authority bookkeeping.
+
+    The seed-prior carry lane is a speed lane. A rearm that arrived in 30-80 ms
+    should not be reclassified as stale only because static-plan/creator-vault
+    checks consumed another few hundred ms before the final authority branch ran.
+    We still cap the total authority lag so truly old candidates cannot pass.
+    """
+    cached_rearm_lag = cand.get("last_rearm_lag_ms") or cand.get(
+        "last_rearm_pass_lag_ms"
+    )
+    if cached_rearm_lag is not None:
+        raw_lag_ms = int(cached_rearm_lag)
+    else:
+        last_rearm_ts_ms = int(cand.get("last_rearm_pass_ts_ms") or 0)
+        raw_lag_ms = (
+            max(0, _now_ms() - last_rearm_ts_ms)
+            if last_rearm_ts_ms > 0
+            else int(cand.get("last_rearm_pass_delay_ms") or 999999)
+        )
+    first_delay_ms = int(cand.get("first_rearm_pass_delay_ms") or 999999)
+    last_delay_ms = int(cand.get("last_rearm_pass_delay_ms") or first_delay_ms)
+    if (
+        os.environ.get("V287_SELECTED_SEED_PRIOR_SPEED_USE_EVENT_DELAY_LAG", "1")
+        != "0"
+        and first_delay_ms <= int(max_delay_ms)
+        and last_delay_ms <= int(max_delay_ms)
+        and raw_lag_ms <= int(max_authority_lag_ms)
+    ):
+        return int(last_delay_ms), int(raw_lag_ms), "event_delay"
+    return int(raw_lag_ms), int(raw_lag_ms), "authority_lag"
+
+
 def _v287_selected_seed_prior_pending_plan_credit_ok(
     cand: dict[str, Any],
     *,
@@ -2741,22 +2921,34 @@ def _v287_seed_prior_consumed_postplan_authority_ok(
     post_plan_buys = int(cand.get("post_plan_followthrough_buys") or 0)
     post_plan_sol = _v287_cand_post_plan_sol(cand)
     pre_entry_sol = _v287_cand_pre_entry_sol(cand)
+    pre_entry_buys = int(cand.get("pre_entry_buys") or 0)
+    current_sol = float(cand.get("current_buy_sol") or 0.0)
+    first_delay_ms = int(cand.get("first_rearm_pass_delay_ms") or 999999)
+    last_delay_ms = int(cand.get("last_rearm_pass_delay_ms") or first_delay_ms)
+    prev_sells = int(cand.get("prev_sells") or 0)
     top_share = float(cand.get("top_share") or 0.0)
-    cached_rearm_lag = (
-        cand.get("last_rearm_lag_ms")
-        or cand.get("last_rearm_pass_lag_ms")
+    max_delay_ms = int(
+        os.environ.get("V287_SELECTED_SEED_PRIOR_SPEED_MAX_REARM_DELAY_MS", "80")
     )
-    if cached_rearm_lag is not None:
-        last_rearm_lag_ms = int(cached_rearm_lag)
-    else:
-        last_rearm_ts_ms = int(cand.get("last_rearm_pass_ts_ms") or 0)
-        if last_rearm_ts_ms > 0:
-            last_rearm_lag_ms = max(0, _now_ms() - last_rearm_ts_ms)
-        else:
-            last_rearm_lag_ms = int(
-                cand.get("last_rearm_pass_delay_ms")
-                or 999999
-            )
+    max_authority_lag_ms = int(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_SPEED_MAX_AUTHORITY_LAG_MS",
+            "1150",
+        )
+    )
+    last_rearm_lag_ms, raw_last_rearm_lag_ms, lag_source = (
+        _v287_selected_seed_prior_effective_rearm_lag_ms(
+            cand,
+            max_delay_ms=max_delay_ms,
+            max_authority_lag_ms=max_authority_lag_ms,
+        )
+    )
+    cand["v287_seed_prior_consumed_postplan_lag_eval"] = {
+        "last_rearm_lag_ms": int(last_rearm_lag_ms),
+        "raw_last_rearm_lag_ms": int(raw_last_rearm_lag_ms),
+        "lag_source": str(lag_source),
+        "max_authority_lag_ms": int(max_authority_lag_ms),
+    }
     if post_plan_buys < int(
         os.environ.get(
             "V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_BUYS",
@@ -2764,6 +2956,128 @@ def _v287_seed_prior_consumed_postplan_authority_ok(
         )
     ):
         return False, "consumed_postplan_weak_buys"
+    hot_high_cap_enabled = (
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_ENABLED",
+            "1",
+        )
+        != "0"
+    )
+    hot_high_cap_ok = (
+        hot_high_cap_enabled
+        and int(prev_sells) == 0
+        and post_plan_buys
+        >= int(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_BUYS",
+                "1",
+            )
+        )
+        and float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_POSTPLAN_SOL",
+                "0.70",
+            )
+        )
+        <= post_plan_sol
+        <= float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_POSTPLAN_SOL",
+                "1.18",
+            )
+        )
+        and float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_QUOTE_TOKENS",
+                "795000",
+            )
+        )
+        <= quote_tokens
+        <= float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_QUOTE_TOKENS",
+                "825000",
+            )
+        )
+        and float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_PRE_ENTRY_SOL",
+                "2.00",
+            )
+        )
+        <= pre_entry_sol
+        <= float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_PRE_ENTRY_SOL",
+                "2.70",
+            )
+        )
+        and pre_entry_buys
+        == int(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_EXACT_PRE_ENTRY_BUYS",
+                "2",
+            )
+        )
+        and float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_CURRENT_SOL",
+                "2.00",
+            )
+        )
+        <= current_sol
+        <= float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_CURRENT_SOL",
+                "2.20",
+            )
+        )
+        and int(raw_last_rearm_lag_ms)
+        <= int(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_RAW_REARM_LAG_MS",
+                "350",
+            )
+        )
+        and first_delay_ms
+        <= int(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_REARM_DELAY_MS",
+                "45",
+            )
+        )
+        and last_delay_ms
+        <= int(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MAX_REARM_DELAY_MS",
+                "45",
+            )
+        )
+        and top_share
+        >= float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_HOT_HIGH_CAP_MIN_TOP_SHARE",
+                "0.999",
+            )
+        )
+    )
+    cand["v287_seed_prior_consumed_hot_high_cap_eval"] = {
+        "enabled": int(hot_high_cap_enabled),
+        "pass": int(hot_high_cap_ok),
+        "quote_tokens": float(quote_tokens),
+        "post_plan_buys": int(post_plan_buys),
+        "post_plan_sol": float(post_plan_sol),
+        "pre_entry_buys": int(pre_entry_buys),
+        "pre_entry_sol": float(pre_entry_sol),
+        "current_sol": float(current_sol),
+        "first_delay_ms": int(first_delay_ms),
+        "last_delay_ms": int(last_delay_ms),
+        "raw_last_rearm_lag_ms": int(raw_last_rearm_lag_ms),
+        "prev_sells": int(prev_sells),
+        "top_share": float(top_share),
+    }
+    if hot_high_cap_ok:
+        return True, "consumed_postplan_hot_high_cap_authorized"
     if post_plan_sol < float(
         os.environ.get(
             "V287_SELECTED_SEED_PRIOR_CONSUMED_POSTPLAN_MIN_SOL",
@@ -2814,6 +3128,199 @@ def _v287_seed_prior_consumed_postplan_authority_ok(
     ):
         return False, "consumed_postplan_weak_top_share"
     return True, "consumed_postplan_flow_in_final_curve_read"
+
+
+def _v287_seed_prior_hot_high_cap_bypass_ok(
+    cand: dict[str, Any],
+    reason: str,
+    *,
+    quote_tokens: float,
+    max_quote_tokens: float,
+    source: str,
+    mint: str,
+    counters: Any = None,
+) -> bool:
+    ok, authority_reason = _v287_seed_prior_consumed_postplan_authority_ok(
+        cand,
+        reason,
+        quote_tokens=float(quote_tokens or 0.0),
+        drift_pct=0.0,
+    )
+    if not ok or authority_reason != "consumed_postplan_hot_high_cap_authorized":
+        return False
+    if counters is not None:
+        counters["seed_prior_hot_high_cap_bypass"] += 1
+    eval_info = cand.get("v287_seed_prior_consumed_hot_high_cap_eval") or {}
+    _log(
+        "PGG2-V287-SEED-PRIOR-HOT-HIGH-CAP-BYPASS "
+        f"mint={_short(mint)} full_mint={mint} "
+        f"reason={reason} source={source} "
+        f"amount_out_tokens={float(quote_tokens):.6f} "
+        f"base_max_tokens={float(max_quote_tokens):.6f} "
+        f"authority_reason={authority_reason} "
+        f"post_plan_buys={int(eval_info.get('post_plan_buys') or 0)} "
+        f"post_plan_buy_sol={float(eval_info.get('post_plan_sol') or 0.0):.6f} "
+        f"pre_entry_buys={int(eval_info.get('pre_entry_buys') or 0)} "
+        f"pre_entry_buy_sol={float(eval_info.get('pre_entry_sol') or 0.0):.6f} "
+        f"current_buy_sol={float(eval_info.get('current_sol') or 0.0):.6f} "
+        f"raw_last_rearm_lag_ms={int(eval_info.get('raw_last_rearm_lag_ms') or 0)} "
+        "reason_detail=existing_hot_high_cap_authority_reached_from_cap_check"
+    )
+    return True
+
+
+def _v287_seed_prior_credible_postplan_boundary_ok(
+    cand: dict[str, Any],
+    reason: str,
+    *,
+    quote_tokens: float,
+    drift_pct: float,
+) -> tuple[bool, str]:
+    """Authorize only the bounded 5WnJ/A7uZ post-plan continuation shape.
+
+    This is not a global negative-drift or zero-drift bypass. It requires the
+    selected seed-prior carry lane, a real post-plan buy, refreshed quote still
+    inside the base cap, and the same two-buy seed-prior structure seen in the
+    credible last-run misses. Over-cap rows such as J9Ly/BvY9 remain blocked by
+    the quote band, and weak post-plan rows such as CTf5/8Y6C remain blocked by
+    the post-plan SOL threshold.
+    """
+    if (
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_SEND_ENABLED",
+            "1",
+        )
+        == "0"
+    ):
+        return False, "credible_postplan_disabled"
+    if str(reason or "") != "selected_seed_prior_carry_rearm":
+        return False, "credible_postplan_reason"
+    if not _v287_is_selected_seed_prior(cand, reason):
+        return False, "not_seed_prior"
+    if int(cand.get("post_plan_rearm_passed") or 0) != 1:
+        return False, "postplan_not_passed"
+    if int(cand.get("prev_sells") or 0) != 0:
+        return False, "prev_sells"
+
+    post_plan_buys = int(cand.get("post_plan_followthrough_buys") or 0)
+    post_plan_sol = _v287_cand_post_plan_sol(cand)
+    min_post_plan_buys = int(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_BUYS",
+            "1",
+        )
+    )
+    min_post_plan_sol = float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_SOL",
+            "1.20",
+        )
+    )
+    if post_plan_buys < min_post_plan_buys:
+        return False, "credible_postplan_weak_buys"
+    if post_plan_sol < min_post_plan_sol:
+        return False, "credible_postplan_weak_sol"
+
+    quote_tokens = float(quote_tokens or 0.0)
+    min_quote_tokens = float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_QUOTE_TOKENS",
+            "540000",
+        )
+    )
+    max_quote_tokens = float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MAX_QUOTE_TOKENS",
+            "760000",
+        )
+    )
+    if quote_tokens < min_quote_tokens:
+        return False, "credible_postplan_low_quote"
+    if quote_tokens > max_quote_tokens:
+        return False, "credible_postplan_high_quote"
+
+    pre_entry_buys = int(cand.get("pre_entry_buys") or 0)
+    exact_pre_entry_buys = int(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_EXACT_PRE_ENTRY_BUYS",
+            "2",
+        )
+    )
+    if exact_pre_entry_buys > 0 and pre_entry_buys != exact_pre_entry_buys:
+        return False, "credible_postplan_pre_entry_buys"
+    pre_entry_sol = _v287_cand_pre_entry_sol(cand)
+    if pre_entry_sol < float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_PRE_ENTRY_SOL",
+            "2.15",
+        )
+    ):
+        return False, "credible_postplan_pre_entry_low"
+    if pre_entry_sol > float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MAX_PRE_ENTRY_SOL",
+            "2.70",
+        )
+    ):
+        return False, "credible_postplan_pre_entry_high"
+
+    max_rearm_delay_ms = int(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MAX_REARM_DELAY_MS",
+            "80",
+        )
+    )
+    first_delay_ms = int(cand.get("first_rearm_pass_delay_ms") or 999999)
+    last_delay_ms = int(cand.get("last_rearm_pass_delay_ms") or first_delay_ms)
+    if first_delay_ms > max_rearm_delay_ms or last_delay_ms > max_rearm_delay_ms:
+        return False, "credible_postplan_rearm_delay"
+
+    postplan_ts_ms = int(cand.get("post_plan_rearm_pass_ts_ms") or 0)
+    max_pass_age_ms = int(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MAX_PASS_AGE_MS",
+            "650",
+        )
+    )
+    if postplan_ts_ms > 0 and max(0, _now_ms() - postplan_ts_ms) > max_pass_age_ms:
+        return False, "credible_postplan_stale"
+
+    if float(cand.get("top_share") or 0.0) < float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_TOP_SHARE",
+            "0.999",
+        )
+    ):
+        return False, "credible_postplan_top_share"
+
+    drift_pct = float(drift_pct or 0.0)
+    min_neg_drift_pct = float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_CREDIBLE_POSTPLAN_MIN_NEG_DRIFT_PCT",
+            "-20.00",
+        )
+    )
+    if drift_pct < min_neg_drift_pct:
+        return False, "credible_postplan_drift_too_negative"
+
+    cand["v287_seed_prior_credible_postplan_eval"] = {
+        "pass": 1,
+        "post_plan_buys": int(post_plan_buys),
+        "post_plan_sol": float(post_plan_sol),
+        "min_post_plan_sol": float(min_post_plan_sol),
+        "quote_tokens": float(quote_tokens),
+        "min_quote_tokens": float(min_quote_tokens),
+        "max_quote_tokens": float(max_quote_tokens),
+        "pre_entry_buys": int(pre_entry_buys),
+        "pre_entry_sol": float(pre_entry_sol),
+        "first_delay_ms": int(first_delay_ms),
+        "last_delay_ms": int(last_delay_ms),
+        "drift_pct": float(drift_pct),
+        "min_neg_drift_pct": float(min_neg_drift_pct),
+    }
+    if drift_pct < 0.0:
+        return True, "credible_postplan_consumed_negative_refresh"
+    return True, "credible_postplan_zero_or_positive_refresh"
 
 
 def _v287_seed_prior_one_strong_postplan_zerodrift_ok(
@@ -3417,6 +3924,124 @@ def _v287_seed_prior_clean_cap_override_ok(
             )
         ):
             cand["seed_prior_postplan_cap_override_ok"] = 1
+            return True
+    if (
+        os.environ.get("V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_ENABLED", "1")
+        != "0"
+        and int(cand.get("post_plan_rearm_passed") or 0) == 1
+    ):
+        post_plan_sol = _v287_cand_post_plan_sol(cand)
+        post_plan_buys = int(cand.get("post_plan_followthrough_buys") or 0)
+        pre_entry_sol = _v287_cand_pre_entry_sol(cand)
+        pre_entry_buys = int(cand.get("pre_entry_buys") or 0)
+        first_delay = int(cand.get("first_rearm_pass_delay_ms") or 999999)
+        last_delay = int(cand.get("last_rearm_pass_delay_ms") or first_delay)
+        last_rearm_lag = int(
+            cand.get("last_rearm_lag_ms")
+            or cand.get("last_rearm_pass_lag_ms")
+            or 999999
+        )
+        early_clean_cap = float(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_QUOTE_TOKENS",
+                "870000",
+            )
+        )
+        exact_postplan_buys = int(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_EXACT_POSTPLAN_BUYS",
+                "1",
+            )
+        )
+        exact_pre_entry_buys = int(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_EXACT_PRE_ENTRY_BUYS",
+                "2",
+            )
+        )
+        if (
+            float(quote_tokens) <= early_clean_cap
+            and (
+                exact_postplan_buys <= 0
+                or post_plan_buys == exact_postplan_buys
+            )
+            and post_plan_sol
+            >= float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MIN_POSTPLAN_SOL",
+                    "0.70",
+                )
+            )
+            and post_plan_sol
+            <= float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_POSTPLAN_SOL",
+                    "0.95",
+                )
+            )
+            and (
+                exact_pre_entry_buys <= 0
+                or pre_entry_buys == exact_pre_entry_buys
+            )
+            and pre_entry_sol
+            >= float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MIN_PRE_ENTRY_SOL",
+                    "1.40",
+                )
+            )
+            and pre_entry_sol
+            <= float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_PRE_ENTRY_SOL",
+                    "1.85",
+                )
+            )
+            and float(cand.get("current_buy_sol") or 0.0)
+            >= float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MIN_CURRENT_SOL",
+                    "2.00",
+                )
+            )
+            and float(cand.get("current_buy_sol") or 0.0)
+            <= float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_CURRENT_SOL",
+                    "2.25",
+                )
+            )
+            and first_delay
+            <= int(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_REARM_DELAY_MS",
+                    "80",
+                )
+            )
+            and last_delay
+            <= int(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_REARM_DELAY_MS",
+                    "80",
+                )
+            )
+            and last_rearm_lag
+            <= int(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_LAST_REARM_LAG_MS",
+                    "350",
+                )
+            )
+            and int(cand.get("prev_sells") or 0) == 0
+            and float(cand.get("top_share") or 0.0)
+            >= float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MIN_TOP_SHARE",
+                    "0.999",
+                )
+            )
+        ):
+            cand["seed_prior_early_clean_cap_override_ok"] = 1
             return True
     clean_cap = float(os.environ.get("V287_SELECTED_SEED_PRIOR_CLEAN_MAX_QUOTE_TOKENS", "825000"))
     if float(quote_tokens) > clean_cap:
@@ -4151,16 +4776,66 @@ def _v287_seed_prior_watch_followthrough_state(
     start_buys = int(cand.get("no_movement_watch_start_buys") or 0)
     delta_lamports = max(0, int(cand.get("pre_entry_buy_lamports") or 0) - start_lamports)
     delta_buys = max(0, int(cand.get("pre_entry_buys") or 0) - start_buys)
-    min_delta_lamports = int(
-        float(os.environ.get("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_SOL", "0.50"))
-        * LAMPORTS_PER_SOL
-    )
-    min_delta_buys = int(
-        os.environ.get("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_BUYS", "2")
-    )
+    if int(cand.get("seed_prior_consumed_postplan_zero_watch") or 0) == 1:
+        min_delta_lamports = int(
+            float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_FOLLOW_MIN_SOL",
+                    "0.50",
+                )
+            )
+            * LAMPORTS_PER_SOL
+        )
+        min_delta_buys = int(
+            os.environ.get(
+                "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_FOLLOW_MIN_BUYS",
+                "1",
+            )
+        )
+    else:
+        min_delta_lamports = int(
+            float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_SOL",
+                    "0.50",
+                )
+            )
+            * LAMPORTS_PER_SOL
+        )
+        min_delta_buys = int(
+            os.environ.get("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_BUYS", "2")
+        )
     if delta_lamports >= min_delta_lamports and delta_buys >= min_delta_buys:
         return "followthrough", reason, delta_lamports, delta_buys
     return "keep", reason, delta_lamports, delta_buys
+
+
+def _v287_mark_seed_prior_consumed_zero_watch(
+    cand: dict[str, Any],
+    reason: str,
+    now_ms: int,
+    watch_ms: int,
+) -> None:
+    """Wait for a fresh post-boundary buy instead of sending consumed zero-drift."""
+    cand["seed_prior_consumed_postplan_zero_watch"] = 1
+    cand["seed_prior_consumed_postplan_zero_watch_start_ms"] = int(now_ms)
+    cand["seed_prior_consumed_postplan_zero_watch_reason"] = str(reason or "")
+    cand["seed_prior_consumed_postplan_send_ok"] = 0
+    cand["post_plan_rearm_required"] = 1
+    cand["post_plan_rearm_wait_start_ms"] = int(now_ms)
+    cand["post_plan_rearm_wait_last_ms"] = int(now_ms)
+    cand["post_plan_rearm_base_lamports"] = int(
+        cand.get("pre_entry_buy_lamports") or 0
+    )
+    cand["post_plan_rearm_base_buys"] = int(cand.get("pre_entry_buys") or 0)
+    cand["no_movement_watch_keeps"] = int(cand.get("no_movement_watch_keeps", 0)) + 1
+    cand["no_movement_watch_deadline_ms"] = int(now_ms) + int(watch_ms)
+    cand["no_movement_watch_reason"] = str(reason or "")
+    cand["no_movement_watch_start_pre_entry_lamports"] = int(
+        cand.get("pre_entry_buy_lamports") or 0
+    )
+    cand["no_movement_watch_start_buys"] = int(cand.get("pre_entry_buys") or 0)
+    cand["no_movement_watch_ts_ms"] = int(now_ms)
 
 
 def _v287_seed_prior_speed_authority_ok(
@@ -4194,7 +4869,7 @@ def _v287_seed_prior_speed_authority_ok(
         os.environ.get("V287_SELECTED_SEED_PRIOR_SPEED_MIN_QUOTE_TOKENS", "150000")
     )
     max_quote_tokens = float(
-        os.environ.get("V287_SELECTED_SEED_PRIOR_SPEED_MAX_QUOTE_TOKENS", "900000")
+        os.environ.get("V287_SELECTED_SEED_PRIOR_SPEED_MAX_QUOTE_TOKENS", "760000")
     )
     max_current_sol = float(
         os.environ.get("V287_SELECTED_SEED_PRIOR_SPEED_MAX_CURRENT_SOL", "2.65")
@@ -4213,6 +4888,19 @@ def _v287_seed_prior_speed_authority_ok(
     )
     max_lag_ms = int(
         os.environ.get("V287_SELECTED_SEED_PRIOR_SPEED_MAX_REARM_LAG_MS", "350")
+    )
+    max_authority_lag_ms = int(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_SPEED_MAX_AUTHORITY_LAG_MS",
+            "1150",
+        )
+    )
+    effective_lag_ms, raw_lag_ms, lag_source = (
+        _v287_selected_seed_prior_effective_rearm_lag_ms(
+            cand,
+            max_delay_ms=max_delay_ms,
+            max_authority_lag_ms=max_authority_lag_ms,
+        )
     )
     min_rearm_sol = float(os.environ.get("V287_SEED_PRIOR_CARRY_REARM_MIN_SOL", "0.70"))
     min_rearm_buys = int(os.environ.get("V287_SEED_PRIOR_CARRY_MIN_REARM_BUYS", "2"))
@@ -4245,8 +4933,11 @@ def _v287_seed_prior_speed_authority_ok(
             "first_delay_ms": int(first_delay_ms),
             "last_delay_ms": int(last_delay_ms),
             "max_delay_ms": int(max_delay_ms),
-            "last_lag_ms": int(last_lag_ms),
+            "last_lag_ms": int(effective_lag_ms),
+            "raw_last_lag_ms": int(raw_lag_ms),
+            "lag_source": str(lag_source),
             "max_lag_ms": int(max_lag_ms),
+            "max_authority_lag_ms": int(max_authority_lag_ms),
             "pass": int(ok),
             "result_reason": str(result_reason),
         }
@@ -4268,7 +4959,7 @@ def _v287_seed_prior_speed_authority_ok(
         return _result(False, "speed_rearm")
     if first_delay_ms > max_delay_ms or last_delay_ms > max_delay_ms:
         return _result(False, "speed_delay")
-    if last_lag_ms > max_lag_ms:
+    if effective_lag_ms > max_lag_ms:
         return _result(False, "speed_lag")
     if quote_tokens < min_quote_tokens:
         return _result(False, "speed_quote_low")
@@ -4641,6 +5332,23 @@ def _v287_seed_prior_final_send_authority(
     required_postplan_min = float(
         os.environ.get("V287_SELECTED_SEED_PRIOR_REQUIRED_POSTPLAN_MIN_SOL", "0.50")
     )
+    credible_postplan_ok, credible_postplan_reason = (
+        _v287_seed_prior_credible_postplan_boundary_ok(
+            cand,
+            reason,
+            quote_tokens=quote_tokens,
+            drift_pct=drift_pct,
+        )
+    )
+    if credible_postplan_ok:
+        cand["seed_prior_credible_postplan_send_ok"] = 1
+        if drift_pct <= 0.0:
+            cand["seed_prior_credible_postplan_zero_watch_pending"] = 1
+            return (
+                False,
+                "credible_postplan_zero_drift_requires_fresh_post_final_followthrough",
+            )
+        return True, credible_postplan_reason
 
     def _watch_followthrough_authority_ok(authority_reason: str) -> tuple[bool, str]:
         """Authorize a send only from fresh post-watch buy continuation.
@@ -4690,24 +5398,50 @@ def _v287_seed_prior_final_send_authority(
             cand.get("seed_prior_watch_followthrough_lamports") or 0
         )
         follow_delta_buys = int(cand.get("seed_prior_watch_followthrough_buys") or 0)
-        min_follow_delta_lamports = int(
-            float(
+        if int(cand.get("seed_prior_consumed_postplan_zero_watch") or 0) == 1:
+            min_follow_delta_lamports = int(
+                float(
+                    os.environ.get(
+                        "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_FOLLOW_MIN_SOL",
+                        "0.50",
+                    )
+                )
+                * LAMPORTS_PER_SOL
+            )
+            min_follow_delta_buys = int(
                 os.environ.get(
-                    "V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_SOL",
-                    "0.50",
+                    "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_FOLLOW_MIN_BUYS",
+                    "1",
                 )
             )
-            * LAMPORTS_PER_SOL
-        )
-        min_follow_delta_buys = int(
-            os.environ.get("V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_BUYS", "2")
-        )
-        max_zero_refresh_quote_tokens = float(
-            os.environ.get(
-                "V287_SELECTED_SEED_PRIOR_ZERO_WATCH_MAX_QUOTE_TOKENS",
-                "620000",
+            max_zero_refresh_quote_tokens = float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MAX_QUOTE_TOKENS",
+                    "760000",
+                )
             )
-        )
+        else:
+            min_follow_delta_lamports = int(
+                float(
+                    os.environ.get(
+                        "V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_SOL",
+                        "0.50",
+                    )
+                )
+                * LAMPORTS_PER_SOL
+            )
+            min_follow_delta_buys = int(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_WATCH_FOLLOWTHROUGH_MIN_BUYS",
+                    "2",
+                )
+            )
+            max_zero_refresh_quote_tokens = float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_ZERO_WATCH_MAX_QUOTE_TOKENS",
+                    "620000",
+                )
+            )
         def _watch_result(ok: bool, result_reason: str) -> tuple[bool, str]:
             cand["v287_seed_prior_watch_followthrough_eval"] = {
                 "send_enabled": int(send_enabled),
@@ -4776,12 +5510,30 @@ def _v287_seed_prior_final_send_authority(
         # shape. Re-check and honor those flags before the broader speed/watch
         # negative-projection wait below; otherwise a real allow is converted
         # into an expire-only watch.
+        if int(cand.get("seed_prior_consumed_postplan_send_ok") or 0) == 1:
+            consumed_preauth_ok, consumed_preauth_reason = (
+                _v287_seed_prior_consumed_postplan_authority_ok(
+                    cand,
+                    reason,
+                    quote_tokens=quote_tokens,
+                    drift_pct=drift_pct,
+                )
+            )
+            cand["v287_seed_prior_zero_drift_preauth_eval"] = {
+                "flag": "seed_prior_consumed_postplan_send_ok",
+                "pass": int(consumed_preauth_ok),
+                "reason": str(consumed_preauth_reason),
+                "drift_pct": float(drift_pct),
+                "quote_tokens": float(quote_tokens),
+                "direct_send_disabled": 1,
+            }
+            if consumed_preauth_ok:
+                return (
+                    False,
+                    "consumed_postplan_zero_drift_requires_fresh_post_final_followthrough",
+                )
+
         zero_drift_pre_authorities = (
-            (
-                "seed_prior_consumed_postplan_send_ok",
-                _v287_seed_prior_consumed_postplan_authority_ok,
-                "consumed_postplan_zero_drift_authorized",
-            ),
             (
                 "seed_prior_one_strong_postplan_zero_drift_send_ok",
                 _v287_seed_prior_one_strong_postplan_zerodrift_ok,
@@ -4830,6 +5582,16 @@ def _v287_seed_prior_final_send_authority(
         }
         if fast_single_ok:
             return True, fast_single_reason
+        if int(cand.get("seed_prior_consumed_postplan_zero_watch") or 0) == 1:
+            consumed_watch_ok, consumed_watch_reason = (
+                _watch_followthrough_authority_ok(
+                    "zero_refresh_watch_followthrough"
+                )
+            )
+            if consumed_watch_ok:
+                return True, "consumed_postplan_zero_watch_followthrough"
+            if int(cand.get("seed_prior_watch_followthrough_send_ok") or 0) == 1:
+                return False, consumed_watch_reason
         if speed_ok:
             cand["v287_seed_prior_speed_negative_projection_gate"] = {
                 "speed_reason": str(speed_reason),
@@ -4883,7 +5645,14 @@ def _v287_seed_prior_final_send_authority(
                 )
             )
             if consumed_postplan_ok:
-                return True, consumed_postplan_reason
+                cand["seed_prior_consumed_postplan_zero_watch_pending"] = 1
+                cand["seed_prior_consumed_postplan_zero_watch_blocker"] = (
+                    consumed_postplan_reason
+                )
+                return (
+                    False,
+                    "consumed_postplan_zero_drift_requires_fresh_post_final_followthrough",
+                )
             return False, "postplan_followthrough_consumed_before_send_boundary"
         return False, "nonpositive_final_drift_negative_roundtrip"
     min_drift_pct = float(
@@ -4897,6 +5666,14 @@ def _v287_seed_prior_final_send_authority(
             )
             != "0"
             and speed_ok
+            and drift_pct >= 0.0
+            and quote_tokens
+            <= float(
+                os.environ.get(
+                    "V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_POSTPLAN_MAX_QUOTE_TOKENS",
+                    "760000",
+                )
+            )
             and int(cand.get("post_plan_rearm_passed") or 0) == 1
             and post_plan_buys
             >= int(
@@ -4983,7 +5760,7 @@ def _v287_seed_prior_final_send_authority(
     strong_max_quote_tokens = float(
         os.environ.get(
             "V287_SELECTED_SEED_PRIOR_STRONG_DRIFT_MAX_QUOTE_TOKENS",
-            "825000",
+            "760000",
         )
     )
     strong_min_top_share = float(
@@ -5018,6 +5795,50 @@ def _v287_seed_prior_final_send_authority(
         "top_share": float(top_share),
         "min_top_share": float(strong_min_top_share),
     }
+    speed_pos_min_drift_pct = float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_NO_POSTPLAN_MIN_PCT",
+            "1.50",
+        )
+    )
+    speed_pos_min_quote_tokens = float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_NO_POSTPLAN_MIN_QUOTE_TOKENS",
+            "540000",
+        )
+    )
+    speed_pos_max_quote_tokens = float(
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_NO_POSTPLAN_MAX_QUOTE_TOKENS",
+            "790000",
+        )
+    )
+    speed_positive_no_postplan_ok = (
+        os.environ.get(
+            "V287_SELECTED_SEED_PRIOR_SPEED_POSITIVE_DRIFT_NO_POSTPLAN_ENABLED",
+            "1",
+        )
+        != "0"
+        and speed_ok
+        and post_plan_buys == 0
+        and post_plan_sol <= 1e-12
+        and drift_pct >= speed_pos_min_drift_pct
+        and speed_pos_min_quote_tokens <= quote_tokens <= speed_pos_max_quote_tokens
+    )
+    cand["v287_seed_prior_speed_positive_no_postplan_eval"] = {
+        "pass": int(speed_positive_no_postplan_ok),
+        "speed_pass": int(speed_ok),
+        "speed_reason": str(speed_reason),
+        "drift_pct": float(drift_pct),
+        "min_drift_pct": float(speed_pos_min_drift_pct),
+        "quote_tokens": float(quote_tokens),
+        "min_quote_tokens": float(speed_pos_min_quote_tokens),
+        "max_quote_tokens": float(speed_pos_max_quote_tokens),
+        "post_plan_buys": int(post_plan_buys),
+        "post_plan_sol": float(post_plan_sol),
+    }
+    if speed_positive_no_postplan_ok:
+        return True, "speed_positive_final_drift_no_postplan"
     # This branch is intentionally before post-plan rejection: live logs showed
     # strong_pass=1 could otherwise be converted into a wait/block by the
     # post-plan branch ordering.
@@ -5147,6 +5968,8 @@ def _v287_log_seed_prior_cap_override(
         f"pre_entry_buy_sol={_v287_cand_pre_entry_sol(cand):.6f} "
         f"first_rearm_delay_ms={int(cand.get('first_rearm_pass_delay_ms') or 0)} "
         f"last_rearm_delay_ms={int(cand.get('last_rearm_pass_delay_ms') or 0)} "
+        f"early_clean_cap_override={int(cand.get('seed_prior_early_clean_cap_override_ok') or 0)} "
+        f"early_clean_max_tokens={float(os.environ.get('V287_SELECTED_SEED_PRIOR_EARLY_CLEAN_CAP_MAX_QUOTE_TOKENS', '870000')):.6f} "
         f"watch_cap_override={int(cand.get('seed_prior_watch_cap_override_ok') or 0)} "
         f"postplan_cap_override={int(cand.get('seed_prior_postplan_cap_override_ok') or 0)} "
         f"watch_delta_sol={int(cand.get('seed_prior_watch_followthrough_lamports') or 0)/LAMPORTS_PER_SOL:.6f} "
@@ -5301,6 +6124,85 @@ def _v287_seed_prior_only_send_allowed(
         f"source={source}"
     )
     return False
+
+
+_V287_SINGLE_LANE_ALLOWED_REASON = "selected_single_prior_strong_rearm"
+
+
+def _v287_single_lane_only_mode() -> bool:
+    return os.environ.get("V287_SINGLE_LANE_ONLY", "0") == "1"
+
+
+def _v287_single_lane_firewall_ok(
+    *,
+    mint: str,
+    cand: dict[str, Any],
+    reason: str,
+    counters: Counter[str],
+    source: str,
+) -> bool:
+    """Hard single-lane firewall at the live-buy send site.
+
+    When V287_SINGLE_LANE_ONLY=1 the ONLY live buy permitted is the empirically
+    winning lane: ``selected_single_prior_strong_rearm`` on the
+    ``single_prior_buy_continuation`` shape with no active no-movement watch.
+    Every other authority/reason is shadow-blocked here, regardless of which of
+    the ~30 upstream authority paths set ``continuation_reason`` -- because this
+    runs at the narrow waist right before ``broker.send_signed``.
+
+    Evidence (empirical authority ledger, 2026-06-07, tools/v287_authority_ledger.py
+    over all _v287_all_logs): this lane = +0.027248 SOL, 2W/1L/3burn
+    (522f +0.0151, 2NFj +0.0132); all 26 other authorities net-negative
+    (machine-wide realized = -0.0374 SOL / 49 sends). Default OFF preserves the
+    frozen multi-authority behavior exactly.
+    """
+    if not _v287_single_lane_only_mode():
+        return True
+    reason = str(reason or "")
+    top_lane = str(cand.get("top_lane") or "")
+    no_move_keeps = int(cand.get("no_movement_watch_keeps") or 0)
+    allowed = (
+        reason == _V287_SINGLE_LANE_ALLOWED_REASON
+        and top_lane == "single_prior_buy_continuation"
+        and no_move_keeps <= 0
+    )
+    if allowed:
+        counters["single_lane_firewall_allow"] += 1
+        _log(
+            "PGG2-V287-SINGLE-LANE-FIREWALL-ALLOW "
+            f"mint={_short(mint)} full_mint={mint} reason={reason} "
+            f"top_lane={top_lane} source={source}"
+        )
+        return True
+    counters["single_lane_firewall_block"] += 1
+    _log(
+        "PGG2-V287-SINGLE-LANE-FIREWALL-BLOCK "
+        f"mint={_short(mint)} full_mint={mint} reason={reason or '-'} "
+        f"top_lane={top_lane} no_movement_watch_keeps={no_move_keeps} "
+        f"allowed_reason={_V287_SINGLE_LANE_ALLOWED_REASON} source={source}"
+    )
+    return False
+
+
+def _v287_assert_single_lane_config() -> None:
+    """Defense-in-depth lock applied at startup when V287_SINGLE_LANE_ONLY=1.
+
+    Pins the winning lane and its allowlist gate ON, then prints a banner. No
+    effect unless V287_SINGLE_LANE_ONLY=1, so the frozen launcher is unchanged.
+    The send-site firewall (above) is the hard guarantee; this is belt-and-braces
+    so the existing ``_v287_seed_prior_only_send_allowed`` gate agrees.
+    """
+    if not _v287_single_lane_only_mode():
+        return
+    os.environ["V287_ENABLE_SINGLE_PRIOR_BUY_LANE"] = "1"
+    os.environ["V287_SEED_PRIOR_ONLY_ALLOW_SINGLE_PRIOR_STRONG"] = "1"
+    os.environ["V287_LIVE_ONLY_SEED_PRIOR_CARRY"] = "1"
+    _log(
+        "PGG2-V287-SINGLE-LANE-ONLY-ARMED "
+        f"allowed_reason={_V287_SINGLE_LANE_ALLOWED_REASON} "
+        "allowed_top_lane=single_prior_buy_continuation "
+        "other_authorities=shadow_blocked_at_send_site"
+    )
 
 
 def _v287_reason_min_guard_mode(reason: str) -> str:
@@ -6111,6 +7013,7 @@ def _maybe_sell_before_buy_confirm(
 
 def main() -> int:
     _load_env()
+    _v287_assert_single_lane_config()
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=int, default=600)
     ap.add_argument("--endpoint", default=os.environ.get("PUBLICNODE_YELLOWSTONE_ENDPOINT", "solana-yellowstone-grpc.publicnode.com:443"))
@@ -6450,7 +7353,7 @@ def main() -> int:
         f"strong_current_max={float(os.environ.get('V287_SELECTED_SEED_PRIOR_STRONG_DRIFT_MAX_CURRENT_SOL', '2.50')):.3f} "
         f"strong_pre_entry_max={float(os.environ.get('V287_SELECTED_SEED_PRIOR_STRONG_DRIFT_MAX_PRE_ENTRY_SOL', '3.50')):.3f} "
         f"strong_buys_max={int(os.environ.get('V287_SELECTED_SEED_PRIOR_STRONG_DRIFT_MAX_PRE_ENTRY_BUYS', '2'))} "
-        f"strong_quote_max={float(os.environ.get('V287_SELECTED_SEED_PRIOR_STRONG_DRIFT_MAX_QUOTE_TOKENS', '825000')):.3f}"
+        f"strong_quote_max={float(os.environ.get('V287_SELECTED_SEED_PRIOR_STRONG_DRIFT_MAX_QUOTE_TOKENS', '760000')):.3f}"
     )
 
     stub = geyser_pb2_grpc.GeyserStub(grpc.secure_channel(str(args.endpoint), grpc.ssl_channel_credentials()))
@@ -8807,6 +9710,16 @@ def main() -> int:
                                                 max_quote_tokens=max_quote_tokens,
                                                 source="fast_final_curve",
                                             )
+                                        elif _v287_seed_prior_hot_high_cap_bypass_ok(
+                                            cand,
+                                            continuation_reason,
+                                            quote_tokens=quote_tokens,
+                                            max_quote_tokens=max_quote_tokens,
+                                            source="fast_final_curve",
+                                            mint=mint,
+                                            counters=counters,
+                                        ):
+                                            pass
                                         else:
                                             counters["buy_quote_token_cap_block"] += 1
                                             active.pop(mint, None)
@@ -9532,6 +10445,16 @@ def main() -> int:
                                                     max_quote_tokens=max_quote_tokens,
                                                     source="fast_final_curve_refresh",
                                                 )
+                                            elif _v287_seed_prior_hot_high_cap_bypass_ok(
+                                                cand,
+                                                continuation_reason,
+                                                quote_tokens=quote_tokens,
+                                                max_quote_tokens=max_quote_tokens,
+                                                source="fast_final_curve_refresh",
+                                                mint=mint,
+                                                counters=counters,
+                                            ):
+                                                pass
                                             else:
                                                 (
                                                     seed_prior_high_cap_watch_ok,
@@ -9678,6 +10601,33 @@ def main() -> int:
                                         float(final_refresh_drift_pct),
                                         _now_ms(),
                                     )
+                                    (
+                                        seed_prior_credible_postplan_ok,
+                                        seed_prior_credible_postplan_reason,
+                                    ) = _v287_seed_prior_credible_postplan_boundary_ok(
+                                        cand,
+                                        continuation_reason or "",
+                                        quote_tokens=float(quote_tokens),
+                                        drift_pct=float(final_refresh_drift_pct),
+                                    )
+                                    if seed_prior_credible_postplan_ok:
+                                        cand["seed_prior_credible_postplan_send_ok"] = 1
+                                        counters[
+                                            "seed_prior_credible_postplan_send_allow"
+                                        ] += 1
+                                        _log(
+                                            "PGG2-V287-SEED-PRIOR-CREDIBLE-POSTPLAN-SEND-ALLOW "
+                                            f"mint={_short(mint)} full_mint={mint} "
+                                            f"reason={continuation_reason} "
+                                            f"authority_reason={seed_prior_credible_postplan_reason} "
+                                            f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                            f"quote_tokens={float(quote_tokens):.6f} "
+                                            f"post_plan_buys={int(cand.get('post_plan_followthrough_buys') or 0)} "
+                                            f"post_plan_buy_sol={_v287_cand_post_plan_sol(cand):.6f} "
+                                            f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                            f"pre_entry_buy_sol={_v287_cand_pre_entry_sol(cand):.6f} "
+                                            "reason_detail=bounded_post_plan_continuation_authorizes_final_send"
+                                        )
                                     max_selected_neg_drift_pct = float(
                                         os.environ.get(
                                             "V287_SELECTED_MAX_NEG_REFRESH_DRIFT_PCT",
@@ -9702,6 +10652,7 @@ def main() -> int:
                                         and not seed_prior_tiny_neg_ok
                                         and not seed_prior_neg_refresh_followthrough_ok
                                         and not seed_prior_speed_refresh_ok
+                                        and not seed_prior_credible_postplan_ok
                                     ):
                                         if (
                                             seed_prior_neg_refresh_watch_ok
@@ -9857,6 +10808,7 @@ def main() -> int:
                                         < -abs(max_selected_neg_drift_pct)
                                         and not seed_prior_neg_refresh_followthrough_ok
                                         and not seed_prior_speed_refresh_ok
+                                        and not seed_prior_credible_postplan_ok
                                     ):
                                         if (
                                             os.environ.get(
@@ -9864,6 +10816,7 @@ def main() -> int:
                                                 "0",
                                             )
                                             == "1"
+                                            and not seed_prior_credible_postplan_ok
                                         ):
                                             counters[
                                                 "selected_refresh_negative_drift_hard_block"
@@ -10104,6 +11057,15 @@ def main() -> int:
                                             and final_refresh_drift_pct >= -1e-9
                                         ):
                                             (
+                                                credible_postplan_send_ok,
+                                                credible_postplan_send_reason,
+                                            ) = _v287_seed_prior_credible_postplan_boundary_ok(
+                                                cand,
+                                                continuation_reason,
+                                                quote_tokens=quote_tokens,
+                                                drift_pct=final_refresh_drift_pct,
+                                            )
+                                            (
                                                 consumed_postplan_send_ok,
                                                 consumed_postplan_send_reason,
                                             ) = _v287_seed_prior_consumed_postplan_authority_ok(
@@ -10137,15 +11099,82 @@ def main() -> int:
                                                 )
                                                 == "1"
                                             )
-                                            if consumed_postplan_send_ok:
+                                            if credible_postplan_send_ok:
+                                                if final_refresh_drift_pct <= 1e-9:
+                                                    watch_now_ms = _now_ms()
+                                                    watch_ms = int(
+                                                        os.environ.get(
+                                                            "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MS",
+                                                            "350",
+                                                        )
+                                                    )
+                                                    _v287_mark_seed_prior_consumed_zero_watch(
+                                                        cand,
+                                                        continuation_reason,
+                                                        watch_now_ms,
+                                                        watch_ms,
+                                                    )
+                                                    cand[
+                                                        "seed_prior_credible_postplan_zero_watch_pending"
+                                                    ] = 1
+                                                    counters[
+                                                        "seed_prior_credible_postplan_zero_watch_keep"
+                                                    ] += 1
+                                                    _log(
+                                                        "PGG2-V287-SEED-PRIOR-CREDIBLE-POSTPLAN-ZERO-WATCH-KEEP "
+                                                        f"mint={_short(mint)} full_mint={mint} "
+                                                        f"reason={continuation_reason} "
+                                                        f"shape={credible_postplan_send_reason} "
+                                                        f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                        f"post_plan_buys={int(cand.get('post_plan_followthrough_buys') or 0)} "
+                                                        f"post_plan_buy_sol={_v287_cand_post_plan_sol(cand):.6f} "
+                                                        f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                                        f"pre_entry_buy_sol={_v287_cand_pre_entry_sol(cand):.6f} "
+                                                        f"quote_tokens={float(quote_tokens):.6f} "
+                                                        f"watch_ms={watch_ms} "
+                                                        "reason_detail=credible_zero_drift_requires_fresh_post_boundary_buy"
+                                                    )
+                                                    hist[mint].append(rec)
+                                                    continue
                                                 cand[
-                                                    "seed_prior_consumed_postplan_send_ok"
+                                                    "seed_prior_credible_postplan_send_ok"
                                                 ] = 1
                                                 counters[
-                                                    "seed_prior_consumed_postplan_send_allow"
+                                                    "seed_prior_credible_postplan_send_allow"
                                                 ] += 1
                                                 _log(
-                                                    "PGG2-V287-SEED-PRIOR-CONSUMED-POSTPLAN-SEND-ALLOW "
+                                                    "PGG2-V287-SEED-PRIOR-CREDIBLE-POSTPLAN-ZERODRIFT-SEND-ALLOW "
+                                                    f"mint={_short(mint)} full_mint={mint} "
+                                                    f"reason={continuation_reason} "
+                                                    f"shape={credible_postplan_send_reason} "
+                                                    f"drift_pct={final_refresh_drift_pct:+.3f} "
+                                                    f"post_plan_buys={int(cand.get('post_plan_followthrough_buys') or 0)} "
+                                                    f"post_plan_buy_sol={_v287_cand_post_plan_sol(cand):.6f} "
+                                                    f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                                    f"pre_entry_buy_sol={_v287_cand_pre_entry_sol(cand):.6f} "
+                                                    f"quote_tokens={float(quote_tokens):.6f} "
+                                                    "reason_detail=bounded_post_plan_flow_already_in_final_curve_read"
+                                                )
+                                                any_negative_no_movement = False
+                                            elif consumed_postplan_send_ok:
+                                                watch_now_ms = _now_ms()
+                                                watch_ms = int(
+                                                    os.environ.get(
+                                                        "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MS",
+                                                        "350",
+                                                    )
+                                                )
+                                                _v287_mark_seed_prior_consumed_zero_watch(
+                                                    cand,
+                                                    continuation_reason,
+                                                    watch_now_ms,
+                                                    watch_ms,
+                                                )
+                                                counters[
+                                                    "seed_prior_consumed_postplan_zero_watch_keep"
+                                                ] += 1
+                                                _log(
+                                                    "PGG2-V287-SEED-PRIOR-CONSUMED-POSTPLAN-ZERO-WATCH-KEEP "
                                                     f"mint={_short(mint)} full_mint={mint} "
                                                     f"reason={continuation_reason} "
                                                     f"shape={consumed_postplan_send_reason} "
@@ -10155,9 +11184,11 @@ def main() -> int:
                                                     f"pre_entry_buy_sol={_v287_cand_pre_entry_sol(cand):.6f} "
                                                     f"last_rearm_lag_ms={int(cand.get('last_rearm_lag_ms') or cand.get('last_rearm_pass_lag_ms') or cand.get('last_rearm_pass_delay_ms') or 999999)} "
                                                     f"quote_tokens={float(quote_tokens):.6f} "
-                                                    "reason_detail=post_plan_flow_was_already_in_final_curve_read"
+                                                    f"watch_ms={watch_ms} "
+                                                    "reason_detail=consumed_zero_drift_requires_fresh_post_boundary_buy"
                                                 )
-                                                any_negative_no_movement = False
+                                                hist[mint].append(rec)
+                                                continue
                                             elif one_strong_postplan_zero_ok:
                                                 cand[
                                                     "seed_prior_one_strong_postplan_zero_drift_send_ok"
@@ -10530,6 +11561,76 @@ def main() -> int:
                                                 "speed_negative_projection_still_negative",
                                             }
                                         )
+                                        consumed_zero_watch_wait = (
+                                            authority_wait_reason
+                                            in {
+                                                "consumed_postplan_zero_drift_requires_fresh_post_final_followthrough",
+                                                "credible_postplan_zero_drift_requires_fresh_post_final_followthrough",
+                                            }
+                                        )
+                                        consumed_zero_watch_max_waits = int(
+                                            os.environ.get(
+                                                "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MAX_WAITS",
+                                                "1",
+                                            )
+                                        )
+                                        consumed_zero_watch_max_age_ms = int(
+                                            os.environ.get(
+                                                "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MAX_AGE_MS",
+                                                "1400",
+                                            )
+                                        )
+                                        if (
+                                            authority_wait_enabled
+                                            and consumed_zero_watch_wait
+                                            and os.environ.get(
+                                                "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_ENABLED",
+                                                "1",
+                                            )
+                                            != "0"
+                                            and authority_waits
+                                            < consumed_zero_watch_max_waits
+                                            and authority_age_ms
+                                            <= consumed_zero_watch_max_age_ms
+                                        ):
+                                            watch_ms = int(
+                                                os.environ.get(
+                                                    "V287_SELECTED_SEED_PRIOR_CONSUMED_ZERO_WATCH_MS",
+                                                    "350",
+                                                )
+                                            )
+                                            _v287_mark_seed_prior_consumed_zero_watch(
+                                                cand,
+                                                continuation_reason,
+                                                authority_now_ms,
+                                                watch_ms,
+                                            )
+                                            cand[
+                                                "seed_prior_authority_postplan_waits"
+                                            ] = authority_waits + 1
+                                            counters[
+                                                "seed_prior_consumed_postplan_zero_watch_keep"
+                                            ] += 1
+                                            _log(
+                                                "PGG2-V287-SEED-PRIOR-CONSUMED-POSTPLAN-ZERO-WATCH-KEEP "
+                                                f"mint={_short(mint)} full_mint={mint} "
+                                                f"reason={continuation_reason} "
+                                                f"authority_reason={authority_wait_reason} "
+                                                f"drift_pct={float(final_refresh_drift_pct):+.3f} "
+                                                f"quote_tokens={float(quote_tokens):.6f} "
+                                                f"pre_entry_buys={int(cand.get('pre_entry_buys') or 0)} "
+                                                f"pre_entry_buy_sol={_v287_cand_pre_entry_sol(cand):.6f} "
+                                                f"post_plan_buys={int(cand.get('post_plan_followthrough_buys') or 0)} "
+                                                f"post_plan_buy_sol={_v287_cand_post_plan_sol(cand):.6f} "
+                                                f"wait_count={authority_waits + 1} "
+                                                f"max_waits={consumed_zero_watch_max_waits} "
+                                                f"age_ms={authority_age_ms} "
+                                                f"max_age_ms={consumed_zero_watch_max_age_ms} "
+                                                f"watch_ms={watch_ms} "
+                                                "reason_detail=do_not_send_consumed_zero_drift_until_fresh_buy"
+                                            )
+                                            hist[mint].append(rec)
+                                            continue
                                         speed_negative_projection_max_waits = int(
                                             os.environ.get(
                                                 "V287_SELECTED_SEED_PRIOR_SPEED_NEGATIVE_PROJECTION_MAX_WAITS",
@@ -11146,15 +12247,26 @@ def main() -> int:
                                     active.pop(mint, None)
                                     hist[mint].append(rec)
                                     continue
-                                if not _validate_pump_buy_live_creator_vault(
+                                live_creator_vault_ok = _validate_pump_buy_live_creator_vault(
                                     broker=broker,
                                     mint=mint,
                                     txn_b64=str(buy_quote["txn"]),
                                     rpc_url=str(args.rpc_url),
                                     source="fast_static_final_presend",
                                     cand=cand,
-                                ):
+                                )
+                                if not live_creator_vault_ok:
                                     counters["live_creator_vault_block"] += 1
+                                    active.pop(mint, None)
+                                    hist[mint].append(rec)
+                                    continue
+                                if not _v287_single_lane_firewall_ok(
+                                    mint=mint,
+                                    cand=cand,
+                                    reason=continuation_reason or "",
+                                    counters=counters,
+                                    source="fast_static_final_presend",
+                                ):
                                     active.pop(mint, None)
                                     hist[mint].append(rec)
                                     continue
@@ -11333,6 +12445,16 @@ def main() -> int:
                                             max_quote_tokens=max_quote_tokens,
                                             source="fallback_buy_path",
                                         )
+                                    elif _v287_seed_prior_hot_high_cap_bypass_ok(
+                                        cand,
+                                        continuation_reason,
+                                        quote_tokens=quote_tokens,
+                                        max_quote_tokens=max_quote_tokens,
+                                        source="fallback_buy_path",
+                                        mint=mint,
+                                        counters=counters,
+                                    ):
+                                        pass
                                     else:
                                         counters["buy_quote_token_cap_block"] += 1
                                         active.pop(mint, None)
@@ -11397,6 +12519,16 @@ def main() -> int:
                                                 max_quote_tokens=max_quote_tokens,
                                                 source="fallback_buy_rebuild",
                                             )
+                                        elif _v287_seed_prior_hot_high_cap_bypass_ok(
+                                            cand,
+                                            continuation_reason,
+                                            quote_tokens=quote_tokens,
+                                            max_quote_tokens=max_quote_tokens,
+                                            source="fallback_buy_rebuild",
+                                            mint=mint,
+                                            counters=counters,
+                                        ):
+                                            pass
                                         else:
                                             counters["buy_quote_token_cap_rebuild_block"] += 1
                                             active.pop(mint, None)
@@ -11541,6 +12673,16 @@ def main() -> int:
                                                     max_quote_tokens=max_quote_tokens,
                                                     source="send_boundary_requote",
                                                 )
+                                            elif _v287_seed_prior_hot_high_cap_bypass_ok(
+                                                cand,
+                                                continuation_reason,
+                                                quote_tokens=boundary_tokens,
+                                                max_quote_tokens=max_quote_tokens,
+                                                source="send_boundary_requote",
+                                                mint=mint,
+                                                counters=counters,
+                                            ):
+                                                pass
                                             else:
                                                 counters["buy_quote_token_cap_boundary_block"] += 1
                                                 active.pop(mint, None)
@@ -11623,6 +12765,16 @@ def main() -> int:
                                 cand=cand,
                             ):
                                 counters["live_creator_vault_block"] += 1
+                                active.pop(mint, None)
+                                hist[mint].append(rec)
+                                continue
+                            if not _v287_single_lane_firewall_ok(
+                                mint=mint,
+                                cand=cand,
+                                reason=continuation_reason or "",
+                                counters=counters,
+                                source="fallback_final_presend",
+                            ):
                                 active.pop(mint, None)
                                 hist[mint].append(rec)
                                 continue
