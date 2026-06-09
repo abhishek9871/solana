@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
+import threading
 import time
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pgg2_goal5_standalone import (
@@ -46,7 +48,10 @@ class ScoutCandidate:
     follow_lamports: int
     follow_buys: int
     start_sig: str
+    start_payer: str
     feed_rec: dict[str, Any]
+    follow_sigs: list[str] = field(default_factory=list)
+    follow_payers: list[str] = field(default_factory=list)
 
 
 def _now_ms() -> int:
@@ -229,11 +234,60 @@ def _lane_allowed(
     return False, "shape"
 
 
+def _c3_postquote_tape_check(
+    args: argparse.Namespace,
+    cand: ScoutCandidate,
+    reason: str,
+    mint_hist: list[dict[str, Any]],
+) -> tuple[bool, str]:
+    if reason != "small005_c3_f13_q720" or not bool(args.c3_postquote_tape_check_enabled):
+        return True, "not_c3"
+
+    known_sigs = {str(cand.start_sig), *(str(sig) for sig in cand.follow_sigs)}
+    after_start = [
+        x
+        for x in mint_hist
+        if int(x.get("recv_ms") or 0) > int(cand.start_ms)
+        and _now_ms() - int(x.get("recv_ms") or 0) <= int(args.c3_postquote_tape_window_ms)
+    ]
+    sells = [x for x in after_start if x.get("kind") == "sell"]
+    hidden_buys = [
+        x
+        for x in after_start
+        if x.get("kind") == "buy" and str(x.get("sig") or "") not in known_sigs
+    ]
+    hidden_sol = sum(int(x.get("sol_lamports") or 0) for x in hidden_buys) / LAMPORTS_PER_SOL
+    dust_max = float(args.c3_dust_buy_max_sol) * LAMPORTS_PER_SOL
+    large_min = float(args.c3_large_buy_min_sol) * LAMPORTS_PER_SOL
+    hidden_dust = sum(1 for x in hidden_buys if int(x.get("sol_lamports") or 0) < dust_max)
+    hidden_large = sum(1 for x in hidden_buys if int(x.get("sol_lamports") or 0) >= large_min)
+    pass_check = (
+        not sells
+        and hidden_sol >= float(args.c3_min_hidden_postfollow_sol)
+        and hidden_large >= int(args.c3_min_hidden_large_buys)
+        and hidden_dust <= int(args.c3_max_hidden_dust_buys)
+    )
+    reason_out = "c3_tape_ok" if pass_check else "c3_tape_block"
+    _log(
+        "PGG2-GOAL5-C3-POSTQUOTE-TAPE "
+        f"mint={_short(cand.mint)} full_mint={cand.mint} pass={int(pass_check)} reason={reason_out} "
+        f"start_sig={cand.start_sig} follow_sigs={','.join(cand.follow_sigs)} "
+        f"start_payer={cand.start_payer} follow_payers={','.join(cand.follow_payers)} "
+        f"events_after_start={len(after_start)} hidden_buys={len(hidden_buys)} "
+        f"hidden_sol={hidden_sol:.6f} hidden_large={hidden_large} hidden_dust={hidden_dust} "
+        f"sells_after_start={len(sells)} min_hidden_sol={float(args.c3_min_hidden_postfollow_sol):.6f} "
+        f"min_hidden_large={int(args.c3_min_hidden_large_buys)} max_hidden_dust={int(args.c3_max_hidden_dust_buys)}"
+    )
+    return pass_check, reason_out
+
+
 def _trade(
     args: argparse.Namespace,
     broker: Any,
     cand: ScoutCandidate,
     counters: Counter[str],
+    hist: dict[str, deque[dict[str, Any]]],
+    hist_lock: threading.Lock,
 ) -> bool:
     from pgg2_direct_pump import as_pubkey  # type: ignore
 
@@ -312,6 +366,12 @@ def _trade(
     )
     if not allowed:
         counters[f"auth_block_{reason}"] += 1
+        return False
+    with hist_lock:
+        mint_hist = list(hist.get(mint, ()))
+    tape_ok, tape_reason = _c3_postquote_tape_check(args, cand, reason, mint_hist)
+    if not tape_ok:
+        counters[f"auth_block_{tape_reason}"] += 1
         return False
     if not args.live:
         counters["dry_ready"] += 1
@@ -484,6 +544,61 @@ def _self_test() -> int:
         got, reason = _lane_allowed(ns, cur, first, follow, buys, quote, age, projected)
         print(f"{name} expected={int(expected)} got={int(got)} reason={reason}")
         ok = ok and got is expected
+    tape_ns = argparse.Namespace(
+        c3_postquote_tape_check_enabled=True,
+        c3_postquote_tape_window_ms=650,
+        c3_min_hidden_postfollow_sol=3.0,
+        c3_min_hidden_large_buys=3,
+        c3_large_buy_min_sol=0.30,
+        c3_dust_buy_max_sol=0.10,
+        c3_max_hidden_dust_buys=2,
+    )
+    base_ms = _now_ms() - 100
+    c3_cand = ScoutCandidate(
+        mint="UnitTestPump",
+        start_ms=base_ms,
+        current_lamports=int(3.3 * LAMPORTS_PER_SOL),
+        first_follow_lamports=int(1.32 * LAMPORTS_PER_SOL),
+        follow_lamports=int(1.32 * LAMPORTS_PER_SOL),
+        follow_buys=1,
+        start_sig="start",
+        start_payer="payer_start",
+        feed_rec={},
+        follow_sigs=["follow"],
+        follow_payers=["payer_follow"],
+    )
+
+    def buy(sig: str, sol: float, offset_ms: int) -> dict[str, Any]:
+        return {"kind": "buy", "sig": sig, "sol_lamports": int(sol * LAMPORTS_PER_SOL), "recv_ms": base_ms + offset_ms}
+
+    win_hist = [
+        buy("start", 3.3, 0),
+        buy("follow", 1.32, 10),
+        buy("h1", 0.99, 20),
+        buy("h2", 0.33, 30),
+        buy("h3", 0.002, 40),
+        buy("h4", 1.25, 50),
+        buy("h5", 0.5735, 60),
+        buy("h6", 0.0847, 70),
+    ]
+    loss_hist = [
+        buy("start", 3.3, 0),
+        buy("follow", 1.32, 10),
+        buy("h1", 1.21, 20),
+        buy("h2", 0.88, 30),
+        buy("d1", 0.06, 40),
+        buy("d2", 0.06, 50),
+        buy("d3", 0.012, 60),
+        buy("d4", 0.06, 70),
+        buy("h3", 0.189731, 80),
+    ]
+    for name, expected, hist_rows in [
+        ("c3_tape_9yY4_style_pass", True, win_hist),
+        ("c3_tape_AJq6_style_block", False, loss_hist),
+    ]:
+        got, reason = _c3_postquote_tape_check(tape_ns, c3_cand, "small005_c3_f13_q720", hist_rows)
+        print(f"{name} expected={int(expected)} got={int(got)} reason={reason}")
+        ok = ok and got is expected
     print("GOAL5_SPEED_SCOUT_SELF_TEST_OK" if ok else "GOAL5_SPEED_SCOUT_SELF_TEST_FAIL")
     return 0 if ok else 1
 
@@ -512,6 +627,9 @@ def run(args: argparse.Namespace) -> int:
     metadata = [(str(args.metadata_key), token)]
     hist: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=64))
     seen: set[str] = set()
+    hist_lock = threading.Lock()
+    stop_event = threading.Event()
+    event_q: queue.Queue[tuple[dict[str, Any], list[dict[str, Any]]]] = queue.Queue(maxsize=int(args.feed_queue_size))
     counters: Counter[str] = Counter()
     started = time.time()
     _log(
@@ -529,26 +647,51 @@ def run(args: argparse.Namespace) -> int:
         f"fresh_start_no_prior_buy_ms={args.fresh_start_no_prior_buy_ms} "
         f"max_prequote_start_age_ms={args.max_prequote_start_age_ms} "
         f"max_send_start_age_ms={args.max_send_start_age_ms} "
-        f"sell_min_headroom={args.sell_min_headroom_lamports} max_hold_ms={args.max_hold_ms}"
+        f"sell_min_headroom={args.sell_min_headroom_lamports} max_hold_ms={args.max_hold_ms} "
+        f"c3_tape_check={int(args.c3_postquote_tape_check_enabled)}"
     )
+
+    def feed_reader() -> None:
+        try:
+            for update in stub.Subscribe(_request_iter(args), metadata=metadata):
+                if stop_event.is_set():
+                    break
+                rec = _decode_pump(update)
+                if not rec:
+                    continue
+                sig = str(rec["sig"])
+                with hist_lock:
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    mint = str(rec["mint"])
+                    prior = list(hist[mint])
+                    hist[mint].append(rec)
+                try:
+                    event_q.put_nowait((rec, prior))
+                except queue.Full:
+                    _log("PGG2-GOAL5-SCOUT-FEED-DROP reason=queue_full")
+        except grpc.RpcError as exc:
+            if not stop_event.is_set():
+                _log(f"PGG2-GOAL5-SCOUT-GRPC-ERROR code={exc.code()} details={str(exc.details())[:220]}")
+        except Exception as exc:
+            if not stop_event.is_set():
+                _log(f"PGG2-GOAL5-SCOUT-FEED-ERROR err={type(exc).__name__}:{str(exc)[:220]}")
+
+    reader = threading.Thread(target=feed_reader, name="goal5-feed-reader", daemon=True)
+    reader.start()
     try:
-        for update in stub.Subscribe(_request_iter(args), metadata=metadata):
+        while True:
             now = _now_ms()
             if time.time() - started > int(args.seconds):
                 counters["timeout"] += 1
                 break
-            rec = _decode_pump(update)
-            if not rec:
-                counters["non_pump"] += 1
+            try:
+                rec, prior = event_q.get(timeout=0.05)
+            except queue.Empty:
                 continue
             sig = str(rec["sig"])
-            if sig in seen:
-                counters["duplicate"] += 1
-                continue
-            seen.add(sig)
             mint = str(rec["mint"])
-            prior = list(hist[mint])
-            hist[mint].append(rec)
             if rec["kind"] != "buy":
                 counters["sell_event"] += 1
                 continue
@@ -570,6 +713,7 @@ def run(args: argparse.Namespace) -> int:
                             follow_lamports=0,
                             follow_buys=0,
                             start_sig=sig,
+                            start_payer=str(rec.get("fee_payer") or ""),
                             feed_rec=dict(rec),
                         )
                     )
@@ -607,7 +751,10 @@ def run(args: argparse.Namespace) -> int:
                         follow_lamports=sum(int(x["sol_lamports"]) for x in follow_buys),
                         follow_buys=len(follow_buys),
                         start_sig=str(start["sig"]),
+                        start_payer=str(start.get("fee_payer") or ""),
                         feed_rec=dict(start),
+                        follow_sigs=[str(x.get("sig") or "") for x in follow_buys],
+                        follow_payers=[str(x.get("fee_payer") or "") for x in follow_buys],
                     )
                 )
             if not candidates:
@@ -616,7 +763,7 @@ def run(args: argparse.Namespace) -> int:
 
             for cand in candidates:
                 counters["candidate"] += 1
-                ok = _trade(args, broker, cand, counters)
+                ok = _trade(args, broker, cand, counters, hist, hist_lock)
                 if ok or counters["closed"] or counters["buy_failed_safe"]:
                     break
             if args.live and (counters["closed"] or counters["buy_failed_safe"]):
@@ -625,10 +772,12 @@ def run(args: argparse.Namespace) -> int:
                 break
             if (not args.live) and args.stop_on_dry_ready and counters["dry_ready"]:
                 break
-    except grpc.RpcError as exc:
-        counters["grpc_error"] += 1
-        _log(f"PGG2-GOAL5-SCOUT-GRPC-ERROR code={exc.code()} details={str(exc.details())[:220]}")
     finally:
+        stop_event.set()
+        try:
+            channel.close()
+        except Exception:
+            pass
         _log("PGG2-GOAL5-SCOUT-FINAL " + " ".join(f"{k}={v}" for k, v in counters.most_common(60)))
     if args.live:
         return 0 if counters["win"] > 0 and counters["loss"] == 0 else 1
@@ -679,6 +828,14 @@ def main() -> int:
     ap.add_argument("--token-poll-ms", type=int, default=20)
     ap.add_argument("--target-closes", type=int, default=1)
     ap.add_argument("--stop-on-dry-ready", action="store_true")
+    ap.add_argument("--feed-queue-size", type=int, default=4096)
+    ap.add_argument("--c3-postquote-tape-check-enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--c3-postquote-tape-window-ms", type=int, default=650)
+    ap.add_argument("--c3-min-hidden-postfollow-sol", type=float, default=3.0)
+    ap.add_argument("--c3-min-hidden-large-buys", type=int, default=3)
+    ap.add_argument("--c3-large-buy-min-sol", type=float, default=0.30)
+    ap.add_argument("--c3-dust-buy-max-sol", type=float, default=0.10)
+    ap.add_argument("--c3-max-hidden-dust-buys", type=int, default=2)
     args = ap.parse_args()
     if args.self_test:
         return _self_test()

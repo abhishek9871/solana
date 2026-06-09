@@ -254,6 +254,7 @@ def _decode_pump(update: Any) -> dict[str, Any] | None:
         common = {
             "slot": int(update.transaction.slot),
             "sig": sig,
+            "fee_payer": keys[0] if keys else "",
             "fee_recipient": acct(1),
             "mint": acct(2),
             "curve": acct(3),
