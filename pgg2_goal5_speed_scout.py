@@ -52,6 +52,8 @@ class ScoutCandidate:
     feed_rec: dict[str, Any]
     follow_sigs: list[str] = field(default_factory=list)
     follow_payers: list[str] = field(default_factory=list)
+    latest_follow_ms: int = 0
+    train_span_ms: int = 0
 
 
 def _now_ms() -> int:
@@ -71,8 +73,23 @@ def _pre_shape_allowed(
     follow_sol: float,
     follow_buys: int,
     start_age_ms: int,
+    latest_follow_age_ms: int | None = None,
+    train_span_ms: int | None = None,
 ) -> tuple[bool, str]:
+    train_follow_age_ms = start_age_ms if latest_follow_age_ms is None else int(latest_follow_age_ms)
+    train_span = 0 if train_span_ms is None else int(train_span_ms)
+    buy_train_fresh_shape = (
+        args.clean_buy_train_continuation_enabled
+        and float(args.size_sol) <= 0.006
+        and float(args.buy_train_min_current_sol) <= current_sol <= float(args.buy_train_max_current_sol)
+        and follow_buys >= int(args.buy_train_min_follow_buys)
+        and follow_sol >= float(args.buy_train_min_follow_sol)
+        and train_follow_age_ms <= int(args.buy_train_max_follow_age_ms)
+        and train_span <= int(args.buy_train_max_train_span_ms)
+    )
     if start_age_ms > int(args.max_prequote_start_age_ms):
+        if buy_train_fresh_shape:
+            return True, "pre_clean_buy_train_continuation"
         return False, "pre_stale_start"
     if (
         args.proven_strong_enabled
@@ -122,6 +139,8 @@ def _pre_shape_allowed(
         and 1.20 <= follow_sol <= 1.35
     ):
         return True, "pre_small005_c3_f13_q720"
+    if buy_train_fresh_shape:
+        return True, "pre_clean_buy_train_continuation"
     if (
         args.scratch_midquote_enabled
         and 0.65 <= current_sol <= 1.95
@@ -150,11 +169,27 @@ def _lane_allowed(
     quote_tokens: float,
     start_age_ms: int,
     projected_headroom_lamports: int | None = None,
+    latest_follow_age_ms: int | None = None,
+    train_span_ms: int | None = None,
 ) -> tuple[bool, str]:
     max_send_age_ms = int(getattr(args, "max_send_start_age_ms", args.max_start_age_ms))
-    if start_age_ms > max_send_age_ms:
-        return False, "stale_start"
     projected_headroom = -10**18 if projected_headroom_lamports is None else int(projected_headroom_lamports)
+    train_follow_age_ms = start_age_ms if latest_follow_age_ms is None else int(latest_follow_age_ms)
+    train_span = 0 if train_span_ms is None else int(train_span_ms)
+    buy_train_fresh_shape = (
+        args.clean_buy_train_continuation_enabled
+        and float(args.size_sol) <= 0.006
+        and float(args.buy_train_min_current_sol) <= current_sol <= float(args.buy_train_max_current_sol)
+        and follow_buys >= int(args.buy_train_min_follow_buys)
+        and follow_sol >= float(args.buy_train_min_follow_sol)
+        and float(args.buy_train_min_quote_tokens_ref) <= quote_tokens <= float(args.buy_train_max_quote_tokens_ref)
+        and train_follow_age_ms <= int(args.buy_train_max_follow_age_ms)
+        and train_span <= int(args.buy_train_max_train_span_ms)
+    )
+    if start_age_ms > max_send_age_ms:
+        if buy_train_fresh_shape:
+            return True, "clean_buy_train_continuation"
+        return False, "stale_start"
     if (
         args.proven_strong_enabled
         and 2.00 <= current_sol <= 2.18
@@ -209,16 +244,20 @@ def _lane_allowed(
         and follow_buys == 1
         and 1.20 <= first_follow_sol <= 1.35
         and 1.20 <= follow_sol <= 1.35
-        and 700_000 <= quote_tokens <= 760_000
+        and 660_000 <= quote_tokens <= 760_000
     ):
         return True, "small005_c3_f13_q720"
+    if buy_train_fresh_shape:
+        return True, "clean_buy_train_continuation"
     if (
         args.scratch_midquote_enabled
         and 0.65 <= current_sol <= 1.95
         and follow_buys == 1
         and 0.38 <= first_follow_sol <= 1.25
         and 0.38 <= follow_sol <= 1.25
-        and 680_000 <= quote_tokens <= 805_000
+        and float(args.scratch_midquote_min_quote_tokens_ref)
+        <= quote_tokens
+        <= float(args.scratch_midquote_max_quote_tokens_ref)
         and projected_headroom >= int(args.scratch_midquote_min_projected_headroom_lamports)
     ):
         return True, "scratch_positive_midquote_one_follow"
@@ -261,22 +300,101 @@ def _c3_postquote_tape_check(
     large_min = float(args.c3_large_buy_min_sol) * LAMPORTS_PER_SOL
     hidden_dust = sum(1 for x in hidden_buys if int(x.get("sol_lamports") or 0) < dust_max)
     hidden_large = sum(1 for x in hidden_buys if int(x.get("sol_lamports") or 0) >= large_min)
+    current_sol = int(cand.current_lamports) / LAMPORTS_PER_SOL
     pass_check = (
         not sells
         and hidden_sol >= float(args.c3_min_hidden_postfollow_sol)
         and hidden_large >= int(args.c3_min_hidden_large_buys)
         and hidden_dust <= int(args.c3_max_hidden_dust_buys)
     )
-    reason_out = "c3_tape_ok" if pass_check else "c3_tape_block"
+    mid_clean_pass = (
+        not pass_check
+        and not sells
+        and 3.20 <= current_sol <= 3.40
+        and hidden_sol >= 2.00
+        and hidden_large >= 2
+        and hidden_dust == 0
+    )
+    high_total_low_dust_pass = (
+        not pass_check
+        and not mid_clean_pass
+        and not sells
+        and 3.20 <= current_sol <= 3.40
+        and hidden_sol >= 3.00
+        and hidden_large >= 2
+        and hidden_dust <= 1
+    )
+    pass_check = pass_check or mid_clean_pass or high_total_low_dust_pass
+    if pass_check and high_total_low_dust_pass:
+        reason_out = "c3_tape_high_total_low_dust_ok"
+    elif pass_check and mid_clean_pass:
+        reason_out = "c3_tape_mid_clean_ok"
+    elif pass_check:
+        reason_out = "c3_tape_ok"
+    else:
+        reason_out = "c3_tape_block"
     _log(
         "PGG2-GOAL5-C3-POSTQUOTE-TAPE "
         f"mint={_short(cand.mint)} full_mint={cand.mint} pass={int(pass_check)} reason={reason_out} "
         f"start_sig={cand.start_sig} follow_sigs={','.join(cand.follow_sigs)} "
         f"start_payer={cand.start_payer} follow_payers={','.join(cand.follow_payers)} "
         f"events_after_start={len(after_start)} hidden_buys={len(hidden_buys)} "
-        f"hidden_sol={hidden_sol:.6f} hidden_large={hidden_large} hidden_dust={hidden_dust} "
+        f"current_sol={current_sol:.6f} hidden_sol={hidden_sol:.6f} hidden_large={hidden_large} hidden_dust={hidden_dust} "
         f"sells_after_start={len(sells)} min_hidden_sol={float(args.c3_min_hidden_postfollow_sol):.6f} "
         f"min_hidden_large={int(args.c3_min_hidden_large_buys)} max_hidden_dust={int(args.c3_max_hidden_dust_buys)}"
+    )
+    return pass_check, reason_out
+
+
+def _clean_buy_train_tape_check(
+    args: argparse.Namespace,
+    cand: ScoutCandidate,
+    reason: str,
+    mint_hist: list[dict[str, Any]],
+) -> tuple[bool, str]:
+    if reason != "clean_buy_train_continuation" or not bool(args.clean_buy_train_tape_check_enabled):
+        return True, "not_buy_train"
+
+    start_ms = int(cand.start_ms)
+    max_age_ms = int(args.buy_train_tape_window_ms)
+    train_events = [
+        x
+        for x in mint_hist
+        if start_ms <= int(x.get("recv_ms") or 0)
+        and int(x.get("recv_ms") or 0) - start_ms <= max_age_ms
+    ]
+    buys = [x for x in train_events if x.get("kind") == "buy"]
+    sells = [x for x in train_events if x.get("kind") == "sell"]
+    buy_sol = sum(int(x.get("sol_lamports") or 0) for x in buys) / LAMPORTS_PER_SOL
+    follow_buy_sol = sum(int(x.get("sol_lamports") or 0) for x in buys if str(x.get("sig") or "") != str(cand.start_sig)) / LAMPORTS_PER_SOL
+    dust_max = float(args.buy_train_dust_buy_max_sol) * LAMPORTS_PER_SOL
+    large_min = float(args.buy_train_large_buy_min_sol) * LAMPORTS_PER_SOL
+    dust_buys = sum(1 for x in buys if int(x.get("sol_lamports") or 0) < dust_max)
+    large_buys = sum(1 for x in buys if int(x.get("sol_lamports") or 0) >= large_min)
+    payers = [str(x.get("fee_payer") or "") for x in buys if str(x.get("fee_payer") or "")]
+    unique_payers = len(set(payers))
+    top_payer_count = max((payers.count(p) for p in set(payers)), default=0)
+    pass_check = (
+        not sells
+        and len(buys) >= int(args.buy_train_min_total_buys)
+        and buy_sol >= float(args.buy_train_min_total_sol)
+        and follow_buy_sol >= float(args.buy_train_min_follow_sol)
+        and large_buys >= int(args.buy_train_min_large_buys)
+        and unique_payers >= int(args.buy_train_min_unique_payers)
+        and dust_buys <= int(args.buy_train_max_dust_buys)
+        and top_payer_count <= int(args.buy_train_max_top_payer_count)
+    )
+    reason_out = "buy_train_tape_ok" if pass_check else "buy_train_tape_block"
+    _log(
+        "PGG2-GOAL5-BUY-TRAIN-TAPE "
+        f"mint={_short(cand.mint)} full_mint={cand.mint} pass={int(pass_check)} reason={reason_out} "
+        f"start_sig={cand.start_sig} follow_sigs={','.join(cand.follow_sigs)} "
+        f"events={len(train_events)} buys={len(buys)} sells={len(sells)} "
+        f"buy_sol={buy_sol:.6f} follow_buy_sol={follow_buy_sol:.6f} "
+        f"large_buys={large_buys} dust_buys={dust_buys} unique_payers={unique_payers} "
+        f"top_payer_count={top_payer_count} min_total_buys={int(args.buy_train_min_total_buys)} "
+        f"min_total_sol={float(args.buy_train_min_total_sol):.6f} "
+        f"min_follow_sol={float(args.buy_train_min_follow_sol):.6f}"
     )
     return pass_check, reason_out
 
@@ -295,7 +413,10 @@ def _trade(
     current_sol = cand.current_lamports / LAMPORTS_PER_SOL
     first_follow_sol = cand.first_follow_lamports / LAMPORTS_PER_SOL
     follow_sol = cand.follow_lamports / LAMPORTS_PER_SOL
-    start_age_ms = _now_ms() - cand.start_ms
+    now_ms = _now_ms()
+    start_age_ms = now_ms - cand.start_ms
+    latest_follow_ms = cand.latest_follow_ms or cand.start_ms
+    latest_follow_age_ms = now_ms - latest_follow_ms
     _remember_feed_accounts(broker, cand.feed_rec)
 
     pre_allowed, pre_reason = _pre_shape_allowed(
@@ -305,6 +426,8 @@ def _trade(
         follow_sol,
         cand.follow_buys,
         start_age_ms,
+        latest_follow_age_ms,
+        cand.train_span_ms,
     )
     if not pre_allowed:
         counters[f"preauth_block_{pre_reason}"] += 1
@@ -313,17 +436,30 @@ def _trade(
             f"mint={_short(mint)} full_mint={mint} pass=0 reason={pre_reason} "
             f"current_sol={current_sol:.6f} first_follow_sol={first_follow_sol:.6f} "
             f"follow_sol={follow_sol:.6f} follow_buys={cand.follow_buys} "
-            f"start_age_ms={start_age_ms}"
+            f"start_age_ms={start_age_ms} latest_follow_age_ms={latest_follow_age_ms} "
+            f"train_span_ms={cand.train_span_ms}"
         )
         return False
 
     quote_start = _now_ms()
-    curve = broker.bonding_curve(as_pubkey(mint))
-    global_cfg = broker.pump_global()
-    spend_lamports = int(float(args.size_sol) * LAMPORTS_PER_SOL)
-    tokens_raw, buy_fee = broker.quote_pump_buy_tokens(spend_lamports, curve, global_cfg)
-    quote_tokens = float(broker.raw_to_ui(as_pubkey(mint), int(tokens_raw)))
-    quote_tokens_ref = _quote_ref_030(quote_tokens, float(args.size_sol))
+    try:
+        curve = broker.bonding_curve(as_pubkey(mint))
+        global_cfg = broker.pump_global()
+        spend_lamports = int(float(args.size_sol) * LAMPORTS_PER_SOL)
+        tokens_raw, buy_fee = broker.quote_pump_buy_tokens(spend_lamports, curve, global_cfg)
+        quote_tokens = float(broker.raw_to_ui(as_pubkey(mint), int(tokens_raw)))
+        quote_tokens_ref = _quote_ref_030(quote_tokens, float(args.size_sol))
+    except Exception as exc:
+        counters["auth_block_quote_error"] += 1
+        _log(
+            "PGG2-GOAL5-SCOUT-QUOTE-BLOCK "
+            f"mint={_short(mint)} full_mint={mint} reason=quote_error "
+            f"error={str(exc).replace(' ', '_')[:160]} "
+            f"pre_reason={pre_reason} start_age_ms={_now_ms() - cand.start_ms} "
+            f"prequote_start_age_ms={start_age_ms} latest_follow_age_ms={latest_follow_age_ms} "
+            f"train_span_ms={cand.train_span_ms}"
+        )
+        return False
     quote_latency_ms = _now_ms() - quote_start
     projected_sell_lamports = 0
     projected_sell_fee = 0
@@ -334,15 +470,16 @@ def _trade(
         + int(args.target_lamports)
     )
     projected_headroom = 0
-    if bool(args.scratch_midquote_enabled):
-        post_buy_curve = broker.simulate_post_buy_pump_curve(curve, int(tokens_raw))
-        projected_sell_lamports, projected_sell_fee = broker.quote_pump_sell_sol(
-            int(tokens_raw),
-            post_buy_curve,
-            global_cfg,
-        )
-        projected_headroom = int(projected_sell_lamports) - int(projected_cost_lamports)
-    send_start_age_ms = _now_ms() - cand.start_ms
+    post_buy_curve = broker.simulate_post_buy_pump_curve(curve, int(tokens_raw))
+    projected_sell_lamports, projected_sell_fee = broker.quote_pump_sell_sol(
+        int(tokens_raw),
+        post_buy_curve,
+        global_cfg,
+    )
+    projected_headroom = int(projected_sell_lamports) - int(projected_cost_lamports)
+    send_now_ms = _now_ms()
+    send_start_age_ms = send_now_ms - cand.start_ms
+    send_latest_follow_age_ms = send_now_ms - latest_follow_ms
     allowed, reason = _lane_allowed(
         args,
         current_sol,
@@ -352,6 +489,8 @@ def _trade(
         quote_tokens_ref,
         send_start_age_ms,
         projected_headroom,
+        send_latest_follow_age_ms,
+        cand.train_span_ms,
     )
     _log(
         "PGG2-GOAL5-SCOUT-AUTH "
@@ -362,7 +501,8 @@ def _trade(
         f"projected_sell={projected_sell_lamports} projected_sell_fee={projected_sell_fee} "
         f"projected_cost={projected_cost_lamports} projected_headroom={projected_headroom} "
         f"pre_reason={pre_reason} start_age_ms={send_start_age_ms} "
-        f"prequote_start_age_ms={start_age_ms} quote_latency_ms={quote_latency_ms}"
+        f"prequote_start_age_ms={start_age_ms} latest_follow_age_ms={send_latest_follow_age_ms} "
+        f"train_span_ms={cand.train_span_ms} quote_latency_ms={quote_latency_ms}"
     )
     if not allowed:
         counters[f"auth_block_{reason}"] += 1
@@ -373,26 +513,77 @@ def _trade(
     if not tape_ok:
         counters[f"auth_block_{tape_reason}"] += 1
         return False
+    train_ok, train_reason = _clean_buy_train_tape_check(args, cand, reason, mint_hist)
+    if not train_ok:
+        counters[f"auth_block_{train_reason}"] += 1
+        return False
+    send_curve = curve
+    send_tokens_raw = int(tokens_raw)
+    send_quote_tokens = float(quote_tokens)
+    send_buy_fee = int(buy_fee)
+    if bool(args.final_projection_check_enabled):
+        projection_start = _now_ms()
+        try:
+            final_curve = broker.bonding_curve(as_pubkey(mint))
+            final_tokens_raw, final_buy_fee = broker.quote_pump_buy_tokens(spend_lamports, final_curve, global_cfg)
+            final_quote_tokens = float(broker.raw_to_ui(as_pubkey(mint), int(final_tokens_raw)))
+            final_post_buy_curve = broker.simulate_post_buy_pump_curve(final_curve, int(final_tokens_raw))
+            final_sell_lamports, final_sell_fee = broker.quote_pump_sell_sol(
+                int(final_tokens_raw),
+                final_post_buy_curve,
+                global_cfg,
+            )
+        except Exception as exc:
+            counters["auth_block_final_projection_error"] += 1
+            _log(
+                "PGG2-GOAL5-SCOUT-FINAL-PROJECTION-BLOCK "
+                f"mint={_short(mint)} full_mint={mint} reason=projection_error "
+                f"error={str(exc).replace(' ', '_')[:160]}"
+            )
+            return False
+        final_cost = (
+            spend_lamports
+            + int(args.buy_tx_fee_est_lamports)
+            + int(args.sell_fee_est_lamports)
+            + int(args.target_lamports)
+        )
+        final_headroom = int(final_sell_lamports) - int(final_cost)
+        min_final_headroom = int(args.final_projection_min_headroom_lamports)
+        _log(
+            "PGG2-GOAL5-SCOUT-FINAL-PROJECTION "
+            f"mint={_short(mint)} full_mint={mint} pass={int(final_headroom >= min_final_headroom)} "
+            f"reason={reason} quote_tokens={final_quote_tokens:.6f} buy_fee={int(final_buy_fee)} "
+            f"projected_sell={int(final_sell_lamports)} projected_sell_fee={int(final_sell_fee)} "
+            f"projected_cost={int(final_cost)} projected_headroom={int(final_headroom)} "
+            f"min_headroom={min_final_headroom} latency_ms={_now_ms() - projection_start}"
+        )
+        if final_headroom < min_final_headroom:
+            counters["auth_block_final_projection_negative"] += 1
+            return False
+        send_curve = final_curve
+        send_tokens_raw = int(final_tokens_raw)
+        send_quote_tokens = float(final_quote_tokens)
+        send_buy_fee = int(final_buy_fee)
     if not args.live:
         counters["dry_ready"] += 1
         _log(f"PGG2-GOAL5-SCOUT-DRY-READY mint={_short(mint)} reason={reason} size_sol={args.size_sol:.6f}")
         return True
 
     wallet_before = _wallet_lamports(broker, "processed")
-    min_tokens_ui = quote_tokens * max(0.0, 1.0 - float(args.buy_slippage_pct) / 100.0)
+    min_tokens_ui = send_quote_tokens * max(0.0, 1.0 - float(args.buy_slippage_pct) / 100.0)
     buy_quote = broker.build_buy_with_min_tokens_from_curve_snapshot(
         mint,
         float(args.size_sol),
         min_tokens_ui,
-        virtual_token_reserves=int(curve.virtual_token_reserves),
-        virtual_sol_reserves=int(curve.virtual_sol_reserves),
-        real_token_reserves=int(curve.real_token_reserves),
-        real_sol_reserves=int(curve.real_sol_reserves),
-        token_total_supply=int(curve.token_total_supply),
-        complete=bool(curve.complete),
-        creator=str(curve.creator),
-        is_mayhem=bool(getattr(curve, "is_mayhem", False)),
-        cashback_enabled=bool(getattr(curve, "cashback_enabled", False)),
+        virtual_token_reserves=int(send_curve.virtual_token_reserves),
+        virtual_sol_reserves=int(send_curve.virtual_sol_reserves),
+        real_token_reserves=int(send_curve.real_token_reserves),
+        real_sol_reserves=int(send_curve.real_sol_reserves),
+        token_total_supply=int(send_curve.token_total_supply),
+        complete=bool(send_curve.complete),
+        creator=str(send_curve.creator),
+        is_mayhem=bool(getattr(send_curve, "is_mayhem", False)),
+        cashback_enabled=bool(getattr(send_curve, "cashback_enabled", False)),
         snapshot_ts_ms=_now_ms(),
     )
     signed_b64 = str(buy_quote.get("txn") or "")
@@ -401,7 +592,8 @@ def _trade(
     _log(
         "PGG2-GOAL5-SCOUT-BUY-SEND "
         f"mint={_short(mint)} reason={reason} wallet_before={wallet_before} "
-        f"size_sol={args.size_sol:.6f} quote_tokens={quote_tokens:.6f} min_tokens={min_tokens_ui:.6f}"
+        f"size_sol={args.size_sol:.6f} quote_tokens={send_quote_tokens:.6f} "
+        f"buy_fee={send_buy_fee} min_tokens={min_tokens_ui:.6f}"
     )
     buy_sent_ms = _now_ms()
     buy_sig = broker.send_signed(signed_b64)
@@ -421,7 +613,22 @@ def _trade(
     expected_out = 0
     min_needed = 0
     sell_attempts = 0
-    deadline = time.time() + max(0.4, float(args.max_hold_ms) / 1000.0)
+    buy_train_exit = reason == "clean_buy_train_continuation"
+    profit_headroom_lamports = (
+        int(args.buy_train_sell_min_headroom_lamports)
+        if buy_train_exit
+        else int(args.sell_min_headroom_lamports)
+    )
+    opened_at = time.time()
+    base_deadline = opened_at + max(0.4, float(args.max_hold_ms) / 1000.0)
+    hard_deadline = (
+        opened_at + max(float(args.max_hold_ms), float(args.buy_train_max_hold_ms)) / 1000.0
+        if buy_train_exit
+        else base_deadline
+    )
+    last_headroom: int | None = None
+    best_headroom = -10**18
+    last_improve_at = opened_at
     while True:
         token_after_poll = _token_balance_raw_or_zero(broker, mint, "processed")
         if token_after_poll > 0:
@@ -438,13 +645,43 @@ def _trade(
         quote = broker.build_sell(mint, token_ui, float(args.sell_slippage_pct))
         expected_out = int(float((quote.get("rate") or {}).get("amountOut") or 0.0) * LAMPORTS_PER_SOL)
         headroom = expected_out - min_needed
+        now = time.time()
+        with hist_lock:
+            post_buy_events = [
+                x
+                for x in list(hist.get(mint, ()))
+                if int(x.get("recv_ms") or 0) >= buy_sent_ms
+            ]
+        post_buy_sells = sum(1 for x in post_buy_events if x.get("kind") == "sell")
+        if last_headroom is None or headroom >= last_headroom + int(args.buy_train_improve_step_lamports):
+            last_improve_at = now
+        best_headroom = max(best_headroom, headroom)
+        last_headroom = headroom
         _log(
             "PGG2-GOAL5-SCOUT-SELL-CHECK "
             f"mint={_short(mint)} expected_out={expected_out} min_needed={min_needed} "
-            f"headroom={headroom} token_raw={token_raw}"
+            f"headroom={headroom} token_raw={token_raw} "
+            f"policy={'buy_train' if buy_train_exit else 'default'} "
+            f"profit_headroom={profit_headroom_lamports} post_buy_sells={post_buy_sells} "
+            f"best_headroom={best_headroom}"
         )
-        should_profit_sell = headroom >= int(args.sell_min_headroom_lamports)
-        should_rescue = time.time() >= deadline or headroom <= int(args.loss_rescue_headroom_lamports)
+        should_profit_sell = headroom >= profit_headroom_lamports
+        if buy_train_exit:
+            improving_recently = (now - last_improve_at) * 1000 <= int(args.buy_train_improve_grace_ms)
+            extend_ok = (
+                post_buy_sells <= 0
+                and headroom >= int(args.buy_train_extend_min_headroom_lamports)
+                and improving_recently
+                and now < hard_deadline
+            )
+            should_rescue = (
+                (post_buy_sells > 0 and bool(args.buy_train_exit_on_postbuy_sell))
+                or headroom <= int(args.loss_rescue_headroom_lamports)
+                or (now >= base_deadline and not extend_ok)
+                or now >= hard_deadline
+            )
+        else:
+            should_rescue = now >= base_deadline or headroom <= int(args.loss_rescue_headroom_lamports)
         if not should_profit_sell and not should_rescue:
             time.sleep(max(0.025, float(args.sell_poll_ms) / 1000.0))
             continue
@@ -503,7 +740,19 @@ def _self_test() -> int:
         small_size005_cur1_q900_follow_enabled=True,
         small_size005_c0_f22_multi_q900_enabled=True,
         small_size005_c3_f13_q720_enabled=True,
+        clean_buy_train_continuation_enabled=True,
+        buy_train_min_current_sol=0.25,
+        buy_train_max_current_sol=1.00,
+        buy_train_min_follow_buys=3,
+        buy_train_min_follow_sol=1.10,
+        buy_train_min_quote_tokens_ref=250_000.0,
+        buy_train_max_quote_tokens_ref=950_000.0,
+        buy_train_max_start_age_ms=220,
+        buy_train_max_follow_age_ms=220,
+        buy_train_max_train_span_ms=650,
         scratch_midquote_enabled=False,
+        scratch_midquote_min_quote_tokens_ref=680_000.0,
+        scratch_midquote_max_quote_tokens_ref=805_000.0,
         scratch_midquote_min_projected_headroom_lamports=250_000,
         early_cur1_q800_enabled=False,
         size_sol=0.005,
@@ -529,8 +778,14 @@ def _self_test() -> int:
         ("small005_c0_f22_b4", True, 0.850, 2.200, 2.477, 4, 895_619, 90),
         ("small005_c0_f22_b1_block", False, 0.850, 2.200, 2.200, 1, 936_893, 90),
         ("small005_c3_f13_q720", True, 3.300, 1.320, 1.320, 1, 735_495, 90),
+        ("small005_c3_f12_q670_shadow_pass", True, 3.300, 1.200, 1.200, 1, 670_173, 90),
+        ("small005_c3_current306_live_loss_block", False, 3.060, 1.244, 1.244, 1, 695_536, 90),
         ("small005_c3_f13_low_quote_block", False, 3.300, 1.320, 1.320, 1, 650_000, 90),
         ("small005_c3_f13_b2_block", False, 3.300, 1.320, 2.090, 2, 735_495, 90),
+        ("clean_buy_train_68gu_shape", True, 0.885938, 0.885938, 2.275875, 3, 520_000, 132),
+        ("clean_buy_train_b2_block", False, 0.885938, 0.885938, 1.771875, 2, 520_000, 76),
+        ("clean_buy_train_quote_low_block", False, 0.885938, 0.885938, 2.275875, 3, 200_000, 132),
+        ("clean_buy_train_current_high_block", False, 3.579950, 8.000000, 9.952000, 3, 520_000, 187),
         ("scratch_midquote_disabled", False, 0.700, 0.400, 0.400, 1, 694_463, 40, 655_995),
         ("early_cur1_q800_disabled", False, 1.250, 0.000, 0.000, 0, 856_000, 40),
         ("early_cur1_q900_mixed_block", False, 1.000, 0.000, 0.000, 0, 994_780, 40),
@@ -544,6 +799,53 @@ def _self_test() -> int:
         got, reason = _lane_allowed(ns, cur, first, follow, buys, quote, age, projected)
         print(f"{name} expected={int(expected)} got={int(got)} reason={reason}")
         ok = ok and got is expected
+    got, reason = _pre_shape_allowed(
+        ns,
+        0.398,
+        0.344,
+        2.6372,
+        14,
+        448,
+        latest_follow_age_ms=24,
+        train_span_ms=448,
+    )
+    print(f"clean_buy_train_fresh_follow_preauth expected=1 got={int(got)} reason={reason}")
+    ok = ok and got is True
+    got, reason = _lane_allowed(
+        ns,
+        0.398,
+        0.344,
+        2.6372,
+        14,
+        520_000,
+        560,
+        latest_follow_age_ms=118,
+        train_span_ms=560,
+    )
+    print(f"clean_buy_train_fresh_follow_auth expected=1 got={int(got)} reason={reason}")
+    ok = ok and got is True
+    ns.scratch_midquote_enabled = True
+    ns.scratch_midquote_min_quote_tokens_ref = 500_000.0
+    ns.scratch_midquote_max_quote_tokens_ref = 820_000.0
+    got, reason = _lane_allowed(ns, 0.700, 0.400, 0.400, 1, 694_463, 40, 655_995)
+    print(f"scratch_midquote_005_positive expected=1 got={int(got)} reason={reason}")
+    ok = ok and got is True
+    got, reason = _lane_allowed(ns, 0.700, 0.400, 0.400, 1, 694_463, 40, 240_000)
+    print(f"scratch_midquote_low_headroom_block expected=0 got={int(got)} reason={reason}")
+    ok = ok and got is False
+    ns.scratch_midquote_enabled = False
+    got, reason = _pre_shape_allowed(
+        ns,
+        0.398,
+        0.344,
+        2.6372,
+        14,
+        820,
+        latest_follow_age_ms=24,
+        train_span_ms=820,
+    )
+    print(f"clean_buy_train_span_block expected=0 got={int(got)} reason={reason}")
+    ok = ok and got is False
     tape_ns = argparse.Namespace(
         c3_postquote_tape_check_enabled=True,
         c3_postquote_tape_window_ms=650,
@@ -552,6 +854,17 @@ def _self_test() -> int:
         c3_large_buy_min_sol=0.30,
         c3_dust_buy_max_sol=0.10,
         c3_max_hidden_dust_buys=2,
+        clean_buy_train_tape_check_enabled=True,
+        buy_train_tape_window_ms=650,
+        buy_train_min_total_buys=4,
+        buy_train_min_total_sol=2.40,
+        buy_train_min_follow_sol=1.10,
+        buy_train_min_large_buys=4,
+        buy_train_large_buy_min_sol=0.25,
+        buy_train_min_unique_payers=4,
+        buy_train_dust_buy_max_sol=0.10,
+        buy_train_max_dust_buys=1,
+        buy_train_max_top_payer_count=4,
     )
     base_ms = _now_ms() - 100
     c3_cand = ScoutCandidate(
@@ -592,11 +905,86 @@ def _self_test() -> int:
         buy("d4", 0.06, 70),
         buy("h3", 0.189731, 80),
     ]
+    mid_clean_hist = [
+        buy("start", 3.3, 0),
+        buy("follow", 1.32, 10),
+        buy("h1", 1.21, 25),
+        buy("h2", 0.88, 40),
+    ]
+    high_total_low_dust_hist = [
+        buy("start", 3.3, 0),
+        buy("follow", 1.32, 10),
+        buy("h1", 1.65, 25),
+        buy("h2", 1.98, 45),
+        buy("d1", 0.002, 80),
+    ]
     for name, expected, hist_rows in [
         ("c3_tape_9yY4_style_pass", True, win_hist),
         ("c3_tape_AJq6_style_block", False, loss_hist),
+        ("c3_tape_mid_clean_7Snr_style_pass", True, mid_clean_hist),
+        ("c3_tape_83WE_style_pass", True, high_total_low_dust_hist),
     ]:
         got, reason = _c3_postquote_tape_check(tape_ns, c3_cand, "small005_c3_f13_q720", hist_rows)
+        print(f"{name} expected={int(expected)} got={int(got)} reason={reason}")
+        ok = ok and got is expected
+    c3_low_current_cand = ScoutCandidate(
+        mint="LowCurrentC3Pump",
+        start_ms=base_ms,
+        current_lamports=int(3.06 * LAMPORTS_PER_SOL),
+        first_follow_lamports=int(1.2444 * LAMPORTS_PER_SOL),
+        follow_lamports=int(1.2444 * LAMPORTS_PER_SOL),
+        follow_buys=1,
+        start_sig="start",
+        start_payer="payer_start",
+        feed_rec={},
+        follow_sigs=["follow"],
+        follow_payers=["payer_follow"],
+    )
+    low_current_hist = [
+        buy("start", 3.06, 0),
+        buy("follow", 1.2444, 10),
+        buy("h1", 1.2240, 40),
+    ]
+    got, reason = _c3_postquote_tape_check(
+        tape_ns,
+        c3_low_current_cand,
+        "small005_c3_f13_q720",
+        low_current_hist,
+    )
+    print(f"c3_tape_low_current_live_loss_block expected=0 got={int(got)} reason={reason}")
+    ok = ok and got is False
+    train_cand = ScoutCandidate(
+        mint="TrainUnitPump",
+        start_ms=base_ms,
+        current_lamports=int(0.885938 * LAMPORTS_PER_SOL),
+        first_follow_lamports=int(0.885938 * LAMPORTS_PER_SOL),
+        follow_lamports=int(2.275875 * LAMPORTS_PER_SOL),
+        follow_buys=3,
+        start_sig="s0",
+        start_payer="p0",
+        feed_rec={},
+        follow_sigs=["s1", "s2", "s3"],
+        follow_payers=["p1", "p2", "p3"],
+    )
+    train_pass_hist = [
+        {"kind": "buy", "sig": "s0", "sol_lamports": int(0.885938 * LAMPORTS_PER_SOL), "recv_ms": base_ms, "fee_payer": "p0"},
+        {"kind": "buy", "sig": "s1", "sol_lamports": int(0.885938 * LAMPORTS_PER_SOL), "recv_ms": base_ms + 20, "fee_payer": "p1"},
+        {"kind": "buy", "sig": "s2", "sol_lamports": int(0.504000 * LAMPORTS_PER_SOL), "recv_ms": base_ms + 45, "fee_payer": "p2"},
+        {"kind": "buy", "sig": "s3", "sol_lamports": int(0.379688 * LAMPORTS_PER_SOL), "recv_ms": base_ms + 75, "fee_payer": "p3"},
+    ]
+    train_sell_hist = train_pass_hist + [
+        {"kind": "sell", "sig": "sell0", "sol_lamports": 0, "recv_ms": base_ms + 90, "fee_payer": "p4"}
+    ]
+    train_dust_hist = train_pass_hist[:2] + [
+        {"kind": "buy", "sig": "d0", "sol_lamports": int(0.05 * LAMPORTS_PER_SOL), "recv_ms": base_ms + 45, "fee_payer": "p2"},
+        {"kind": "buy", "sig": "d1", "sol_lamports": int(0.05 * LAMPORTS_PER_SOL), "recv_ms": base_ms + 75, "fee_payer": "p3"},
+    ]
+    for name, expected, hist_rows in [
+        ("buy_train_tape_68gu_style_pass", True, train_pass_hist),
+        ("buy_train_tape_sell_block", False, train_sell_hist),
+        ("buy_train_tape_dust_block", False, train_dust_hist),
+    ]:
+        got, reason = _clean_buy_train_tape_check(tape_ns, train_cand, "clean_buy_train_continuation", hist_rows)
         print(f"{name} expected={int(expected)} got={int(got)} reason={reason}")
         ok = ok and got is expected
     print("GOAL5_SPEED_SCOUT_SELF_TEST_OK" if ok else "GOAL5_SPEED_SCOUT_SELF_TEST_FAIL")
@@ -641,14 +1029,25 @@ def run(args: argparse.Namespace) -> int:
         f"small005_cur1_q900={int(args.small_size005_cur1_q900_follow_enabled)} "
         f"small005_c0_f22_multi={int(args.small_size005_c0_f22_multi_q900_enabled)} "
         f"small005_c3_f13={int(args.small_size005_c3_f13_q720_enabled)} "
+        f"clean_buy_train={int(args.clean_buy_train_continuation_enabled)} "
         f"scratch_midquote={int(args.scratch_midquote_enabled)} "
+        f"scratch_midquote_quote=[{args.scratch_midquote_min_quote_tokens_ref:.0f},{args.scratch_midquote_max_quote_tokens_ref:.0f}] "
         f"scratch_midquote_min_headroom={args.scratch_midquote_min_projected_headroom_lamports} "
         f"early_cur1_q800={int(args.early_cur1_q800_enabled)} "
         f"fresh_start_no_prior_buy_ms={args.fresh_start_no_prior_buy_ms} "
         f"max_prequote_start_age_ms={args.max_prequote_start_age_ms} "
         f"max_send_start_age_ms={args.max_send_start_age_ms} "
         f"sell_min_headroom={args.sell_min_headroom_lamports} max_hold_ms={args.max_hold_ms} "
-        f"c3_tape_check={int(args.c3_postquote_tape_check_enabled)}"
+        f"c3_tape_check={int(args.c3_postquote_tape_check_enabled)} "
+        f"buy_train_quote_ref=[{args.buy_train_min_quote_tokens_ref:.0f},{args.buy_train_max_quote_tokens_ref:.0f}] "
+        f"buy_train_max_follow_age_ms={args.buy_train_max_follow_age_ms} "
+        f"buy_train_max_train_span_ms={args.buy_train_max_train_span_ms} "
+        f"buy_train_tape_check={int(args.clean_buy_train_tape_check_enabled)} "
+        f"buy_train_sell_headroom={args.buy_train_sell_min_headroom_lamports} "
+        f"buy_train_max_hold_ms={args.buy_train_max_hold_ms} "
+        f"buy_train_extend_min_headroom={args.buy_train_extend_min_headroom_lamports} "
+        f"final_projection_check={int(args.final_projection_check_enabled)} "
+        f"final_projection_min_headroom={args.final_projection_min_headroom_lamports}"
     )
 
     def feed_reader() -> None:
@@ -715,6 +1114,8 @@ def run(args: argparse.Namespace) -> int:
                             start_sig=sig,
                             start_payer=str(rec.get("fee_payer") or ""),
                             feed_rec=dict(rec),
+                            latest_follow_ms=int(rec.get("recv_ms") or now),
+                            train_span_ms=0,
                         )
                     )
 
@@ -742,6 +1143,8 @@ def run(args: argparse.Namespace) -> int:
                 if not follow_buys:
                     block = "no_follow"
                     continue
+                follow_recv_times = [int(x.get("recv_ms") or now) for x in follow_buys]
+                latest_follow_ms = max(follow_recv_times) if follow_recv_times else now
                 candidates.append(
                     ScoutCandidate(
                         mint=mint,
@@ -755,6 +1158,8 @@ def run(args: argparse.Namespace) -> int:
                         feed_rec=dict(start),
                         follow_sigs=[str(x.get("sig") or "") for x in follow_buys],
                         follow_payers=[str(x.get("fee_payer") or "") for x in follow_buys],
+                        latest_follow_ms=latest_follow_ms,
+                        train_span_ms=max(0, latest_follow_ms - start_ms),
                     )
                 )
             if not candidates:
@@ -809,7 +1214,37 @@ def main() -> int:
     ap.add_argument("--small-size005-cur1-q900-follow-enabled", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--small-size005-c0-f22-multi-q900-enabled", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--small-size005-c3-f13-q720-enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--clean-buy-train-continuation-enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--buy-train-min-current-sol", type=float, default=0.25)
+    ap.add_argument("--buy-train-max-current-sol", type=float, default=1.00)
+    ap.add_argument("--buy-train-min-follow-buys", type=int, default=3)
+    ap.add_argument("--buy-train-min-follow-sol", type=float, default=1.10)
+    ap.add_argument("--buy-train-max-start-age-ms", type=int, default=220)
+    ap.add_argument("--buy-train-max-follow-age-ms", type=int, default=220)
+    ap.add_argument("--buy-train-max-train-span-ms", type=int, default=650)
+    ap.add_argument("--buy-train-min-quote-tokens-ref", type=float, default=250_000.0)
+    ap.add_argument("--buy-train-max-quote-tokens-ref", type=float, default=950_000.0)
+    ap.add_argument("--clean-buy-train-tape-check-enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--buy-train-tape-window-ms", type=int, default=650)
+    ap.add_argument("--buy-train-min-total-buys", type=int, default=4)
+    ap.add_argument("--buy-train-min-total-sol", type=float, default=2.40)
+    ap.add_argument("--buy-train-min-large-buys", type=int, default=4)
+    ap.add_argument("--buy-train-large-buy-min-sol", type=float, default=0.25)
+    ap.add_argument("--buy-train-min-unique-payers", type=int, default=4)
+    ap.add_argument("--buy-train-dust-buy-max-sol", type=float, default=0.10)
+    ap.add_argument("--buy-train-max-dust-buys", type=int, default=1)
+    ap.add_argument("--buy-train-max-top-payer-count", type=int, default=4)
+    ap.add_argument("--buy-train-sell-min-headroom-lamports", type=int, default=20_000)
+    ap.add_argument("--buy-train-max-hold-ms", type=int, default=5200)
+    ap.add_argument("--buy-train-extend-min-headroom-lamports", type=int, default=-180_000)
+    ap.add_argument("--buy-train-improve-step-lamports", type=int, default=5_000)
+    ap.add_argument("--buy-train-improve-grace-ms", type=int, default=900)
+    ap.add_argument("--buy-train-exit-on-postbuy-sell", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--final-projection-check-enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--final-projection-min-headroom-lamports", type=int, default=0)
     ap.add_argument("--scratch-midquote-enabled", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--scratch-midquote-min-quote-tokens-ref", type=float, default=680_000.0)
+    ap.add_argument("--scratch-midquote-max-quote-tokens-ref", type=float, default=805_000.0)
     ap.add_argument("--scratch-midquote-min-projected-headroom-lamports", type=int, default=250_000)
     ap.add_argument("--early-cur1-q800-enabled", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--buy-slippage-pct", type=float, default=8.0)

@@ -1,0 +1,157 @@
+# Goal5 Frozen Live Smoke Manual
+
+This file is the checkpoint for the current working Goal5 live lane. Read this before touching code or running live.
+
+## Frozen Files
+
+Commit and deploy these files together:
+
+- `pgg2_goal5_speed_scout.py` - the live smoke runner.
+- `pgg2_goal5_standalone.py` - feed, wallet, broker, quote, sell, and verification helpers.
+- `pgg2_direct_pump.py` - direct pump buy/sell execution helper.
+
+Do not use the old V287/V288 engine for this lane. Do not add broad gates or mint-specific patches before running the frozen smoke.
+
+## What Worked
+
+The current frozen config moved away from the oversized V287 authority file and uses a small latency-first Goal5 runner. The main working behavior is:
+
+- PublicNode Yellowstone feed observes pump.fun flow.
+- The runner only sends on narrow Goal5 lane shapes.
+- Current best repeated lane: `small005_c3_f13_q720`.
+- The latest strong win came from `cur1_q600_clean_follow`.
+- Size is `0.005 SOL`.
+- The run stops after one completed close by default.
+- Sell requires positive headroom and closes the token account.
+- `pgg2_direct_pump.py` refreshes the pump curve before snapshot buy and blocks stale min-token buys when the fresh quote cannot satisfy the min.
+
+Recent live evidence on this frozen command:
+
+- `goal5_c3hightotal_live_smoke5_20260609_125620.log`: clean win, `+386021` lamports, no token residual.
+- `goal5_repeat_c3hightotal_live_smoke5_20260609_130241.log`: clean win, `+389064` lamports, no token residual.
+- `goal5_repeat2_c3hightotal_live_smoke5_20260609_130609.log`: clean no-trade timeout, no spend.
+- `goal5_c3hightotal_live_smoke20_20260609_131523.log`: clean win, `+387544` lamports, no token residual.
+- `goal5_c3hightotal_live_smoke20_20260609_133248.log`: clean no-trade timeout, no spend.
+- `goal5_c3hightotal_live_smoke60_20260609_135558.log`: clean win, `+2246967` lamports, no token residual.
+
+Current frozen record at the time this manual was written: 4 clean wins, 2 clean no-trade timeouts, 0 failed-buy fee burns, 0 realized losses, 0 stuck tokens.
+
+## Exact Live Command
+
+Run from `/root/piggy` on Hetzner. This is a max-duration smoke; it stops early after one close.
+
+```bash
+runid=$(date +%Y%m%d_%H%M%S)
+log=logs/goal5_c3hightotal_live_smoke60_${runid}.log
+echo "$log" > current_goal5_smoke_log.txt
+echo "$runid" > goal5_speed_scout_latest_runid.txt
+setsid /root/piggy/venv/bin/python -u pgg2_goal5_speed_scout.py \
+  --live \
+  --seconds 3600 \
+  --size-sol 0.005 \
+  --target-closes 1 \
+  --no-proven-strong-enabled \
+  --no-micro-c0-highquote-enabled \
+  --cur1-q600-clean-follow-enabled \
+  --no-small-size005-cur1-q900-follow-enabled \
+  --no-small-size005-c0-f22-multi-q900-enabled \
+  --small-size005-c3-f13-q720-enabled \
+  --no-clean-buy-train-continuation-enabled \
+  --no-scratch-midquote-enabled \
+  --no-early-cur1-q800-enabled \
+  --no-final-projection-check-enabled \
+  --sell-min-headroom-lamports 150000 \
+  --loss-rescue-headroom-lamports -250000 \
+  --max-hold-ms 2800 \
+  --max-send-start-age-ms 420 \
+  --max-prequote-start-age-ms 250 \
+  > "$log" 2>&1 < /dev/null &
+echo $! > goal5_speed_scout_latest_pid.txt
+```
+
+For a 20-minute smoke, change only `--seconds 3600` to `--seconds 1200`.
+
+For a 5-minute smoke, change only `--seconds 3600` to `--seconds 300`.
+
+## Required Pre-Run Checks
+
+Do these before every live smoke:
+
+```bash
+cd /root/piggy
+ps aux | grep -E "pgg2_goal5|goal5_speed|python.*goal5|pgg2_v287|python.*v287" | grep -v grep || echo no_bot_process
+/root/piggy/venv/bin/python v246_wallet_check.py
+/root/piggy/venv/bin/python -m py_compile pgg2_goal5_speed_scout.py pgg2_goal5_standalone.py pgg2_direct_pump.py
+```
+
+Expected clean state:
+
+- No bot process.
+- Wallet has SOL.
+- `token_accounts=0`.
+- `nonzero_tokens=0`.
+- Compile exits with no output.
+
+## Monitoring Command
+
+```bash
+cd /root/piggy
+log=$(cat current_goal5_smoke_log.txt)
+echo LOG=$log
+printf "preauth_pass0="; grep -c "PGG2-GOAL5-SCOUT-PREAUTH.*pass=0" "$log" || true
+printf "auth_pass0="; grep -c "PGG2-GOAL5-SCOUT-AUTH.*pass=0" "$log" || true
+printf "auth_pass1="; grep -c "PGG2-GOAL5-SCOUT-AUTH.*pass=1" "$log" || true
+printf "buy="; grep -c "PGG2-GOAL5-SCOUT-BUY" "$log" || true
+printf "sell="; grep -c "PGG2-GOAL5-SCOUT-SELL" "$log" || true
+printf "buy_failed="; grep -c "PGG2-GOAL5-SCOUT-BUY-FAILED" "$log" || true
+grep -E "PGG2-GOAL5-(SCOUT-(AUTH|BUY|SELL|BUY-FAILED|FINAL)|C3-POSTQUOTE-TAPE)|PGG2-DIRECT-SNAPSHOT-BUY-CURVE-REFRESH" "$log" | tail -160 || true
+/root/piggy/venv/bin/python v246_wallet_check.py
+```
+
+## Final Verification
+
+After the process exits:
+
+```bash
+cd /root/piggy
+log=$(cat current_goal5_smoke_log.txt)
+grep -E "PGG2-GOAL5-(SCOUT-(AUTH|BUY|SELL|BUY-FAILED|FINAL)|C3-POSTQUOTE-TAPE)|PGG2-DIRECT-SNAPSHOT-BUY-CURVE-REFRESH" "$log" | tail -220 || true
+ps aux | grep -E "pgg2_goal5|goal5_speed|python.*goal5" | grep -v grep || echo no_goal5_process
+/root/piggy/venv/bin/python v246_wallet_check.py
+```
+
+A clean outcome is one of:
+
+- `closed=1 win=1`, wallet increased, token accounts `0`.
+- `timeout=1`, wallet unchanged, token accounts `0`.
+
+Bad outcomes to stop and investigate:
+
+- `PGG2-GOAL5-SCOUT-BUY-FAILED`.
+- Wallet delta negative.
+- `token_accounts` nonzero after final verification.
+- Any live V287/V288 process running.
+
+## Deployment From Local Checkout
+
+If the remote is stale, copy only the frozen files:
+
+```bash
+scp -i "$USERPROFILE/.ssh/hetzner_sniper" pgg2_goal5_speed_scout.py pgg2_goal5_standalone.py pgg2_direct_pump.py root@87.99.151.70:/root/piggy/
+ssh -i "$USERPROFILE/.ssh/hetzner_sniper" root@87.99.151.70 "cd /root/piggy && /root/piggy/venv/bin/python -m py_compile pgg2_goal5_speed_scout.py pgg2_goal5_standalone.py pgg2_direct_pump.py"
+```
+
+On Windows PowerShell, prefer this SSH key path:
+
+```powershell
+$env:USERPROFILE\.ssh\hetzner_sniper
+```
+
+## Future-Agent Rules
+
+- Run the frozen command first before changing code.
+- Do not widen the live send authority just because a smoke times out.
+- Do not revive the giant V287/V288 authority files for this Goal5 lane.
+- Do not commit logs, wallet files, `.env`, keypairs, or random analysis artifacts.
+- If code must change, keep it in the three frozen files and rerun `py_compile` plus a short smoke.
+- Preserve the safety properties: no failed-buy fee burns, no stuck token accounts, no negative close.

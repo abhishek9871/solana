@@ -1952,10 +1952,53 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             )
             if curve.complete:
                 raise RuntimeError("snapshot_explicit_min_tokens_only_supports_pump_bc")
+            snapshot_creator = curve.creator
+            if env_bool("PGG2_DIRECT_REFRESH_CURVE_BEFORE_SNAPSHOT_BUY", True):
+                try:
+                    fresh_curve = self.bonding_curve(mint)
+                except Exception as refresh_exc:
+                    if env_bool("PGG2_DIRECT_REQUIRE_FRESH_CURVE_BEFORE_SNAPSHOT_BUY", True):
+                        raise RuntimeError(
+                            f"snapshot_fresh_curve_before_buy_failed:{type(refresh_exc).__name__}:{refresh_exc}"
+                        ) from refresh_exc
+                    fresh_curve = curve
+                if fresh_curve.complete:
+                    raise RuntimeError("snapshot_fresh_curve_complete_before_buy")
+                if (
+                    fresh_curve.creator != curve.creator
+                    or fresh_curve.virtual_token_reserves != curve.virtual_token_reserves
+                    or fresh_curve.virtual_sol_reserves != curve.virtual_sol_reserves
+                    or fresh_curve.real_token_reserves != curve.real_token_reserves
+                    or fresh_curve.real_sol_reserves != curve.real_sol_reserves
+                    or fresh_curve.token_total_supply != curve.token_total_supply
+                    or fresh_curve.is_mayhem != curve.is_mayhem
+                    or fresh_curve.cashback_enabled != curve.cashback_enabled
+                ):
+                    old_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(curve.creator))
+                    new_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(fresh_curve.creator))
+                    log(
+                        f"PGG2-DIRECT-SNAPSHOT-BUY-CURVE-REFRESH mint={short_addr(mint_str)} "
+                        f"creator_changed={int(fresh_curve.creator != curve.creator)} "
+                        f"snapshot_creator={short_addr(str(snapshot_creator))} "
+                        f"fresh_creator={short_addr(str(fresh_curve.creator))} "
+                        f"snapshot_creator_vault={short_addr(str(old_vault))} "
+                        f"fresh_creator_vault={short_addr(str(new_vault))}"
+                    )
+                    curve = fresh_curve
             global_cfg = self.pump_global()
             spend_lamports = max(1, int(amount_sol * LAMPORTS_PER_SOL))
             token_out, fee_lamports = self.quote_pump_buy_tokens(spend_lamports, curve, global_cfg)
             min_tokens_out = max(0, self.ui_to_raw(mint, min_tokens_ui))
+            if (
+                env_bool("PGG2_DIRECT_BLOCK_SNAPSHOT_BUY_IF_MIN_GT_FRESH_QUOTE", True)
+                and min_tokens_out > token_out
+            ):
+                log(
+                    f"PGG2-DIRECT-SNAPSHOT-BUY-MIN-TOKENS-BLOCK mint={short_addr(mint_str)} "
+                    f"min_tokens_raw={min_tokens_out} fresh_quote_tokens_raw={token_out} "
+                    f"creator={short_addr(str(curve.creator))}"
+                )
+                raise RuntimeError("snapshot_buy_min_tokens_exceeds_fresh_quote")
             token_program = self.mint_owner(mint)
             user = as_pubkey(self.public_key)
             user_ata = get_associated_token_address(user, mint, token_program)
@@ -1998,6 +2041,7 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
                 f"in={amount_sol:.6f} out={out_ui:.6f} min={min_ui:.6f} "
                 f"fee_bps={global_cfg.fee_bps + global_cfg.creator_fee_bps} fee={fee_sol:.6f} "
                 f"explicit_min_tokens=1 source=decision_curve_snapshot "
+                f"creator_vault={short_addr(str(creator_vault))} "
                 f"snapshot_age_ms={max(0, int(time.time() * 1000) - int(snapshot_ts_ms or 0)) if snapshot_ts_ms else -1}"
             )
             _qend_ms = int(time.time() * 1000)
