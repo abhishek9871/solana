@@ -30,6 +30,7 @@ The current frozen config moved away from the oversized V287 authority file and 
 - After `goal5_c3hightotal_live_smoke60_20260609_151801.log`, `cur1_q600_clean_follow` also requires `train_span_ms <= 25` so delayed-follow cur1 rows like `2Hur..pump` do not fire. This does not touch `small005_c3_f13_q720`.
 - The same 60-minute log showed the frequency miss was C3-adjacent, not cur1: `small005_c3_f13_q720` had zero exact rows, while 18 fast C3 strong-follow rows across 12 mints had `current=3.00..3.40`, `first_follow=1.45..2.20`, `follow_buys=1..3`, and `train_span_ms<=25`. These now use the separate `small005_c3_strong_fast_follow` lane and must pass the existing C3 postquote tape before sending.
 - After `goal5_c3strongfast_live_smoke10_20260609_161800.log`, C3 rows around `761k` quote-ref were shown to be overblocked by the old `760k` cap, so C3 auth now allows up to `765k`. The same run also proved the C3 fast path can hit Pump `6042` buy slippage after tape; C3 buys now use `--c3-buy-slippage-pct 16.0` while other lanes still use `--buy-slippage-pct 8.0`.
+- After `goal5_batch1_smoke2_20260609_165100.log`, `c3_tape_mid_clean_ok` was proven unsafe: `9PrU..pump` had only `2.574 SOL` hidden continuation with `2` large buys and immediately opened with negative sell headroom, closing at `-1,087,532` lamports. C3 mid-clean tape is now disabled by default; C3 sends require the stronger `c3_tape_ok` or `c3_tape_high_total_low_dust_ok` paths.
 - Size is `0.005 SOL`.
 - The run stops after one completed close by default.
 - Sell requires positive headroom and closes the token account.
@@ -75,6 +76,7 @@ setsid /root/piggy/venv/bin/python -u pgg2_goal5_speed_scout.py \
   --no-final-projection-check-enabled \
   --buy-slippage-pct 8.0 \
   --c3-buy-slippage-pct 16.0 \
+  --no-c3-mid-clean-tape-enabled \
   --sell-min-headroom-lamports 150000 \
   --loss-rescue-headroom-lamports -250000 \
   --max-hold-ms 2800 \

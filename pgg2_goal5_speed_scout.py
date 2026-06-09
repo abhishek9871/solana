@@ -354,6 +354,7 @@ def _c3_postquote_tape_check(
         and hidden_sol >= 2.00
         and hidden_large >= 2
         and hidden_dust == 0
+        and bool(getattr(args, "c3_mid_clean_tape_enabled", False))
     )
     high_total_low_dust_pass = (
         not pass_check
@@ -913,6 +914,7 @@ def _self_test() -> int:
         c3_postquote_tape_window_ms=650,
         c3_min_hidden_postfollow_sol=3.0,
         c3_min_hidden_large_buys=3,
+        c3_mid_clean_tape_enabled=False,
         c3_large_buy_min_sol=0.30,
         c3_dust_buy_max_sol=0.10,
         c3_max_hidden_dust_buys=2,
@@ -983,7 +985,7 @@ def _self_test() -> int:
     for name, expected, hist_rows in [
         ("c3_tape_9yY4_style_pass", True, win_hist),
         ("c3_tape_AJq6_style_block", False, loss_hist),
-        ("c3_tape_mid_clean_7Snr_style_pass", True, mid_clean_hist),
+        ("c3_tape_mid_clean_9PrU_style_block", False, mid_clean_hist),
         ("c3_tape_83WE_style_pass", True, high_total_low_dust_hist),
     ]:
         got, reason = _c3_postquote_tape_check(tape_ns, c3_cand, "small005_c3_f13_q720", hist_rows)
@@ -1014,8 +1016,8 @@ def _self_test() -> int:
         "small005_c3_strong_fast_follow",
         strong_c3_hist,
     )
-    print(f"c3_tape_strong_fast_mid_clean_pass expected=1 got={int(got)} reason={reason}")
-    ok = ok and got is True
+    print(f"c3_tape_strong_fast_mid_clean_block expected=0 got={int(got)} reason={reason}")
+    ok = ok and got is False
     c3_low_current_cand = ScoutCandidate(
         mint="LowCurrentC3Pump",
         start_ms=base_ms,
@@ -1132,6 +1134,7 @@ def run(args: argparse.Namespace) -> int:
         f"sell_min_headroom={args.sell_min_headroom_lamports} max_hold_ms={args.max_hold_ms} "
         f"buy_slippage_pct={args.buy_slippage_pct:.3f} c3_buy_slippage_pct={args.c3_buy_slippage_pct:.3f} "
         f"c3_tape_check={int(args.c3_postquote_tape_check_enabled)} "
+        f"c3_mid_clean_tape={int(args.c3_mid_clean_tape_enabled)} "
         f"buy_train_quote_ref=[{args.buy_train_min_quote_tokens_ref:.0f},{args.buy_train_max_quote_tokens_ref:.0f}] "
         f"buy_train_max_follow_age_ms={args.buy_train_max_follow_age_ms} "
         f"buy_train_max_train_span_ms={args.buy_train_max_train_span_ms} "
@@ -1365,6 +1368,7 @@ def main() -> int:
     ap.add_argument("--c3-postquote-tape-window-ms", type=int, default=650)
     ap.add_argument("--c3-min-hidden-postfollow-sol", type=float, default=3.0)
     ap.add_argument("--c3-min-hidden-large-buys", type=int, default=3)
+    ap.add_argument("--c3-mid-clean-tape-enabled", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--c3-large-buy-min-sol", type=float, default=0.30)
     ap.add_argument("--c3-dust-buy-max-sol", type=float, default=0.10)
     ap.add_argument("--c3-max-hidden-dust-buys", type=int, default=2)
