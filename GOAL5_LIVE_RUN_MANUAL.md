@@ -9,6 +9,12 @@ Commit and deploy these files together:
 - `pgg2_goal5_speed_scout.py` - the live smoke runner.
 - `pgg2_goal5_standalone.py` - feed, wallet, broker, quote, sell, and verification helpers.
 - `pgg2_direct_pump.py` - direct pump buy/sell execution helper.
+- `pgg2_live_raptor.py` - RPC/keypair/send broker used by the direct pump helper.
+- `birth_first_sniper.py` - shared config/env/log/pubkey helpers used by the broker stack.
+- `pgg2_v74_sender_adapter.py` - optional Helius Sender adapter if the env enables it.
+- `pgg2_v75_sender_tx_builder.py` - optional Sender tip builder if the env enables Sender.
+- `v246_wallet_check.py` - wallet/token verification.
+- `yellowstone_proto/` - generated PublicNode Yellowstone gRPC protobuf files.
 
 Do not use the old V287/V288 engine for this lane. Do not add broad gates or mint-specific patches before running the frozen smoke.
 
@@ -137,8 +143,9 @@ Bad outcomes to stop and investigate:
 If the remote is stale, copy only the frozen files:
 
 ```bash
-scp -i "$USERPROFILE/.ssh/hetzner_sniper" pgg2_goal5_speed_scout.py pgg2_goal5_standalone.py pgg2_direct_pump.py root@87.99.151.70:/root/piggy/
-ssh -i "$USERPROFILE/.ssh/hetzner_sniper" root@87.99.151.70 "cd /root/piggy && /root/piggy/venv/bin/python -m py_compile pgg2_goal5_speed_scout.py pgg2_goal5_standalone.py pgg2_direct_pump.py"
+scp -i "$USERPROFILE/.ssh/hetzner_sniper" pgg2_goal5_speed_scout.py pgg2_goal5_standalone.py pgg2_direct_pump.py pgg2_live_raptor.py birth_first_sniper.py pgg2_v74_sender_adapter.py pgg2_v75_sender_tx_builder.py v246_wallet_check.py GOAL5_LIVE_RUN_MANUAL.md root@87.99.151.70:/root/piggy/
+scp -i "$USERPROFILE/.ssh/hetzner_sniper" -r yellowstone_proto root@87.99.151.70:/root/piggy/
+ssh -i "$USERPROFILE/.ssh/hetzner_sniper" root@87.99.151.70 "cd /root/piggy && /root/piggy/venv/bin/python -m py_compile pgg2_goal5_speed_scout.py pgg2_goal5_standalone.py pgg2_direct_pump.py pgg2_live_raptor.py birth_first_sniper.py pgg2_v74_sender_adapter.py pgg2_v75_sender_tx_builder.py v246_wallet_check.py"
 ```
 
 On Windows PowerShell, prefer this SSH key path:
