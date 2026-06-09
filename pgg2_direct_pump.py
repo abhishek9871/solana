@@ -2019,6 +2019,21 @@ class DirectPumpQuoteBroker(RaptorLiveBroker):
             user_ata = get_associated_token_address(user, mint, token_program)
             associated_curve = get_associated_token_address(curve.key, mint, token_program)
             creator_vault = pda(PUMP_PROGRAM_ID, b"creator-vault", bytes(curve.creator))
+            creator_vault_source = "curve_creator"
+            creator_vault_override = self._pump_creator_vault_override.get(str(mint), "")
+            if creator_vault_override:
+                try:
+                    override_vault = as_pubkey(creator_vault_override)
+                    if override_vault != creator_vault:
+                        log(
+                            f"PGG2-DIRECT-SNAPSHOT-BUY-CREATOR-VAULT-OVERRIDE mint={short_addr(mint_str)} "
+                            f"curve_creator_vault={short_addr(str(creator_vault))} "
+                            f"feed_creator_vault={short_addr(str(override_vault))}"
+                        )
+                    creator_vault = override_vault
+                    creator_vault_source = "feed_override"
+                except Exception:
+                    creator_vault_source = "curve_creator_bad_override"
             fee_recipient = self.pump_fee_recipient(global_cfg, curve)
             user_volume = pda(PUMP_PROGRAM_ID, b"user_volume_accumulator", bytes(user))
             track_volume = b"\x01" if env_bool("PGG2_DIRECT_TRACK_VOLUME", True) else b"\x00"
