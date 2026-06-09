@@ -26,6 +26,10 @@ The current frozen config moved away from the oversized V287 authority file and 
 - The runner only sends on narrow Goal5 lane shapes.
 - Current best repeated lane: `small005_c3_f13_q720`.
 - The latest strong win came from `cur1_q600_clean_follow`.
+- After `goal5_c3hightotal_live_smoke30_20260609_142931.log`, `cur1_q600_clean_follow` now requires `follow/current >= 0.38` so weak-follow upper-cur1 rows like `3c6T..pump` do not fire.
+- After `goal5_c3hightotal_live_smoke60_20260609_151801.log`, `cur1_q600_clean_follow` also requires `train_span_ms <= 25` so delayed-follow cur1 rows like `2Hur..pump` do not fire. This does not touch `small005_c3_f13_q720`.
+- The same 60-minute log showed the frequency miss was C3-adjacent, not cur1: `small005_c3_f13_q720` had zero exact rows, while 18 fast C3 strong-follow rows across 12 mints had `current=3.00..3.40`, `first_follow=1.45..2.20`, `follow_buys=1..3`, and `train_span_ms<=25`. These now use the separate `small005_c3_strong_fast_follow` lane and must pass the existing C3 postquote tape before sending.
+- After `goal5_c3strongfast_live_smoke10_20260609_161800.log`, C3 rows around `761k` quote-ref were shown to be overblocked by the old `760k` cap, so C3 auth now allows up to `765k`. The same run also proved the C3 fast path can hit Pump `6042` buy slippage after tape; C3 buys now use `--c3-buy-slippage-pct 16.0` while other lanes still use `--buy-slippage-pct 8.0`.
 - Size is `0.005 SOL`.
 - The run stops after one completed close by default.
 - Sell requires positive headroom and closes the token account.
@@ -39,8 +43,10 @@ Recent live evidence on this frozen command:
 - `goal5_c3hightotal_live_smoke20_20260609_131523.log`: clean win, `+387544` lamports, no token residual.
 - `goal5_c3hightotal_live_smoke20_20260609_133248.log`: clean no-trade timeout, no spend.
 - `goal5_c3hightotal_live_smoke60_20260609_135558.log`: clean win, `+2246967` lamports, no token residual.
+- `goal5_c3hightotal_live_smoke30_20260609_142931.log`: clean close but loss, `-132843` lamports, no token residual; root cause was weak-follow `cur1_q600_clean_follow` with follow/current about `0.24`.
+- `goal5_c3hightotal_live_smoke60_20260609_151801.log`: clean close but loss, `-153459` lamports, no token residual; root cause was delayed-follow `cur1_q600_clean_follow` with `train_span_ms=220`.
 
-Current frozen record at the time this manual was written: 4 clean wins, 2 clean no-trade timeouts, 0 failed-buy fee burns, 0 realized losses, 0 stuck tokens.
+Current frozen record after the cur1 weak-follow and delayed-follow patches: 4 clean wins, 2 clean no-trade timeouts, 2 clean closed losses, 0 failed-buy fee burns, 0 stuck tokens.
 
 ## Exact Live Command
 
@@ -62,10 +68,13 @@ setsid /root/piggy/venv/bin/python -u pgg2_goal5_speed_scout.py \
   --no-small-size005-cur1-q900-follow-enabled \
   --no-small-size005-c0-f22-multi-q900-enabled \
   --small-size005-c3-f13-q720-enabled \
+  --small-size005-c3-strong-fast-follow-enabled \
   --no-clean-buy-train-continuation-enabled \
   --no-scratch-midquote-enabled \
   --no-early-cur1-q800-enabled \
   --no-final-projection-check-enabled \
+  --buy-slippage-pct 8.0 \
+  --c3-buy-slippage-pct 16.0 \
   --sell-min-headroom-lamports 150000 \
   --loss-rescue-headroom-lamports -250000 \
   --max-hold-ms 2800 \

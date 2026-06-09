@@ -66,6 +66,18 @@ def _quote_ref_030(quote_tokens: float, size_sol: float) -> float:
     return float(quote_tokens) * (0.030 / float(size_sol))
 
 
+def _follow_current_ratio(current_sol: float, follow_sol: float) -> float:
+    if current_sol <= 0:
+        return 0.0
+    return float(follow_sol) / float(current_sol)
+
+
+def _buy_slippage_pct_for_reason(args: argparse.Namespace, reason: str) -> float:
+    if str(reason).startswith("small005_c3_"):
+        return float(getattr(args, "c3_buy_slippage_pct", args.buy_slippage_pct))
+    return float(args.buy_slippage_pct)
+
+
 def _pre_shape_allowed(
     args: argparse.Namespace,
     current_sol: float,
@@ -113,6 +125,9 @@ def _pre_shape_allowed(
         and follow_buys == 1
         and 0.30 <= first_follow_sol <= 0.55
         and 0.30 <= follow_sol <= 0.55
+        and _follow_current_ratio(current_sol, min(first_follow_sol, follow_sol))
+        >= float(getattr(args, "cur1_q600_min_follow_current_ratio", 0.38))
+        and train_span <= int(getattr(args, "cur1_q600_max_train_span_ms", 25))
     ):
         return True, "pre_cur1_q600_clean_follow"
     if (
@@ -139,6 +154,16 @@ def _pre_shape_allowed(
         and 1.20 <= follow_sol <= 1.35
     ):
         return True, "pre_small005_c3_f13_q720"
+    if (
+        args.small_size005_c3_strong_fast_follow_enabled
+        and float(args.size_sol) <= 0.006
+        and 3.00 <= current_sol <= 3.40
+        and 1 <= follow_buys <= 3
+        and 1.45 <= first_follow_sol <= 2.20
+        and 1.45 <= follow_sol <= 3.60
+        and train_span <= 25
+    ):
+        return True, "pre_small005_c3_strong_fast_follow"
     if buy_train_fresh_shape:
         return True, "pre_clean_buy_train_continuation"
     if (
@@ -214,6 +239,9 @@ def _lane_allowed(
         and follow_buys == 1
         and 0.30 <= first_follow_sol <= 0.55
         and 0.30 <= follow_sol <= 0.55
+        and _follow_current_ratio(current_sol, min(first_follow_sol, follow_sol))
+        >= float(getattr(args, "cur1_q600_min_follow_current_ratio", 0.38))
+        and train_span <= int(getattr(args, "cur1_q600_max_train_span_ms", 25))
         and 560_000 <= quote_tokens <= 650_000
     ):
         return True, "cur1_q600_clean_follow"
@@ -244,9 +272,20 @@ def _lane_allowed(
         and follow_buys == 1
         and 1.20 <= first_follow_sol <= 1.35
         and 1.20 <= follow_sol <= 1.35
-        and 660_000 <= quote_tokens <= 760_000
+        and 660_000 <= quote_tokens <= 765_000
     ):
         return True, "small005_c3_f13_q720"
+    if (
+        args.small_size005_c3_strong_fast_follow_enabled
+        and float(args.size_sol) <= 0.006
+        and 3.00 <= current_sol <= 3.40
+        and 1 <= follow_buys <= 3
+        and 1.45 <= first_follow_sol <= 2.20
+        and 1.45 <= follow_sol <= 3.60
+        and train_span <= 25
+        and 520_000 <= quote_tokens <= 765_000
+    ):
+        return True, "small005_c3_strong_fast_follow"
     if buy_train_fresh_shape:
         return True, "clean_buy_train_continuation"
     if (
@@ -279,7 +318,7 @@ def _c3_postquote_tape_check(
     reason: str,
     mint_hist: list[dict[str, Any]],
 ) -> tuple[bool, str]:
-    if reason != "small005_c3_f13_q720" or not bool(args.c3_postquote_tape_check_enabled):
+    if not str(reason).startswith("small005_c3_") or not bool(args.c3_postquote_tape_check_enabled):
         return True, "not_c3"
 
     known_sigs = {str(cand.start_sig), *(str(sig) for sig in cand.follow_sigs)}
@@ -301,6 +340,7 @@ def _c3_postquote_tape_check(
     hidden_dust = sum(1 for x in hidden_buys if int(x.get("sol_lamports") or 0) < dust_max)
     hidden_large = sum(1 for x in hidden_buys if int(x.get("sol_lamports") or 0) >= large_min)
     current_sol = int(cand.current_lamports) / LAMPORTS_PER_SOL
+    c3_mid_current_min = 3.00 if reason == "small005_c3_strong_fast_follow" else 3.20
     pass_check = (
         not sells
         and hidden_sol >= float(args.c3_min_hidden_postfollow_sol)
@@ -310,7 +350,7 @@ def _c3_postquote_tape_check(
     mid_clean_pass = (
         not pass_check
         and not sells
-        and 3.20 <= current_sol <= 3.40
+        and c3_mid_current_min <= current_sol <= 3.40
         and hidden_sol >= 2.00
         and hidden_large >= 2
         and hidden_dust == 0
@@ -319,7 +359,7 @@ def _c3_postquote_tape_check(
         not pass_check
         and not mid_clean_pass
         and not sells
-        and 3.20 <= current_sol <= 3.40
+        and c3_mid_current_min <= current_sol <= 3.40
         and hidden_sol >= 3.00
         and hidden_large >= 2
         and hidden_dust <= 1
@@ -570,7 +610,8 @@ def _trade(
         return True
 
     wallet_before = _wallet_lamports(broker, "processed")
-    min_tokens_ui = send_quote_tokens * max(0.0, 1.0 - float(args.buy_slippage_pct) / 100.0)
+    buy_slippage_pct = _buy_slippage_pct_for_reason(args, reason)
+    min_tokens_ui = send_quote_tokens * max(0.0, 1.0 - buy_slippage_pct / 100.0)
     buy_quote = broker.build_buy_with_min_tokens_from_curve_snapshot(
         mint,
         float(args.size_sol),
@@ -593,7 +634,7 @@ def _trade(
         "PGG2-GOAL5-SCOUT-BUY-SEND "
         f"mint={_short(mint)} reason={reason} wallet_before={wallet_before} "
         f"size_sol={args.size_sol:.6f} quote_tokens={send_quote_tokens:.6f} "
-        f"buy_fee={send_buy_fee} min_tokens={min_tokens_ui:.6f}"
+        f"buy_fee={send_buy_fee} buy_slippage_pct={buy_slippage_pct:.3f} min_tokens={min_tokens_ui:.6f}"
     )
     buy_sent_ms = _now_ms()
     buy_sig = broker.send_signed(signed_b64)
@@ -740,6 +781,7 @@ def _self_test() -> int:
         small_size005_cur1_q900_follow_enabled=True,
         small_size005_c0_f22_multi_q900_enabled=True,
         small_size005_c3_f13_q720_enabled=True,
+        small_size005_c3_strong_fast_follow_enabled=True,
         clean_buy_train_continuation_enabled=True,
         buy_train_min_current_sol=0.25,
         buy_train_max_current_sol=1.00,
@@ -755,10 +797,14 @@ def _self_test() -> int:
         scratch_midquote_max_quote_tokens_ref=805_000.0,
         scratch_midquote_min_projected_headroom_lamports=250_000,
         early_cur1_q800_enabled=False,
+        cur1_q600_min_follow_current_ratio=0.38,
+        c3_buy_slippage_pct=16.0,
+        buy_slippage_pct=8.0,
         size_sol=0.005,
         max_start_age_ms=250,
         max_prequote_start_age_ms=250,
-        max_send_start_age_ms=250,
+        max_send_start_age_ms=420,
+        cur1_q600_max_train_span_ms=25,
     )
     cases = [
         ("Ftuc_win_shape", True, 2.072, 2.394, 2.394, 1, 618_769, 80),
@@ -779,9 +825,15 @@ def _self_test() -> int:
         ("small005_c0_f22_b1_block", False, 0.850, 2.200, 2.200, 1, 936_893, 90),
         ("small005_c3_f13_q720", True, 3.300, 1.320, 1.320, 1, 735_495, 90),
         ("small005_c3_f12_q670_shadow_pass", True, 3.300, 1.200, 1.200, 1, 670_173, 90),
+        ("small005_c3_f13_q761_cap_pass", True, 3.300, 1.320, 1.320, 1, 761_500, 90),
         ("small005_c3_current306_live_loss_block", False, 3.060, 1.244, 1.244, 1, 695_536, 90),
         ("small005_c3_f13_low_quote_block", False, 3.300, 1.320, 1.320, 1, 650_000, 90),
         ("small005_c3_f13_b2_block", False, 3.300, 1.320, 2.090, 2, 735_495, 90),
+        ("small005_c3_strong_fast_f209_b1", True, 3.300, 2.090, 2.090, 1, 620_000, 10, 0, 0, 0),
+        ("small005_c3_strong_fast_q761_cap_pass", True, 3.300, 1.650, 1.650, 1, 761_800, 10, 0, 0, 0),
+        ("small005_c3_strong_fast_f153_b3", True, 3.000, 1.530, 3.390, 3, 620_000, 10, 0, 0, 10),
+        ("small005_c3_strong_fast_slow_span_block", False, 3.000, 1.530, 3.390, 3, 620_000, 80, 0, 0, 60),
+        ("small005_c3_strong_fast_high_quote_block", False, 3.300, 2.090, 2.090, 1, 820_000, 10, 0, 0, 0),
         ("clean_buy_train_68gu_shape", True, 0.885938, 0.885938, 2.275875, 3, 520_000, 132),
         ("clean_buy_train_b2_block", False, 0.885938, 0.885938, 1.771875, 2, 520_000, 76),
         ("clean_buy_train_quote_low_block", False, 0.885938, 0.885938, 2.275875, 3, 200_000, 132),
@@ -791,12 +843,22 @@ def _self_test() -> int:
         ("early_cur1_q900_mixed_block", False, 1.000, 0.000, 0.000, 0, 994_780, 40),
         ("early_cur1_q600_actual_loss_family_block", False, 1.190, 0.000, 0.000, 0, 669_000, 40),
         ("stale_block", False, 0.415, 0.406, 0.406, 1, 856_000, 400),
+        ("cur1_8uyR_win_shape", True, 1.000, 0.500, 0.500, 1, 603_426, 415, 0, 415, 0),
+        ("cur1_3c6T_weak_follow_loss_block", False, 1.2926, 0.314927, 0.314927, 1, 642_132, 164, 0, 157, 7),
+        ("cur1_2Hur_delayed_follow_loss_block", False, 1.000, 0.471173, 0.471173, 1, 605_782, 341, 0, 121, 220),
     ]
     ok = True
+    c3_slip = _buy_slippage_pct_for_reason(ns, "small005_c3_strong_fast_follow")
+    non_c3_slip = _buy_slippage_pct_for_reason(ns, "cur1_q600_clean_follow")
+    print(f"c3_buy_slippage expected=16.0 got={c3_slip:.1f}")
+    print(f"non_c3_buy_slippage expected=8.0 got={non_c3_slip:.1f}")
+    ok = ok and abs(c3_slip - 16.0) < 1e-9 and abs(non_c3_slip - 8.0) < 1e-9
     for case in cases:
         name, expected, cur, first, follow, buys, quote, age, *rest = case
         projected = rest[0] if rest else 0
-        got, reason = _lane_allowed(ns, cur, first, follow, buys, quote, age, projected)
+        latest_follow_age = rest[1] if len(rest) > 1 else None
+        train_span = rest[2] if len(rest) > 2 else None
+        got, reason = _lane_allowed(ns, cur, first, follow, buys, quote, age, projected, latest_follow_age, train_span)
         print(f"{name} expected={int(expected)} got={int(got)} reason={reason}")
         ok = ok and got is expected
     got, reason = _pre_shape_allowed(
@@ -927,6 +989,33 @@ def _self_test() -> int:
         got, reason = _c3_postquote_tape_check(tape_ns, c3_cand, "small005_c3_f13_q720", hist_rows)
         print(f"{name} expected={int(expected)} got={int(got)} reason={reason}")
         ok = ok and got is expected
+    strong_c3_cand = ScoutCandidate(
+        mint="StrongFastC3Pump",
+        start_ms=base_ms,
+        current_lamports=int(3.0 * LAMPORTS_PER_SOL),
+        first_follow_lamports=int(1.53 * LAMPORTS_PER_SOL),
+        follow_lamports=int(1.53 * LAMPORTS_PER_SOL),
+        follow_buys=1,
+        start_sig="start",
+        start_payer="payer_start",
+        feed_rec={},
+        follow_sigs=["follow"],
+        follow_payers=["payer_follow"],
+    )
+    strong_c3_hist = [
+        buy("start", 3.0, 0),
+        buy("follow", 1.53, 10),
+        buy("h1", 1.21, 25),
+        buy("h2", 0.88, 40),
+    ]
+    got, reason = _c3_postquote_tape_check(
+        tape_ns,
+        strong_c3_cand,
+        "small005_c3_strong_fast_follow",
+        strong_c3_hist,
+    )
+    print(f"c3_tape_strong_fast_mid_clean_pass expected=1 got={int(got)} reason={reason}")
+    ok = ok and got is True
     c3_low_current_cand = ScoutCandidate(
         mint="LowCurrentC3Pump",
         start_ms=base_ms,
@@ -1026,9 +1115,12 @@ def run(args: argparse.Namespace) -> int:
         f"size_sol={args.size_sol:.6f} proven_strong={int(args.proven_strong_enabled)} "
         f"micro_c0_highquote={int(args.micro_c0_highquote_enabled)} "
         f"cur1_q600_clean={int(args.cur1_q600_clean_follow_enabled)} "
+        f"cur1_q600_min_follow_current_ratio={args.cur1_q600_min_follow_current_ratio:.3f} "
+        f"cur1_q600_max_train_span_ms={args.cur1_q600_max_train_span_ms} "
         f"small005_cur1_q900={int(args.small_size005_cur1_q900_follow_enabled)} "
         f"small005_c0_f22_multi={int(args.small_size005_c0_f22_multi_q900_enabled)} "
         f"small005_c3_f13={int(args.small_size005_c3_f13_q720_enabled)} "
+        f"small005_c3_strong_fast={int(args.small_size005_c3_strong_fast_follow_enabled)} "
         f"clean_buy_train={int(args.clean_buy_train_continuation_enabled)} "
         f"scratch_midquote={int(args.scratch_midquote_enabled)} "
         f"scratch_midquote_quote=[{args.scratch_midquote_min_quote_tokens_ref:.0f},{args.scratch_midquote_max_quote_tokens_ref:.0f}] "
@@ -1038,6 +1130,7 @@ def run(args: argparse.Namespace) -> int:
         f"max_prequote_start_age_ms={args.max_prequote_start_age_ms} "
         f"max_send_start_age_ms={args.max_send_start_age_ms} "
         f"sell_min_headroom={args.sell_min_headroom_lamports} max_hold_ms={args.max_hold_ms} "
+        f"buy_slippage_pct={args.buy_slippage_pct:.3f} c3_buy_slippage_pct={args.c3_buy_slippage_pct:.3f} "
         f"c3_tape_check={int(args.c3_postquote_tape_check_enabled)} "
         f"buy_train_quote_ref=[{args.buy_train_min_quote_tokens_ref:.0f},{args.buy_train_max_quote_tokens_ref:.0f}] "
         f"buy_train_max_follow_age_ms={args.buy_train_max_follow_age_ms} "
@@ -1211,9 +1304,12 @@ def main() -> int:
     ap.add_argument("--proven-strong-enabled", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--micro-c0-highquote-enabled", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--cur1-q600-clean-follow-enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--cur1-q600-min-follow-current-ratio", type=float, default=0.38)
+    ap.add_argument("--cur1-q600-max-train-span-ms", type=int, default=25)
     ap.add_argument("--small-size005-cur1-q900-follow-enabled", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--small-size005-c0-f22-multi-q900-enabled", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--small-size005-c3-f13-q720-enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--small-size005-c3-strong-fast-follow-enabled", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--clean-buy-train-continuation-enabled", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--buy-train-min-current-sol", type=float, default=0.25)
     ap.add_argument("--buy-train-max-current-sol", type=float, default=1.00)
@@ -1248,6 +1344,7 @@ def main() -> int:
     ap.add_argument("--scratch-midquote-min-projected-headroom-lamports", type=int, default=250_000)
     ap.add_argument("--early-cur1-q800-enabled", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--buy-slippage-pct", type=float, default=8.0)
+    ap.add_argument("--c3-buy-slippage-pct", type=float, default=16.0)
     ap.add_argument("--sell-slippage-pct", type=float, default=4.0)
     ap.add_argument("--target-lamports", type=int, default=0)
     ap.add_argument("--buy-tx-fee-est-lamports", type=int, default=50_000)
