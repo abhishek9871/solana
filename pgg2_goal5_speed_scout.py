@@ -340,6 +340,7 @@ def _c3_postquote_tape_check(
     hidden_dust = sum(1 for x in hidden_buys if int(x.get("sol_lamports") or 0) < dust_max)
     hidden_large = sum(1 for x in hidden_buys if int(x.get("sol_lamports") or 0) >= large_min)
     current_sol = int(cand.current_lamports) / LAMPORTS_PER_SOL
+    first_follow_sol = int(cand.first_follow_lamports) / LAMPORTS_PER_SOL
     c3_mid_current_min = 3.00 if reason == "small005_c3_strong_fast_follow" else 3.20
     pass_check = (
         not sells
@@ -374,13 +375,25 @@ def _c3_postquote_tape_check(
         reason_out = "c3_tape_ok"
     else:
         reason_out = "c3_tape_block"
+    low_anchor_block = (
+        pass_check
+        and reason == "small005_c3_strong_fast_follow"
+        and bool(args.c3_strong_fast_low_anchor_block_enabled)
+        and current_sol <= float(args.c3_strong_fast_low_anchor_max_current_sol)
+        and first_follow_sol <= float(args.c3_strong_fast_low_anchor_max_first_follow_sol)
+        and hidden_sol < float(args.c3_strong_fast_low_anchor_min_hidden_sol)
+    )
+    if low_anchor_block:
+        pass_check = False
+        reason_out = "c3_tape_low_anchor_block"
     _log(
         "PGG2-GOAL5-C3-POSTQUOTE-TAPE "
         f"mint={_short(cand.mint)} full_mint={cand.mint} pass={int(pass_check)} reason={reason_out} "
         f"start_sig={cand.start_sig} follow_sigs={','.join(cand.follow_sigs)} "
         f"start_payer={cand.start_payer} follow_payers={','.join(cand.follow_payers)} "
         f"events_after_start={len(after_start)} hidden_buys={len(hidden_buys)} "
-        f"current_sol={current_sol:.6f} hidden_sol={hidden_sol:.6f} hidden_large={hidden_large} hidden_dust={hidden_dust} "
+        f"current_sol={current_sol:.6f} first_follow_sol={first_follow_sol:.6f} "
+        f"hidden_sol={hidden_sol:.6f} hidden_large={hidden_large} hidden_dust={hidden_dust} "
         f"sells_after_start={len(sells)} min_hidden_sol={float(args.c3_min_hidden_postfollow_sol):.6f} "
         f"min_hidden_large={int(args.c3_min_hidden_large_buys)} max_hidden_dust={int(args.c3_max_hidden_dust_buys)}"
     )
@@ -915,6 +928,10 @@ def _self_test() -> int:
         c3_min_hidden_postfollow_sol=3.0,
         c3_min_hidden_large_buys=3,
         c3_mid_clean_tape_enabled=False,
+        c3_strong_fast_low_anchor_block_enabled=True,
+        c3_strong_fast_low_anchor_max_current_sol=3.05,
+        c3_strong_fast_low_anchor_max_first_follow_sol=1.60,
+        c3_strong_fast_low_anchor_min_hidden_sol=3.50,
         c3_large_buy_min_sol=0.30,
         c3_dust_buy_max_sol=0.10,
         c3_max_hidden_dust_buys=2,
@@ -1018,6 +1035,61 @@ def _self_test() -> int:
     )
     print(f"c3_tape_strong_fast_mid_clean_block expected=0 got={int(got)} reason={reason}")
     ok = ok and got is False
+    strong_c3_low_anchor_loss_cand = ScoutCandidate(
+        mint="StrongFastLowAnchorLossPump",
+        start_ms=base_ms,
+        current_lamports=int(3.0 * LAMPORTS_PER_SOL),
+        first_follow_lamports=int(1.5 * LAMPORTS_PER_SOL),
+        follow_lamports=int(1.5 * LAMPORTS_PER_SOL),
+        follow_buys=1,
+        start_sig="start",
+        start_payer="payer_start",
+        feed_rec={},
+        follow_sigs=["follow"],
+        follow_payers=["payer_follow"],
+    )
+    strong_c3_low_anchor_loss_hist = [
+        buy("start", 3.0, 0),
+        buy("follow", 1.5, 10),
+        buy("h1", 1.50, 25),
+        buy("h2", 1.50, 40),
+        buy("h3", 0.377242, 60),
+    ]
+    got, reason = _c3_postquote_tape_check(
+        tape_ns,
+        strong_c3_low_anchor_loss_cand,
+        "small005_c3_strong_fast_follow",
+        strong_c3_low_anchor_loss_hist,
+    )
+    print(f"c3_tape_strong_fast_low_anchor_loss_block expected=0 got={int(got)} reason={reason}")
+    ok = ok and got is False
+    strong_c3_high_follow_win_cand = ScoutCandidate(
+        mint="StrongFastHighFollowWinPump",
+        start_ms=base_ms,
+        current_lamports=int(3.116955 * LAMPORTS_PER_SOL),
+        first_follow_lamports=int(2.133045 * LAMPORTS_PER_SOL),
+        follow_lamports=int(2.133045 * LAMPORTS_PER_SOL),
+        follow_buys=1,
+        start_sig="start",
+        start_payer="payer_start",
+        feed_rec={},
+        follow_sigs=["follow"],
+        follow_payers=["payer_follow"],
+    )
+    strong_c3_high_follow_win_hist = [
+        buy("start", 3.116955, 0),
+        buy("follow", 2.133045, 10),
+        buy("h1", 1.65, 25),
+        buy("h2", 1.515428, 45),
+    ]
+    got, reason = _c3_postquote_tape_check(
+        tape_ns,
+        strong_c3_high_follow_win_cand,
+        "small005_c3_strong_fast_follow",
+        strong_c3_high_follow_win_hist,
+    )
+    print(f"c3_tape_strong_fast_high_follow_win_pass expected=1 got={int(got)} reason={reason}")
+    ok = ok and got is True
     c3_low_current_cand = ScoutCandidate(
         mint="LowCurrentC3Pump",
         start_ms=base_ms,
@@ -1135,6 +1207,7 @@ def run(args: argparse.Namespace) -> int:
         f"buy_slippage_pct={args.buy_slippage_pct:.3f} c3_buy_slippage_pct={args.c3_buy_slippage_pct:.3f} "
         f"c3_tape_check={int(args.c3_postquote_tape_check_enabled)} "
         f"c3_mid_clean_tape={int(args.c3_mid_clean_tape_enabled)} "
+        f"c3_low_anchor_block={int(args.c3_strong_fast_low_anchor_block_enabled)} "
         f"buy_train_quote_ref=[{args.buy_train_min_quote_tokens_ref:.0f},{args.buy_train_max_quote_tokens_ref:.0f}] "
         f"buy_train_max_follow_age_ms={args.buy_train_max_follow_age_ms} "
         f"buy_train_max_train_span_ms={args.buy_train_max_train_span_ms} "
@@ -1369,6 +1442,10 @@ def main() -> int:
     ap.add_argument("--c3-min-hidden-postfollow-sol", type=float, default=3.0)
     ap.add_argument("--c3-min-hidden-large-buys", type=int, default=3)
     ap.add_argument("--c3-mid-clean-tape-enabled", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--c3-strong-fast-low-anchor-block-enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--c3-strong-fast-low-anchor-max-current-sol", type=float, default=3.05)
+    ap.add_argument("--c3-strong-fast-low-anchor-max-first-follow-sol", type=float, default=1.60)
+    ap.add_argument("--c3-strong-fast-low-anchor-min-hidden-sol", type=float, default=3.50)
     ap.add_argument("--c3-large-buy-min-sol", type=float, default=0.30)
     ap.add_argument("--c3-dust-buy-max-sol", type=float, default=0.10)
     ap.add_argument("--c3-max-hidden-dust-buys", type=int, default=2)
